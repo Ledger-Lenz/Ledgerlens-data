@@ -8,7 +8,7 @@ from stellar_sdk import Asset as SdkAsset
 from stellar_sdk import Server
 
 from config import config
-from ingestion.data_models import Asset, Trade
+from ingestion.data_models import Trade
 from ingestion.horizon_streamer import _to_trade
 from utils.retry import retry_with_backoff
 

@@ -7,11 +7,13 @@ Pipeline stages:
     1. Load historical trades for all watched asset pairs (ingestion)
     2. Build the per-wallet feature matrix (Benford + ML features)
     3. Score each wallet with the trained ensemble (model_inference)
-    4. Output flagged wallets above `config.RISK_SCORE_FLAG_THRESHOLD`
+    4. Persist scored wallets via `RiskScoreStore` and output those flagged
+       above `config.RISK_SCORE_FLAG_THRESHOLD`
 
 Stage 3 requires trained models in `config.MODEL_DIR` — run
 `detection/model_training.py` against a labelled dataset first. Until
-models are trained, this script falls back to reporting Benford-only flags.
+models are trained, this script falls back to reporting Benford-only flags
+(and persistence is skipped, since the `RiskScore` shape isn't available).
 """
 
 import argparse
@@ -19,10 +21,23 @@ from datetime import datetime
 
 from config import config
 from detection.feature_engineering import build_feature_matrix
+from detection.risk_score_store import RiskScoreStore
 from ingestion.historical_loader import load_watched_pairs_to_dataframe
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def watched_pairs_label() -> str:
+    """A single label identifying the configured set of watched pairs.
+
+    Used as the `asset_pair` key for persisted `RiskScore` records until
+    per-pair feature attribution is implemented (the feature matrix is
+    currently built across all watched pairs combined).
+    """
+    if not config.WATCHED_ASSET_PAIRS:
+        return "ALL"
+    return "+".join(f"{code}:{issuer}" for code, issuer in config.WATCHED_ASSET_PAIRS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +47,11 @@ def parse_args() -> argparse.Namespace:
         type=lambda s: datetime.fromisoformat(s),
         default=None,
         help="ISO date to start loading historical trades from (default: all available)",
+    )
+    parser.add_argument(
+        "--no-persist",
+        action="store_true",
+        help="Skip writing scored wallets to RISK_SCORE_DB_URL",
     )
     return parser.parse_args()
 
@@ -62,6 +82,24 @@ def main() -> None:
 
     if "score" in scored:
         flagged = scored[scored["score"] >= config.RISK_SCORE_FLAG_THRESHOLD]
+
+        if not args.no_persist:
+            asset_pair = watched_pairs_label()
+            store = RiskScoreStore()
+            for _, row in scored.iterrows():
+                store.upsert(
+                    wallet=row["wallet"],
+                    asset_pair=asset_pair,
+                    risk_score={
+                        "score": row["score"],
+                        "benford_flag": row["benford_flag"],
+                        "ml_flag": row["ml_flag"],
+                        "confidence": row["confidence"],
+                    },
+                )
+            logger.info(
+                "      Persisted %d scored wallets to %s", len(scored), config.RISK_SCORE_DB_URL
+            )
     else:
         flagged = scored[scored["benford_flag"]]
 

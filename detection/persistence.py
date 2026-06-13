@@ -6,7 +6,7 @@ here, keyed by `(wallet, asset_pair)`, for the API to read from
 `RISK_SCORE_DB_URL`.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine
 from sqlalchemy.engine import Engine
@@ -33,7 +33,7 @@ class RiskScoreRecord(Base):
     ml_flag: Mapped[bool] = mapped_column(nullable=False, default=False)
     confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
     def to_risk_score(self) -> dict:
