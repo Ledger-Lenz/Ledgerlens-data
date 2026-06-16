@@ -125,4 +125,3 @@ class RiskScorer:
         `score`, `benford_flag`, `ml_flag`, `confidence` columns appended."""
         scores = feature_matrix.apply(self.score, axis=1, result_type="expand")
         return pd.concat([feature_matrix[["wallet"]], scores], axis=1)
-

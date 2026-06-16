@@ -85,7 +85,7 @@ def test_risk_scorer_raises_on_schema_mismatch(trained_models):
 
 
 def test_risk_scorer_metadata_none_without_metadata_file(trained_models, tmp_path):
-    output, model_dir, df = trained_models
+    output, _, df = trained_models
     # Copy models to a new dir without metadata
     new_dir = str(tmp_path)
     save_models(output["results"], new_dir)
@@ -100,7 +100,7 @@ def test_risk_scorer_metadata_none_without_metadata_file(trained_models, tmp_pat
 
 
 def test_metadata_backward_compat_no_raise_without_file(trained_models, tmp_path):
-    output, model_dir, df = trained_models
+    output, _, df = trained_models
     new_dir = str(tmp_path)
     save_models(output["results"], new_dir)
 
@@ -136,4 +136,3 @@ def test_shap_explainer_explain_ensemble(trained_models):
     assert len(explanation) == 3
     for entry in explanation:
         assert set(entry) == {"feature", "contribution", "value"}
-
