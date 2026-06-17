@@ -44,4 +44,29 @@ class Config:
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
 
 
+    @classmethod
+    def validate(cls, require_onchain: bool = False):
+        errors = []
+
+        if not cls.WATCHED_ASSET_PAIRS:
+            errors.append("WATCHED_ASSET_PAIRS is not set.")
+
+        if not cls.RISK_SCORE_DB_URL.strip():
+            errors.append("RISK_SCORE_DB_URL is not set.")
+
+        if not cls.MODEL_DIR.strip():
+            errors.append("MODEL_DIR is not set.")
+
+        if require_onchain:
+            if not cls.LEDGERLENS_CONTRACT_ID.strip():
+                errors.append("LEDGERLENS_CONTRACT_ID is not set.")
+
+            if not cls.LEDGERLENS_SUBMITTER_SECRET.strip():
+                errors.append("LEDGERLENS_SUBMITTER_SECRET is not set.")
+
+        if errors:
+            raise EnvironmentError(
+                "LedgerLens configuration errors:\n- "
+                + "\n- ".join(errors)
+            )
 config = Config()

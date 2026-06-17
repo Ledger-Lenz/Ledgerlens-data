@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    config.validate()
     args = parse_args()
 
     if args.dry_run:
@@ -100,6 +101,10 @@ def main() -> None:
     logger.info("[3/4] Building feature matrix")
     feature_matrix = build_feature_matrix(trades_df, orderbook_events=orderbook_events)
     logger.info("      Built features for %d wallets", len(feature_matrix))
+
+    if feature_matrix.empty:
+        logger.info("no wallets found. Exiting.")
+        return
 
     logger.info("[4/4] Scoring wallets")
     try:
