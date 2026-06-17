@@ -20,28 +20,6 @@ from config import config
 BENFORD_FEATURE_TEMPLATE = ["benford_chi_square_{h}h", "benford_mad_{h}h", "benford_z_max_{h}h"]
 
 
-def feature_columns() -> list[str]:
-    columns = []
-    for hours in config.BENFORD_WINDOWS_HOURS:
-        columns.extend(t.format(h=hours) for t in BENFORD_FEATURE_TEMPLATE)
-    columns.extend(
-        [
-            "counterparty_concentration_ratio",
-            "round_trip_frequency",
-            "self_matching_rate",
-            "order_cancellation_rate",
-            "volume_per_counterparty_ratio",
-            "intra_minute_clustering",
-            "off_hours_activity_ratio",
-            "volume_spike_frequency",
-            "funding_source_similarity",
-            "network_centrality",
-            "account_age_days",
-        ]
-    )
-    return columns
-
-
 def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataFrame:
     """Generate `n_wallets` rows, roughly half legitimate (label 0) and half
     wash-trading-like (label 1) with systematically different feature
