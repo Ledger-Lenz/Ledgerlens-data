@@ -1,5 +1,61 @@
 # scripts/
 
+## `stream.py` — Real-time streaming pipeline
+
+Streams trades from the Stellar Horizon SSE API, maintains a rolling feature
+buffer per wallet, and dispatches risk alerts within one ledger close (~5 s)
+of a wallet crossing the risk threshold.
+
+### Usage
+
+```bash
+# Alert to stdout (local dev default)
+python -m scripts.stream
+
+# Webhook delivery
+ALERT_WEBHOOK_URL=https://hooks.example.com/alert \
+python -m scripts.stream --alert-channel webhook
+
+# WebSocket broadcast (starts ws server on 127.0.0.1:8765)
+python -m scripts.stream --alert-channel websocket
+
+# Skip WebSocket server but still use websocket channel via custom ws_client
+python -m scripts.stream --alert-channel websocket --no-ws
+
+# Custom dedup window and warmup threshold
+python -m scripts.stream --cooldown-seconds 1800 --min-trades 50
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--alert-channel` | `stdout` | Alert delivery: `stdout`, `webhook`, or `websocket` |
+| `--cooldown-seconds` | `3600` | Per-wallet alert dedup window (seconds) |
+| `--min-trades` | `20` | Minimum buffered trades before a wallet is scored |
+| `--no-ws` | off | Disable the WebSocket broadcast server |
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `WATCHED_ASSET_PAIRS` | — | **Required** — comma-separated `CODE:ISSUER` pairs |
+| `ALERT_CHANNEL` | `stdout` | Overrides `--alert-channel` flag |
+| `ALERT_WEBHOOK_URL` | — | HTTPS webhook endpoint (required for webhook channel) |
+| `ALERT_COOLDOWN_SECONDS` | `3600` | Overrides `--cooldown-seconds` flag |
+| `WS_PORT` | `8765` | WebSocket server port |
+| `WS_BIND_HOST` | `127.0.0.1` | WebSocket bind address |
+| `WS_ALLOW_EXTERNAL` | — | Set to `1` to bind to `0.0.0.0` |
+
+### Stdout alert format
+
+```
+[ALERT] wallet=G… pair=USDC:…/XLM:native score=83 benford=True ml=True confidence=76
+```
+
+See [docs/streaming_architecture.md](../docs/streaming_architecture.md) for the
+full pipeline diagram and threading model.
+
+---
+
 ## `generate_synthetic_dataset.py`
 
 Generates a synthetic labelled feature matrix for local training, demos,

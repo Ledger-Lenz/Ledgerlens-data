@@ -140,8 +140,18 @@ ledgerlens-data/
 ├── integrations/
 │   └── contract_client.py            ← ledgerlens-score Soroban contract client
 │
+├── streaming/
+│   ├── feature_buffer.py             ← FeatureBuffer (rolling per-wallet trade buffer)
+│   ├── alert_dispatcher.py           ← AlertDispatcher (threshold, dedup, delivery)
+│   ├── ws_server.py                  ← asyncio WebSocket server for dashboard push
+│   └── pipeline.py                   ← StreamingPipeline orchestrator
+│
 ├── scripts/
+│   ├── stream.py                     ← Real-time pipeline CLI (python -m scripts.stream)
 │   └── generate_synthetic_dataset.py ← Synthetic labelled dataset for local training/demo
+│
+├── docs/
+│   └── streaming_architecture.md     ← Real-time pipeline diagram and component docs
 │
 ├── utils/
 │   ├── logging.py                    ← Shared logger setup
@@ -171,7 +181,49 @@ python -m detection.model_training --data-path data/synthetic_dataset.parquet
 
 # Run the full detection pipeline
 python run_pipeline.py
+
+# Or run the real-time streaming pipeline
+python -m scripts.stream
 ```
+
+### Real-time streaming (`scripts/stream.py`)
+
+After training models, `scripts/stream.py` scores wallets in real time as
+trades land on the Stellar ledger and delivers alerts within one ledger close
+(~5 seconds) of a wallet crossing the risk threshold.
+
+```bash
+# Stdout alerts (local dev)
+python -m scripts.stream
+
+# HTTP webhook delivery (must be https://)
+ALERT_WEBHOOK_URL=https://hooks.example.com/alert \
+python -m scripts.stream --alert-channel webhook
+
+# WebSocket broadcast to dashboard subscribers
+python -m scripts.stream --alert-channel websocket
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--alert-channel` | `stdout` | `stdout`, `webhook`, or `websocket` |
+| `--cooldown-seconds` | `3600` | Per-wallet alert dedup window |
+| `--min-trades` | `20` | Minimum trades before a wallet is eligible for scoring |
+| `--no-ws` | off | Disable the WebSocket broadcast server |
+
+**New environment variables for streaming:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALERT_CHANNEL` | `stdout` | Alert delivery channel |
+| `ALERT_WEBHOOK_URL` | — | Required when `ALERT_CHANNEL=webhook`; must be `https://` |
+| `ALERT_COOLDOWN_SECONDS` | `3600` | Per-wallet alert dedup window (seconds) |
+| `WS_PORT` | `8765` | WebSocket server port |
+| `WS_BIND_HOST` | `127.0.0.1` | WebSocket bind address (loopback by default) |
+| `WS_ALLOW_EXTERNAL` | — | Set to `1` to allow non-loopback WebSocket binding |
+
+See [docs/streaming_architecture.md](docs/streaming_architecture.md) for the
+full pipeline diagram, threading model, and latency budget.
 
 ### `run_pipeline.py` flags
 
