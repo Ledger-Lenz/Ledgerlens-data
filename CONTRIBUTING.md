@@ -20,7 +20,7 @@ cp .env.example .env  # then edit as needed
 ```bash
 make lint     # ruff + black --check
 make format   # ruff --fix + black
-make test     # pytest
+make test     # pytest (unit tests only — no network)
 ```
 
 Optionally install the pre-commit hooks so checks run automatically:
@@ -29,6 +29,35 @@ Optionally install the pre-commit hooks so checks run automatically:
 pip install pre-commit
 pre-commit install
 ```
+
+### Unit tests vs integration tests
+
+`make test` runs `pytest tests/` and **never** hits the Testnet. All tests
+under `tests/integration/` are automatically skipped unless
+`LEDGERLENS_INTEGRATION_TESTS=1` is set.
+
+To run the live Testnet integration tests locally:
+
+```bash
+# 1. Deploy the contract (once per testnet reset / keypair rotation)
+python -m scripts.testnet_setup \
+    --wasm-path ledgerlens_score.wasm \
+    --wasm-sha256 <sha256-from-release> \
+    --salt ci-testnet
+
+# 2. Run integration tests
+export LEDGERLENS_INTEGRATION_TESTS=1
+export $(grep -v '^#' .env.testnet | xargs)
+pytest tests/integration/ -v --timeout=120
+```
+
+See [`tests/integration/README.md`](tests/integration/README.md) for full
+setup instructions, required environment variables, WASM version details,
+and Testnet fee estimates.
+
+The `testnet-integration.yml` CI workflow runs these tests on a weekly
+schedule (Sundays 03:00 UTC) and on manual `workflow_dispatch` — it does
+**not** run on pull requests so it never blocks a PR merge.
 
 ## Pull requests
 

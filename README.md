@@ -77,7 +77,7 @@ Benford signals alone aren't definitive — legitimate high-frequency market mak
 
 ## Machine Learning Layer
 
-### Features (30+, grouped by category)
+### Features (36+, grouped by category)
 
 **Benford Features (15)**
 - Chi-square, Z-score, and MAD for transaction amounts across 5 rolling time windows
@@ -98,6 +98,14 @@ Benford signals alone aren't definitive — legitimate high-frequency market mak
 - Funding source similarity score
 - Network centrality within trading cluster graphs
 - Account age at time of trading activity
+
+**Cross-Asset Coordination Features (6)**
+- **Cross-pair trade synchrony** (0–1): Fraction of trades where the wallet simultaneously trades on other pairs within a configurable synchrony window (default: 30 seconds). High values indicate coordinated multi-pair activity — a strong wash-trading signal.
+- **Net asset flow deviation** (0–1+): Maximum absolute net asset flow normalized by total volume. Values close to 0 indicate closed-cycle trading (suspect); large values indicate genuine inventory management.
+- **Cross-pair counterparty overlap** (0–1): Jaccard similarity of the wallet's counterparty sets across different pairs. Wash traders reuse the same sock-puppet wallets across pairs; legitimate market makers have pair-specific counterparties.
+- **Cross-pair volume correlation** (-1 to 1): Pearson correlation of trade volumes across pairs, bucketed by minute. Coordinated wash traders' volumes spike together; legitimate traders' pair-specific volumes are uncorrelated.
+- **Pair diversity score** (0–1): Shannon entropy of volume distribution across pairs, normalized. High entropy = volume spread across many pairs (market maker); low entropy = concentrated on one or two pairs.
+- **Cross-pair MAD consistency**: Standard deviation of Benford MAD scores across pairs. Low values mean all pairs have similar Benford conformity (consistent wash-trading pattern). High values indicate mixed conformity (concentrated on specific pairs).
 
 ### Models
 
@@ -125,6 +133,7 @@ ledgerlens-data/
 │   ├── horizon_streamer.py           ← Real-time trade data from Horizon API
 │   ├── historical_loader.py          ← Bulk historical trade ingestion
 │   ├── orderbook_loader.py           ← Order-book event ingestion (cancellation rate)
+│   ├── account_activity_loader.py    ← Account creation/funding event ingestion (funding graph)
 │   └── data_models.py                ← Pydantic schemas for trade records
 │
 ├── detection/
@@ -133,6 +142,7 @@ ledgerlens-data/
 │   ├── wallet_graph.py               ← Funding-graph similarity/centrality features
 │   ├── model_training.py             ← Train ensemble classifiers (CLI)
 │   ├── model_inference.py            ← Real-time risk scoring
+│   ├── drift_monitor.py              ← PSI-based feature drift detection
 │   ├── shap_explainer.py             ← SHAP interpretability layer
 │   ├── persistence.py                ← SQLAlchemy RiskScore model + engine
 │   └── risk_score_store.py           ← RiskScore upsert/read repository
@@ -140,22 +150,37 @@ ledgerlens-data/
 ├── integrations/
 │   └── contract_client.py            ← ledgerlens-score Soroban contract client
 │
+├── streaming/
+│   ├── feature_buffer.py             ← FeatureBuffer (rolling per-wallet trade buffer)
+│   ├── alert_dispatcher.py           ← AlertDispatcher (threshold, dedup, delivery)
+│   ├── ws_server.py                  ← asyncio WebSocket server for dashboard push
+│   └── pipeline.py                   ← StreamingPipeline orchestrator
+│
 ├── scripts/
-│   └── generate_synthetic_dataset.py ← Synthetic labelled dataset for local training/demo
+│   ├── stream.py                     ← Real-time pipeline CLI (python -m scripts.stream)
+│   ├── generate_synthetic_dataset.py ← Synthetic labelled dataset for local training/demo
+│   ├── retrain_if_drifted.py         ← Automated drift detection + retraining trigger
+│   └── list_model_versions.py        ← List archived model versions with metrics
+│
+├── docs/
+│   ├── streaming_architecture.md     ← Real-time pipeline diagram and component docs
+│   └── drift_detection.md           ← PSI drift detection methodology and retraining docs
 │
 ├── utils/
 │   ├── logging.py                    ← Shared logger setup
 │   └── retry.py                      ← Retry/backoff decorator for Horizon calls
 │
-└── tests/
-    ├── test_benford.py
-    ├── test_features.py
-    ├── test_orderbook.py
-    ├── test_wallet_graph.py
-    ├── test_persistence.py
-    ├── test_contract_client.py
-    ├── test_model_training.py
-    └── test_inference_shap.py
+├── tests/
+│   ├── test_benford.py
+│   ├── test_features.py
+│   ├── test_orderbook.py
+│   ├── test_wallet_graph.py
+│   ├── test_persistence.py
+│   ├── test_contract_client.py
+│   ├── test_model_training.py
+│   ├── test_inference_shap.py
+│   ├── test_drift_monitor.py
+│   └── test_retrain_trigger.py
 ```
 
 ## Quick Start
@@ -171,7 +196,50 @@ python -m detection.model_training --data-path data/synthetic_dataset.parquet
 
 # Run the full detection pipeline
 python run_pipeline.py
+
+# Score a single wallet on-demand (targeted investigation)
+python -m scripts.score_wallet --wallet <G...> --pair "USDC:<G...>/XLM:native"
 ```
+
+### Real-time streaming (`scripts/stream.py`)
+
+After training models, `scripts/stream.py` scores wallets in real time as
+trades land on the Stellar ledger and delivers alerts within one ledger close
+(~5 seconds) of a wallet crossing the risk threshold.
+
+```bash
+# Stdout alerts (local dev)
+python -m scripts.stream
+
+# HTTP webhook delivery (must be https://)
+ALERT_WEBHOOK_URL=https://hooks.example.com/alert \
+python -m scripts.stream --alert-channel webhook
+
+# WebSocket broadcast to dashboard subscribers
+python -m scripts.stream --alert-channel websocket
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--alert-channel` | `stdout` | `stdout`, `webhook`, or `websocket` |
+| `--cooldown-seconds` | `3600` | Per-wallet alert dedup window |
+| `--min-trades` | `20` | Minimum trades before a wallet is eligible for scoring |
+| `--no-ws` | off | Disable the WebSocket broadcast server |
+
+**New environment variables for streaming:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `ALERT_CHANNEL` | `stdout` | Alert delivery channel |
+| `ALERT_WEBHOOK_URL` | — | Required when `ALERT_CHANNEL=webhook`; must be `https://` |
+| `ALERT_COOLDOWN_SECONDS` | `3600` | Per-wallet alert dedup window (seconds) |
+| `WS_PORT` | `8765` | WebSocket server port |
+| `WS_BIND_HOST` | `127.0.0.1` | WebSocket bind address (loopback by default) |
+| `WS_ALLOW_EXTERNAL` | — | Set to `1` to allow non-loopback WebSocket binding |
+| `CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS` | `30` | Time window (seconds) for detecting simultaneous trades across pairs |
+
+See [docs/streaming_architecture.md](docs/streaming_architecture.md) for the
+full pipeline diagram, threading model, and latency budget.
 
 ### `run_pipeline.py` flags
 
@@ -180,14 +248,85 @@ python run_pipeline.py
 | `--since <ISO date>` | Only load trades from this date onward (default: all available) |
 | `--no-persist` | Skip writing scored wallets to `RISK_SCORE_DB_URL` |
 | `--no-orderbook` | Skip loading order-book events (faster; `order_cancellation_rate` stays `0`) |
+| `--no-graph` | Skip loading account activity and building the wallet funding graph (faster; `funding_source_similarity` and `network_centrality` stay `0`) |
 | `--submit-onchain` | Submit flagged wallets' `RiskScore` to the `ledgerlens-score` contract via `integrations/contract_client.py` |
 | `--dry-run` | Run all pipeline stages but skip every write — no DB persistence and no on-chain submission (implies `--no-persist`; silently skips `--submit-onchain`). Flagged wallets are still printed. |
 
+## Model Artifacts
+
+Trained models and their associated metadata are stored in `config.MODEL_DIR` (default: `./models`).
+
+### `model_metadata.json`
+
+Every training run produces a `model_metadata.json` sidecar file. This is used by the `RiskScorer` at load time to ensure that the current feature schema matches the schema the model was trained on, preventing silent scoring errors due to feature drift.
+
+**Schema:**
+```json
+{
+  "trained_at": "2026-06-16T12:00:00Z",
+  "data_path": "data/synthetic_dataset.parquet",
+  "n_training_rows": 400,
+  "n_test_rows": 100,
+  "feature_columns": ["benford_chi_square_1h", "benford_mad_1h", "..."],
+  "feature_schema_hash": "sha256:<hash-of-sorted-feature-column-list>",
+  "model_names": ["random_forest", "xgboost", "lightgbm"],
+  "python_version": "3.11.9",
+  "ledgerlens_version": "0.2.0"
+}
+```
+
+If the `feature_schema_hash` computed from the input feature row does not match the hash in the metadata, `RiskScorer.score()` will raise a `RuntimeError` detailing the mismatched columns.
+
+## Continuous Retraining Pipeline
+
+LedgerLens includes an automated retraining pipeline that detects feature drift
+using the **Population Stability Index (PSI)** and safely promotes new models
+without disrupting production.
+
+### Drift Detection
+
+The `DriftMonitor` class (`detection/drift_monitor.py`) computes PSI for every
+feature column by comparing the current production distribution (from recent
+Horizon data) against the training-time reference distribution stored in
+`model_metadata.json`. PSI ≥ 0.25 triggers automatic retraining.
+
+### Retraining Workflow
+
+The `scripts/retrain_if_drifted.py` script:
+
+1. Loads the reference distribution from `model_metadata.json`
+2. Builds a feature matrix from recent Horizon data (`--lookback-days`)
+3. Computes PSI drift via `DriftMonitor`
+4. If drift is detected: archives old models, trains new ones, evaluates
+   against old metrics, and promotes only if all models meet AUC-ROC/F1
+   tolerance (≥ old - 0.01)
+5. Writes detailed reports to `reports/`
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | No drift — no action |
+| 2 | Retrained and promoted |
+| 3 | Retrained but not promoted (regression) |
+| 1 | Fatal error |
+
+### Scheduled Execution
+
+A GitHub Actions workflow (`.github/workflows/retrain.yml`) runs weekly
+(Monday 02:00 UTC) or on-demand via `workflow_dispatch`. It uses OIDC for
+artifact store authentication — no long-lived secrets.
+
+See [docs/drift_detection.md](docs/drift_detection.md) for full methodology,
+thresholds, and architecture diagrams.
+
 ### `scripts/`
 
-See [`scripts/README.md`](scripts/README.md) for `generate_synthetic_dataset.py` usage —
-a synthetic labelled feature matrix matching `build_feature_matrix`'s schema, useful for
-local training/demo/tests without live Horizon data.
+See [`scripts/README.md`](scripts/README.md) for detailed usage of:
+- `generate_synthetic_dataset.py` — synthetic labelled feature matrix for
+  local training/demo/tests without live Horizon data
+- `retrain_if_drifted.py` — automated drift detection and retraining trigger
+- `list_model_versions.py` — list archived models with training dates and metrics
 
 ## Development
 
@@ -291,10 +430,11 @@ Mirrors `ledgerlens-contract`'s `submit_score` payload and
 
 #### Asset pair identifier
 
-Format: `CODE:ISSUER` (e.g. `USDC:GA5Z...`), or `XLM:native` for the native
-asset. See `ingestion/data_models.py::Asset.pair_id()`. Used consistently
-across the API path parameters, contract `Symbol` arguments, and dashboard
-routing.
+Format: `CODE:ISSUER/CODE:ISSUER` (e.g. `USDC:GA5Z.../XLM:native`). The
+pipeline enforces this format as the canonical `pair_id` string in every
+`RiskScore` record — one record per `(wallet, pair_id)` tuple. See
+`ingestion/data_models.py::Asset.pair_id()`. Used consistently across the
+API path parameters, contract `Symbol` arguments, and dashboard routing.
 
 #### Risk thresholds
 
@@ -305,13 +445,15 @@ routing.
 
 #### Feature schema
 
-The 30+ feature columns produced by
+The 36+ feature columns produced by
 `detection/feature_engineering.py::build_feature_matrix` are the training
 input for `detection/model_training.py`. Any new feature column must be
 added to both the training pipeline and `model_inference.py`'s
 `FEATURE_COLUMNS_EXCLUDE`-aware scoring path, and documented in
 `ledgerlens-core` if other repos need to display feature attributions
-(SHAP output from `detection/shap_explainer.py`).
+(SHAP output from `detection/shap_explainer.py`). Cross-asset coordination
+features require that `all_pairs_df` be passed to `build_feature_matrix`;
+if not provided, these features default to 0.0.
 
 ### This Repo (`ledgerlens-data`) — Current State
 
@@ -342,20 +484,9 @@ ledgerlens-data/
 
 #### Known gaps / TODOs
 
-- Wallet funding-graph features (`funding_source_similarity`,
-  `network_centrality`) are implemented in `detection/wallet_graph.py`, but
-  `run_pipeline.py` doesn't build a `funding_graph` yet — there's no
-  ingestion source for `AccountActivity.funding_account` data. Wiring this
-  up requires an account-creation/funding event loader (a candidate next
-  feature).
 - `model_training.py` trains on `scripts/generate_synthetic_dataset.py`'s
   synthetic data by default; the real labelled wash-trade dataset is still
   the "Open dataset release" roadmap item.
-- `run_pipeline.py`'s persisted `asset_pair` is a combined label across all
-  `WATCHED_ASSET_PAIRS` (`watched_pairs_label()`), not a per-pair
-  attribution — the feature matrix is currently built across all pairs
-  together. Per-pair feature matrices would need per-pair trade filtering
-  upstream of `build_feature_matrix`.
 - `--submit-onchain` assumes a deployed `ledgerlens-score` contract and a
   funded `LEDGERLENS_SUBMITTER_SECRET`; it has unit test coverage via mocks
   but hasn't been exercised against a live Soroban network from this repo.

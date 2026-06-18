@@ -9,13 +9,18 @@ fields match the contract's `RiskScore` struct (the `timestamp` field is
 added by the persistence layer when a record is stored).
 """
 
+import json
 import os
 
 import joblib
 import pandas as pd
 
 from config import config
-from detection.model_training import FEATURE_COLUMNS_EXCLUDE, MODEL_REGISTRY
+from detection.model_training import (
+    FEATURE_COLUMNS_EXCLUDE,
+    MODEL_REGISTRY,
+    compute_feature_schema_hash,
+)
 
 BENFORD_MAD_FLAG_THRESHOLD = 0.015
 ML_FLAG_THRESHOLD = 0.5
@@ -47,7 +52,15 @@ class RiskScorer:
 
     def __init__(self, model_dir: str | None = None):
         self.model_dir = model_dir or config.MODEL_DIR
+        self.metadata = self._load_metadata()
         self.models = self._load_models()
+
+    def _load_metadata(self) -> dict | None:
+        path = os.path.join(self.model_dir, "model_metadata.json")
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        return None
 
     def _load_models(self) -> dict:
         models = {}
@@ -69,6 +82,27 @@ class RiskScorer:
             )
 
         feature_cols = [c for c in feature_row.index if c not in FEATURE_COLUMNS_EXCLUDE]
+
+        if self.metadata:
+            current_hash = compute_feature_schema_hash(feature_cols)
+            expected_hash = self.metadata["feature_schema_hash"]
+
+            if current_hash != expected_hash:
+                model_cols = set(self.metadata["feature_columns"])
+                row_cols = set(feature_cols)
+                missing_in_row = model_cols - row_cols
+                missing_in_model = row_cols - model_cols
+
+                msg = (
+                    f"Feature schema mismatch! Model expected hash {expected_hash}, "
+                    f"got {current_hash}."
+                )
+                if missing_in_row:
+                    msg += f" Columns missing from input: {sorted(missing_in_row)}."
+                if missing_in_model:
+                    msg += f" Columns missing from model: {sorted(missing_in_model)}."
+                raise RuntimeError(msg)
+
         X = feature_row[feature_cols].to_frame().T.astype(float)
 
         probs = [model.predict_proba(X)[0, 1] for model in self.models.values()]

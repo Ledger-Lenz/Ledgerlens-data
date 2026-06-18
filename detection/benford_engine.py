@@ -147,3 +147,21 @@ def compute_benford_metrics_for_windows(
         results[hours] = compute_benford_metrics(window_df[amount_col])
 
     return results
+
+
+def cross_pair_benford_consistency(per_pair_metrics: dict[str, dict]) -> float:
+    """Compute cross-pair Benford MAD consistency.
+
+    `per_pair_metrics` maps pair_id -> metrics dict (from compute_benford_metrics).
+    Returns the standard deviation of MAD scores across pairs. Low values indicate
+    all pairs have similar Benford conformity (consistent wash trading pattern).
+    High values indicate mixed conformity (concentrated on specific pairs).
+    """
+    if not per_pair_metrics or len(per_pair_metrics) < 2:
+        return 0.0
+
+    mad_scores = [metrics.get("mad", 0.0) for metrics in per_pair_metrics.values() if metrics]
+    if not mad_scores or len(mad_scores) < 2:
+        return 0.0
+
+    return float(np.std(mad_scores))

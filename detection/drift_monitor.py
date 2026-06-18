@@ -1,0 +1,121 @@
+"""Feature drift detection using Population Stability Index (PSI).
+
+PSI is the industry-standard metric for detecting feature drift in tabular ML
+systems (see https://www.lexjansen.com/wuss/2017/47_Final_Paper_PDF.pdf for a
+reference implementation). It measures how much the current feature distribution
+has shifted from the reference (training-time) distribution.
+
+Thresholds (standard industry practice):
+    PSI < 0.1    → no significant drift
+    0.1 ≤ PSI < 0.25 → moderate drift — monitor
+    PSI ≥ 0.25   → significant drift — trigger retraining
+
+PSI formula:
+    PSI = Σ_i (observed_i - expected_i) * ln(observed_i / expected_i)
+where i iterates over bins of each feature's value distribution.
+"""
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+import numpy as np
+import pandas as pd
+
+PSI_NO_DRIFT_THRESHOLD = 0.1
+PSI_MODERATE_DRIFT_THRESHOLD = 0.25
+PSI_EPSILON = 1e-4
+
+REPORTS_DIR = "reports"
+
+
+@dataclass
+class DriftReport:
+    features: list[dict] = field(default_factory=list)
+    any_drift_detected: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "any_drift_detected": self.any_drift_detected,
+            "n_features_checked": len(self.features),
+            "n_features_drifted": sum(1 for f in self.features if f["drift_flag"]),
+            "features": self.features,
+        }
+
+
+def compute_psi(
+    expected_proportions: np.ndarray,
+    observed_proportions: np.ndarray,
+    epsilon: float = PSI_EPSILON,
+) -> float:
+    """Compute PSI between two sets of bin proportions.
+
+    Both arrays are clipped to >= epsilon to prevent log(0) and division-by-zero
+    errors, then re-normalised to sum to 1.0.
+
+    Reference: https://www.lexjansen.com/wuss/2017/47_Final_Paper_PDF.pdf
+    """
+    expected = np.maximum(expected_proportions, epsilon)
+    observed = np.maximum(observed_proportions, epsilon)
+
+    expected = expected / expected.sum()
+    observed = observed / observed.sum()
+
+    psi = np.sum((observed - expected) * np.log(observed / expected))
+    return float(psi)
+
+
+class DriftMonitor:
+    def __init__(self, reference_distribution: dict[str, dict]):
+        self.reference = reference_distribution
+
+    def compute(self, current_data: pd.DataFrame) -> DriftReport:
+        features = []
+        any_drift = False
+
+        for col in current_data.columns:
+            if col not in self.reference:
+                continue
+
+            ref = self.reference[col]
+            bin_edges = np.array(ref["bin_edges"])
+            expected = np.array(ref["expected_proportions"])
+
+            col_data = current_data[col].dropna().values
+            if len(col_data) == 0:
+                continue
+
+            n_bins = len(bin_edges) - 1
+            bin_indices = np.digitize(col_data, bins=bin_edges) - 1
+            bin_indices = np.clip(bin_indices, 0, n_bins - 1)
+            counts = np.bincount(bin_indices, minlength=n_bins)
+            total = counts.sum()
+            observed = counts / total if total > 0 else np.zeros(n_bins, dtype=float)
+
+            psi = compute_psi(expected, observed)
+
+            drift_flag = psi >= PSI_MODERATE_DRIFT_THRESHOLD
+            if drift_flag:
+                any_drift = True
+
+            features.append(
+                {
+                    "feature": col,
+                    "psi": psi,
+                    "drift_flag": drift_flag,
+                }
+            )
+
+        report = DriftReport(features=features, any_drift_detected=any_drift)
+        self._write_report(report)
+        return report
+
+    def _write_report(self, report: DriftReport) -> str:
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(REPORTS_DIR, f"drift_report_{timestamp}.json")
+        with open(path, "w") as f:
+            json.dump(report.to_dict(), f, indent=2)
+        return path
