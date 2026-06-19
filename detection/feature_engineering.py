@@ -189,6 +189,7 @@ def compute_trade_pattern_features(
         return {
             "counterparty_concentration_ratio": 0.0,
             "round_trip_frequency": 0.0,
+            "net_roundtrip_ratio": 0.0,
             "self_matching_rate": 0.0,
             "order_cancellation_rate": order_cancellation_rate,
         }
@@ -210,6 +211,7 @@ def compute_trade_pattern_features(
     return {
         "counterparty_concentration_ratio": float(concentration),
         "round_trip_frequency": float(round_trip_frequency),
+        "net_roundtrip_ratio": float(round_trip_frequency),
         "self_matching_rate": float(self_matching_rate),
         "order_cancellation_rate": order_cancellation_rate,
     }

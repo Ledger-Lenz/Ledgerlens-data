@@ -20,6 +20,7 @@ import pandas as pd
 from stellar_sdk import Asset as SdkAsset
 
 from config import config
+from detection.causal_attribution import CounterfactualAttributor
 from detection.feature_engineering import build_feature_vector
 from detection.forensic_report import ForensicReportGenerator, write_report_secure
 from detection.model_inference import RiskScorer
@@ -85,22 +86,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
     parser.add_argument(
-        "--report",
+        "--causal",
         action="store_true",
-        help="Generate a forensic report alongside the score",
+        help="Include causal attribution in the output",
     )
     parser.add_argument(
-        "--report-format",
-        choices=["json", "markdown", "pdf"],
-        default="json",
-        help="Format for the forensic report (default: json)",
-    )
-    parser.add_argument(
-        "--anchor",
-        action="store_true",
-        help="Anchor the report SHA-256 to Soroban after generation",
+        "--what-if-remove",
+        default=None,
+        help="Comma-separated trade IDs to remove for a counterfactual score",
     )
     return parser.parse_args()
+
+
+def _parse_remove_trade_ids(
+    remove_trade_ids: str | None, trades_df: pd.DataFrame, wallet: str
+) -> list[str]:
+    if not remove_trade_ids:
+        return []
+
+    requested = [trade_id.strip() for trade_id in remove_trade_ids.split(",") if trade_id.strip()]
+    if not requested:
+        return []
+
+    if trades_df.empty or "trade_id" not in trades_df.columns:
+        raise ValueError("Cannot remove trades: wallet trade history is empty")
+
+    wallet_trade_ids = set(trades_df["trade_id"].astype(str))
+    invalid = [trade_id for trade_id in requested if trade_id not in wallet_trade_ids]
+    if invalid:
+        raise ValueError(f"Trade IDs not found in wallet history: {', '.join(sorted(invalid))}")
+
+    return requested
 
 
 def main() -> None:
@@ -156,6 +172,31 @@ def main() -> None:
         print(f"Error during scoring: {e}", file=sys.stderr)
         sys.exit(1)
 
+    remove_trade_ids = []
+    causal_result = None
+    if args.what_if_remove or args.causal:
+        try:
+            remove_trade_ids = _parse_remove_trade_ids(args.what_if_remove, trades_df, args.wallet)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise
+
+        attributor = CounterfactualAttributor(scorer)
+        if remove_trade_ids:
+            causal_result = attributor.counterfactual_score(
+                args.wallet,
+                trades_df,
+                remove_trade_ids,
+                orderbook_events=orderbook_events_df,
+            )
+        elif args.causal:
+            causal_result = attributor.counterfactual_score(
+                args.wallet,
+                trades_df,
+                [],
+                orderbook_events=orderbook_events_df,
+            )
+
     # 5. Explain
     try:
         explainer = ShapExplainer()
@@ -176,6 +217,8 @@ def main() -> None:
             "confidence": result["confidence"],
             "shap_explanations": shap_explanations,
         }
+        if causal_result is not None:
+            output["causal_attribution"] = causal_result
         print(json.dumps(output, indent=2))
     else:
         status = "FLAGGED" if result["score"] >= config.RISK_SCORE_FLAG_THRESHOLD else "OK"
@@ -189,9 +232,15 @@ def main() -> None:
             contrib = f"{exp['contribution']:+.2f}"
             print(f"  {i}. {exp['feature']:<25} {contrib:>6}  (value: {exp['value']:.4g})")
 
-    # 7. Forensic report (optional)
-    if args.report:
-        _generate_report(args, result, shap_explanations, trades_df, feature_row, scorer)
+        if causal_result is not None:
+            print("\nCausal attribution:")
+            print(f"  Original score:        {causal_result['original_score']}")
+            print(f"  Counterfactual score:   {causal_result['counterfactual_score']}")
+            print(f"  Score delta:           {causal_result['score_delta']}")
+            if causal_result["features_changed"]:
+                print("  Features changed:")
+                for name, details in causal_result["features_changed"].items():
+                    print(f"    - {name}: {details['original']} -> {details['counterfactual']}")
 
 
 if __name__ == "__main__":
