@@ -22,10 +22,10 @@ import os
 import sys
 
 from config import config
-from detection.model_inference import RiskScorer
 from streaming.alert_dispatcher import AlertDispatcher
-from streaming.feature_buffer import FeatureBuffer, StreamingScorer
+from streaming.feature_buffer import FeatureBuffer
 from streaming.pipeline import StreamingPipeline
+from streaming.streaming_scorer import StreamingScorer
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -72,13 +72,10 @@ def main() -> None:
         sys.exit(1)
 
     # --- Load ensemble models ---
-    try:
-        risk_scorer = RiskScorer()
-    except Exception as exc:
-        logger.error("Failed to initialise RiskScorer from %s: %s", config.MODEL_DIR, exc)
-        sys.exit(1)
+    scorer = StreamingScorer()
+    scorer.min_trades = args.min_trades
 
-    if not risk_scorer.models:
+    if not scorer._risk_scorer.models:
         logger.error(
             "No trained models found in %s. " "Run 'python -m detection.model_training' first.",
             config.MODEL_DIR,
@@ -100,7 +97,6 @@ def main() -> None:
 
     # --- Wire up components ---
     buffer = FeatureBuffer()
-    scorer = StreamingScorer(risk_scorer, buffer, min_trades=args.min_trades)
     dispatcher = AlertDispatcher(
         channel=args.alert_channel,
         webhook_url=os.getenv("ALERT_WEBHOOK_URL"),

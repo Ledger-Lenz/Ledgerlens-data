@@ -25,7 +25,8 @@ from stellar_sdk import Asset as SdkAsset
 from config import config
 from ingestion.horizon_streamer import stream_trades
 from streaming.alert_dispatcher import AlertDispatcher
-from streaming.feature_buffer import FeatureBuffer, StreamingScorer
+from streaming.feature_buffer import FeatureBuffer
+from streaming.streaming_scorer import StreamingScorer
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -114,7 +115,7 @@ class StreamingPipeline:
                     self._buffer.update(trade)
                     pair_id = trade.base_asset.pair_id(trade.counter_asset)
                     for wallet in (trade.base_account, trade.counter_account):
-                        score = self._scorer.score_wallet(wallet)
+                        score = self._scorer.score_wallet(wallet, self._buffer)
                         if score is not None:
                             self._dispatcher.dispatch(wallet, score, pair_id)
             except Exception as exc:

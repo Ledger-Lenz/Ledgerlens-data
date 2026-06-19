@@ -32,6 +32,10 @@ class Config:
         os.getenv("BENFORD_WINDOWS_HOURS", "1,4,24,168,720")
     )
 
+    CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS: int = int(
+        os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
+    )
+
     RISK_SCORE_FLAG_THRESHOLD: int = int(os.getenv("RISK_SCORE_FLAG_THRESHOLD", "70"))
 
     RISK_SCORE_DB_URL: str = os.getenv("RISK_SCORE_DB_URL", "sqlite:///ledgerlens.db")
@@ -42,6 +46,8 @@ class Config:
     SOROBAN_RPC_URL: str = os.getenv("SOROBAN_RPC_URL", "https://soroban-testnet.stellar.org")
     LEDGERLENS_CONTRACT_ID: str = os.getenv("LEDGERLENS_CONTRACT_ID", "")
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
+
+    MIN_TRADES_FOR_SCORING: int = int(os.getenv("MIN_TRADES_FOR_SCORING", "20"))
 
     # Real-time streaming / alerting
     ALERT_CHANNEL: str = os.getenv("ALERT_CHANNEL", "stdout")

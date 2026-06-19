@@ -1,90 +1,105 @@
-"""Rolling per-wallet trade buffer and on-the-fly streaming scorer.
+"""Thread-safe per-wallet rolling trade buffer.
 
-Phase 1 of the real-time detection pipeline (Issue #012).
-FeatureBuffer accumulates trades per wallet; StreamingScorer builds a feature
-vector and scores once the wallet has enough history.
+Phase 1 of the real-time detection pipeline (Issue #12).
+
+Thread-safety model
+-------------------
+- A top-level ``threading.RLock`` (``_registry_lock``) guards mutations to the
+  dict of wallets and their per-wallet locks.
+- Each wallet gets its own ``threading.Lock`` that is held only while
+  reading/writing that wallet's deque.  Unrelated wallets can therefore be
+  updated concurrently with no contention between them.
 """
 
 from __future__ import annotations
 
 import threading
+from collections import deque
 from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from detection.feature_engineering import build_feature_vector
 from ingestion.data_models import Trade
-from utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from detection.model_inference import RiskScorer
-
-logger = get_logger(__name__)
+    pass
 
 
 class FeatureBuffer:
-    """Thread-safe rolling trade buffer; builds feature vectors on demand."""
+    """Per-wallet rolling deque of recent trades, safe for concurrent access."""
 
-    def __init__(self, max_trades_per_wallet: int = 5000):
-        self._buffer: dict[str, list[dict]] = {}
-        self._lock = threading.Lock()
-        self.max_trades_per_wallet = max_trades_per_wallet
+    def __init__(self, max_trades: int = 1000) -> None:
+        self.max_trades = max_trades
+        # Guards creation of new wallet entries in _buffers/_locks.
+        self._registry_lock = threading.RLock()
+        self._buffers: dict[str, deque] = {}
+        self._wallet_locks: dict[str, threading.Lock] = {}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_wallet(self, wallet: str) -> threading.Lock:
+        """Return the lock for *wallet*, creating both lock and deque if absent."""
+        with self._registry_lock:
+            if wallet not in self._wallet_locks:
+                self._wallet_locks[wallet] = threading.Lock()
+                self._buffers[wallet] = deque(maxlen=self.max_trades)
+            return self._wallet_locks[wallet]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def update(self, trade: Trade) -> None:
-        """Append trade to both the base_account and counter_account buffers."""
+        """Add *trade* to both ``base_account`` and ``counter_account`` buffers.
+
+        When a wallet's deque is at capacity, ``deque(maxlen=…)`` automatically
+        evicts the oldest entry on ``append()``.
+        """
         record = {
+            "trade_id": trade.trade_id,
             "ledger_close_time": trade.ledger_close_time,
             "base_account": trade.base_account,
             "counter_account": trade.counter_account,
+            "base_asset": str(trade.base_asset.code),
+            "counter_asset": str(trade.counter_asset.code),
             "amount": trade.amount,
         }
-        with self._lock:
-            for wallet in (trade.base_account, trade.counter_account):
-                buf = self._buffer.setdefault(wallet, [])
-                buf.append(record)
-                if len(buf) > self.max_trades_per_wallet:
-                    self._buffer[wallet] = buf[-self.max_trades_per_wallet :]
+        for wallet in (trade.base_account, trade.counter_account):
+            lock = self._ensure_wallet(wallet)
+            with lock:
+                self._buffers[wallet].append(record)
 
-    def get_wallet_df(self, wallet: str) -> pd.DataFrame:
-        """Return buffered trades for *wallet* as a DataFrame."""
-        with self._lock:
-            records = list(self._buffer.get(wallet, []))
+    def get_feature_row(self, wallet: str) -> pd.Series | None:
+        """Build and return the feature row for *wallet*.
+
+        Returns ``None`` if the wallet has no trades in the buffer.
+        """
+        lock = self._ensure_wallet(wallet)
+        with lock:
+            records = list(self._buffers[wallet])
+
         if not records:
-            return pd.DataFrame(
-                columns=["ledger_close_time", "base_account", "counter_account", "amount"]
-            )
-        return pd.DataFrame(records)
+            return None
+
+        wallet_df = pd.DataFrame(records)
+        features = build_feature_vector(wallet, wallet_df, all_pairs_df=wallet_df)
+        return pd.Series(features)
 
     def wallet_trade_count(self, wallet: str) -> int:
-        """Number of trades buffered for *wallet*."""
-        with self._lock:
-            return len(self._buffer.get(wallet, []))
+        """Return the number of trades currently buffered for *wallet*."""
+        with self._registry_lock:
+            buf = self._buffers.get(wallet)
+        if buf is None:
+            return 0
+        # The deque's own lock isn't needed for len() — CPython's GIL makes
+        # len() of a deque atomic, and a brief race here is acceptable for a
+        # count-only read.
+        return len(buf)
 
-
-class StreamingScorer:
-    """Scores wallets in real time using buffered trades and a trained RiskScorer."""
-
-    def __init__(
-        self,
-        risk_scorer: RiskScorer,
-        buffer: FeatureBuffer,
-        min_trades: int = 20,
-    ):
-        self._risk_scorer = risk_scorer
-        self._buffer = buffer
-        self.min_trades = min_trades
-
-    def score_wallet(self, wallet: str) -> dict | None:
-        """Return a RiskScore dict, or *None* if the wallet lacks enough history."""
-        if self._buffer.wallet_trade_count(wallet) < self.min_trades:
-            return None
-
-        wallet_df = self._buffer.get_wallet_df(wallet)
-        features = build_feature_vector(wallet, wallet_df)
-        feature_row = pd.Series(features)
-
-        try:
-            return self._risk_scorer.score(feature_row)
-        except Exception as exc:
-            logger.warning("Scoring failed for wallet %s: %s", wallet, exc)
-            return None
+    def all_wallets(self) -> list[str]:
+        """Return all wallets currently tracked in the buffer."""
+        with self._registry_lock:
+            return list(self._buffers.keys())

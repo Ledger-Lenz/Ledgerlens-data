@@ -76,6 +76,15 @@ def trades_to_dataframe(trades: Iterator[Trade]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def load_pair_to_dataframe(
+    base_asset: SdkAsset,
+    counter_asset: SdkAsset,
+    start_time: datetime | None = None,
+) -> pd.DataFrame:
+    """Load historical trades for a single asset pair into a DataFrame."""
+    return trades_to_dataframe(load_trades(base_asset, counter_asset, start_time=start_time))
+
+
 def load_watched_pairs_to_dataframe(start_time: datetime | None = None) -> pd.DataFrame:
     """Load historical trades for every pair configured in
     `WATCHED_ASSET_PAIRS` and combine them into a single DataFrame."""
@@ -86,7 +95,7 @@ def load_watched_pairs_to_dataframe(start_time: datetime | None = None) -> pd.Da
         asset = xlm if issuer == "native" else SdkAsset(code, issuer)
         if asset == xlm:
             continue
-        frames.append(trades_to_dataframe(load_trades(asset, xlm, start_time=start_time)))
+        frames.append(load_pair_to_dataframe(asset, xlm, start_time=start_time))
 
     if not frames:
         return pd.DataFrame()

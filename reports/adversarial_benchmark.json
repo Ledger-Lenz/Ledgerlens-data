@@ -1,0 +1,32 @@
+{
+  "seed": 42,
+  "n_test_positives": 100,
+  "risk_score_flag_threshold": 70,
+  "evasion_rate": 0.0,
+  "median_l1_cost": 0.0,
+  "gradient_attack": {
+    "evasion_rate": 0.0,
+    "median_l1_cost": 0.0,
+    "mean_l1_cost": 0.0
+  },
+  "benford_evasion_attack": {
+    "evasion_rate": 0.0,
+    "mean_score_conforming": 0.0,
+    "mean_score_nonconforming": 0.0
+  },
+  "counterparty_diversification_attack": {
+    "concentration_by_n_counterparties": {
+      "1": 1.0,
+      "2": 0.5,
+      "5": 0.2,
+      "10": 0.1
+    }
+  },
+  "hardening_results": {
+    "option_c_ensemble_disagreement": {
+      "baseline_evasion_rate": 0.0,
+      "hardened_evasion_rate": 0.0,
+      "reduction": 0.0
+    }
+  }
+}

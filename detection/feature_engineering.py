@@ -5,16 +5,23 @@ Feature groups (see README):
   - Trade pattern features
   - Volume and timing features
   - Wallet graph features
+  - Cross-asset coordination features (6): synchrony, net flow, counterparty overlap, volume correlation, pair diversity, Benford MAD std
 
 Each `compute_*_features` function operates on the trade DataFrame produced
 by `ingestion.historical_loader.trades_to_dataframe` (or the streamer,
 buffered into a DataFrame) for a single wallet.
 """
 
+import math
+
 import networkx as nx
 import pandas as pd
 
-from detection.benford_engine import compute_benford_metrics_for_windows
+from config import config
+from detection.benford_engine import (
+    compute_benford_metrics_for_windows,
+    cross_pair_benford_consistency,
+)
 from detection.wallet_graph import compute_wallet_graph_metrics
 from ingestion.data_models import AccountActivity
 
@@ -160,12 +167,205 @@ def compute_wallet_graph_features(
     }
 
 
+def compute_cross_asset_features(
+    wallet: str,
+    all_pairs_df: pd.DataFrame,
+) -> dict:
+    """Cross-asset coordination features computed from multi-pair trade data.
+
+    `all_pairs_df` should contain trades across all pairs for the wallet, with
+    a `pair_id` column identifying which pair each trade belongs to.
+
+    Returns a dict with 6 cross-asset features:
+    - cross_pair_trade_synchrony: fraction of trades with simultaneous activity on other pairs
+    - net_asset_flow_deviation: max absolute net flow normalized by volume (close to 0 = closed cycle)
+    - cross_pair_counterparty_overlap: Jaccard similarity of counterparty sets across pairs
+    - cross_pair_volume_correlation: Pearson correlation of volumes across pairs (by minute)
+    - pair_diversity_score: Shannon entropy of volume distribution across pairs
+    - cross_pair_mad_std: standard deviation of Benford MAD scores across pairs
+    """
+    # Default values for single pair or empty data
+    default_features = {
+        "cross_pair_trade_synchrony": 0.0,
+        "net_asset_flow_deviation": 1.0,
+        "cross_pair_counterparty_overlap": 0.0,
+        "cross_pair_volume_correlation": 0.0,
+        "pair_diversity_score": 0.0,
+        "cross_pair_mad_std": 0.0,
+    }
+
+    if all_pairs_df.empty:
+        return default_features
+
+    # Ensure timestamp column exists and is datetime
+    if "ledger_close_time" not in all_pairs_df.columns:
+        return default_features
+
+    # Filter to trades involving the wallet
+    mask = (all_pairs_df["base_account"] == wallet) | (all_pairs_df["counter_account"] == wallet)
+    wallet_trades = all_pairs_df[mask].copy()
+
+    if wallet_trades.empty:
+        return default_features
+
+    # Ensure we have a pair_id column; if not, infer from base/counter assets
+    if "pair_id" not in wallet_trades.columns:
+        if (
+            "base_asset" not in wallet_trades.columns
+            or "counter_asset" not in wallet_trades.columns
+        ):
+            return default_features
+        wallet_trades["pair_id"] = (
+            wallet_trades["base_asset"].astype(str)
+            + "/"
+            + wallet_trades["counter_asset"].astype(str)
+        )
+
+    n_pairs = wallet_trades["pair_id"].nunique()
+    if n_pairs < 2:
+        # Less than 2 pairs: cross-pair features don't apply
+        return default_features
+
+    features = {}
+
+    # Feature 1: cross_pair_trade_synchrony
+    # Fraction of trades where wallet also trades on another pair within window
+    wallet_times = pd.to_datetime(wallet_trades["ledger_close_time"], errors="coerce")
+    window_seconds = config.CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS
+    synchrony_count = 0
+    for trade_time in wallet_times:
+        if pd.isna(trade_time):
+            continue
+        other_trades = wallet_times[
+            (wallet_times >= trade_time - pd.Timedelta(seconds=window_seconds))
+            & (wallet_times <= trade_time + pd.Timedelta(seconds=window_seconds))
+        ]
+        other_pairs = wallet_trades.loc[other_trades.index, "pair_id"].unique()
+        if len(other_pairs) > 1:
+            synchrony_count += 1
+
+    features["cross_pair_trade_synchrony"] = float(synchrony_count / len(wallet_trades))
+
+    # Feature 2: net_asset_flow_deviation
+    # Compute net flow for each asset; deviation = max(|net_flow|) / total_volume
+    net_flows = {}
+    total_volume = 0.0
+
+    for _, trade in wallet_trades.iterrows():
+        base_asset = trade.get("base_asset")
+        counter_asset = trade.get("counter_asset")
+        amount = float(trade.get("amount", 0.0))
+
+        if trade["base_account"] == wallet:
+            # Wallet sends base, receives counter
+            if base_asset not in net_flows:
+                net_flows[base_asset] = 0.0
+            net_flows[base_asset] -= amount
+            if counter_asset not in net_flows:
+                net_flows[counter_asset] = 0.0
+            net_flows[counter_asset] += amount
+        else:
+            # Wallet sends counter, receives base
+            if counter_asset not in net_flows:
+                net_flows[counter_asset] = 0.0
+            net_flows[counter_asset] -= amount
+            if base_asset not in net_flows:
+                net_flows[base_asset] = 0.0
+            net_flows[base_asset] += amount
+
+        total_volume += amount
+
+    max_net_flow = max((abs(flow) for flow in net_flows.values()), default=0.0)
+    features["net_asset_flow_deviation"] = max_net_flow / total_volume if total_volume > 0 else 1.0
+
+    # Feature 3: cross_pair_counterparty_overlap
+    # Jaccard similarity of counterparty sets across pairs
+    counterparties_by_pair = {}
+    for pair_id in wallet_trades["pair_id"].unique():
+        pair_trades = wallet_trades[wallet_trades["pair_id"] == pair_id]
+        counterparties = set()
+        for _, trade in pair_trades.iterrows():
+            if trade["base_account"] == wallet:
+                counterparties.add(trade["counter_account"])
+            else:
+                counterparties.add(trade["base_account"])
+        counterparties_by_pair[pair_id] = counterparties
+
+    pairs_list = list(counterparties_by_pair.keys())
+    if len(pairs_list) >= 2:
+        # Compute Jaccard between first and second pair (simplified; could do all pairs)
+        set1 = counterparties_by_pair[pairs_list[0]]
+        set2 = counterparties_by_pair[pairs_list[1]]
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        features["cross_pair_counterparty_overlap"] = (
+            float(intersection / union) if union > 0 else 0.0
+        )
+    else:
+        features["cross_pair_counterparty_overlap"] = 0.0
+
+    # Feature 4: cross_pair_volume_correlation
+    # Pearson correlation of trade volumes across pairs, bucketed by minute
+    minute_volumes_by_pair = {}
+    for pair_id in wallet_trades["pair_id"].unique():
+        pair_trades = wallet_trades[wallet_trades["pair_id"] == pair_id].copy()
+        pair_trades["minute"] = pd.to_datetime(pair_trades["ledger_close_time"]).dt.floor("min")
+        minute_volumes = pair_trades.groupby("minute")["amount"].sum()
+        minute_volumes_by_pair[pair_id] = minute_volumes
+
+    if len(minute_volumes_by_pair) >= 2:
+        pairs_list = list(minute_volumes_by_pair.keys())
+        volumes_1 = minute_volumes_by_pair[pairs_list[0]]
+        volumes_2 = minute_volumes_by_pair[pairs_list[1]]
+        # Align by minute
+        aligned_idx = volumes_1.index.intersection(volumes_2.index)
+        if len(aligned_idx) > 1:
+            correlation = float(volumes_1[aligned_idx].corr(volumes_2[aligned_idx]))
+            features["cross_pair_volume_correlation"] = (
+                correlation if not pd.isna(correlation) else 0.0
+            )
+        else:
+            features["cross_pair_volume_correlation"] = 0.0
+    else:
+        features["cross_pair_volume_correlation"] = 0.0
+
+    # Feature 5: pair_diversity_score
+    # Shannon entropy of volume distribution across pairs
+    pair_volumes = wallet_trades.groupby("pair_id")["amount"].sum()
+    total_vol = pair_volumes.sum()
+    if total_vol > 0:
+        proportions = pair_volumes / total_vol
+        entropy = -sum(p * math.log2(p) if p > 0 else 0 for p in proportions)
+        max_entropy = math.log2(len(proportions)) if len(proportions) > 0 else 1.0
+        features["pair_diversity_score"] = float(entropy / max_entropy) if max_entropy > 0 else 0.0
+    else:
+        features["pair_diversity_score"] = 0.0
+
+    # Feature 6: cross_pair_mad_std
+    # Standard deviation of Benford MAD scores across pairs
+    per_pair_metrics = {}
+    for pair_id in wallet_trades["pair_id"].unique():
+        pair_trades = wallet_trades[wallet_trades["pair_id"] == pair_id]
+        metrics = compute_benford_metrics_for_windows(pair_trades)
+        # Average MAD across all windows for this pair
+        per_pair_metrics[pair_id] = {
+            "mad": (
+                sum(m.get("mad", 0.0) for m in metrics.values()) / len(metrics) if metrics else 0.0
+            )
+        }
+
+    features["cross_pair_mad_std"] = cross_pair_benford_consistency(per_pair_metrics)
+
+    return features
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
     activity: AccountActivity | None = None,
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
+    all_pairs_df: pd.DataFrame | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -174,7 +374,8 @@ def build_feature_vector(
     of `ingestion.orderbook_loader.load_accounts_orderbook_events`, used to
     compute `order_cancellation_rate`. `funding_graph` (optional) is the
     output of `detection.wallet_graph.build_funding_graph`, used for the
-    wallet graph features.
+    wallet graph features. `all_pairs_df` (optional) enables cross-asset
+    coordination features.
     """
     reference_time = (
         pd.to_datetime(wallet_trades["ledger_close_time"], utc=True).max()
@@ -187,6 +388,8 @@ def build_feature_vector(
     features.update(compute_trade_pattern_features(wallet, wallet_trades, orderbook_events))
     features.update(compute_volume_timing_features(wallet_trades))
     features.update(compute_wallet_graph_features(wallet, activity, reference_time, funding_graph))
+    if all_pairs_df is not None:
+        features.update(compute_cross_asset_features(wallet, all_pairs_df))
 
     return features
 
@@ -195,12 +398,15 @@ def build_feature_matrix(
     trades_df: pd.DataFrame,
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
+    all_pairs_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a feature matrix with one row per wallet observed in `trades_df`.
 
     `orderbook_events` and `funding_graph` (both optional) are threaded
     through to `build_feature_vector` for `order_cancellation_rate` and the
-    wallet graph features respectively.
+    wallet graph features respectively. `all_pairs_df` (optional, should be
+    the same as `trades_df` or a superset with a `pair_id` column) enables
+    cross-asset coordination features.
     """
     if trades_df.empty:
         return pd.DataFrame()
@@ -216,6 +422,7 @@ def build_feature_matrix(
                 trades_df[mask],
                 orderbook_events=orderbook_events,
                 funding_graph=funding_graph,
+                all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
             )
         )
 
