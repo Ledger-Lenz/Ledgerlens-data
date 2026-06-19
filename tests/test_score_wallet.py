@@ -113,3 +113,56 @@ def test_score_wallet_missing_models_exits_1(capsys, mock_ingestion):
         assert excinfo.value.code == 1
         _, err = capsys.readouterr()
         assert "model_training.py" in err
+
+
+def test_score_wallet_causal_json_output_includes_causal_section(
+    capsys, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    with patch("scripts.score_wallet.CounterfactualAttributor") as mock_attributor:
+        attributor_instance = mock_attributor.return_value
+        attributor_instance.counterfactual_score.return_value = {
+            "original_score": 83,
+            "counterfactual_score": 41,
+            "score_delta": 42,
+            "features_changed": {"round_trip_frequency": {"original": 0.6, "counterfactual": 0.0}},
+        }
+        with patch(
+            "sys.argv",
+            [
+                "score_wallet.py",
+                "--wallet",
+                test_wallet,
+                "--pair",
+                "USDC:G...",
+                "--json",
+                "--causal",
+            ],
+        ):
+            main()
+
+    out, _ = capsys.readouterr()
+    data = json.loads(out)
+    assert data["wallet"] == test_wallet
+    assert "causal_attribution" in data
+    assert data["causal_attribution"]["counterfactual_score"] == 41
+
+
+def test_score_wallet_what_if_remove_invalid_trade_raises_value_error(
+    mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    with patch(
+        "sys.argv",
+        [
+            "score_wallet.py",
+            "--wallet",
+            test_wallet,
+            "--pair",
+            "USDC:G...",
+            "--what-if-remove",
+            "not-a-trade",
+        ],
+    ):
+        with pytest.raises(ValueError):
+            main()
