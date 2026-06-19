@@ -1,0 +1,36 @@
+# Forensic Report
+
+Wallet: {{ report.wallet }}
+Asset pair: {{ report.asset_pair }}
+Risk score: {{ report.risk_score.score }}
+
+## Summary
+
+- Benford flag: {{ report.risk_score.benford_flag }}
+- ML flag: {{ report.risk_score.ml_flag }}
+- Confidence: {{ report.risk_score.confidence }}
+
+## SHAP
+
+{% for item in report.shap_explanations %}
+- {{ item.feature }}: {{ item.contribution }} (value: {{ item.value }})
+{% endfor %}
+
+## Causal Attribution
+
+{% if report.causal_attribution %}
+- Minimal exonerating trades: {{ report.causal_attribution.minimal_exonerating_trades | join(', ') }}
+- Counterfactual score: {{ report.causal_attribution.counterfactual_score }}
+- Root cause wallet: {{ report.causal_attribution.root_cause_wallet }}
+- Interventional score if no wash: {{ report.causal_attribution.interventional_score_if_no_wash }}
+
+### Causal chain
+
+{% for hop in report.causal_attribution.causal_chain %}
+- Hop {{ hop.hop }}: {{ hop.wallet }} ({{ hop.role }})
+{% endfor %}
+
+> The presence of a minimal exonerating set does not indicate the wallet is innocent; it indicates which specific trades are most anomalous.
+{% else %}
+- Causal attribution disabled.
+{% endif %}

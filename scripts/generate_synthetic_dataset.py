@@ -46,6 +46,7 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
         if is_wash:
             row["counterparty_concentration_ratio"] = rng.uniform(0.7, 1.0)
             row["round_trip_frequency"] = rng.uniform(0.3, 1.0)
+            row["net_roundtrip_ratio"] = rng.uniform(0.3, 1.0)
             row["self_matching_rate"] = rng.uniform(0.3, 1.0)
             row["order_cancellation_rate"] = rng.uniform(0.4, 0.9)
             row["volume_per_counterparty_ratio"] = rng.uniform(1000, 10000)
@@ -65,6 +66,7 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
         else:
             row["counterparty_concentration_ratio"] = rng.uniform(0.0, 0.5)
             row["round_trip_frequency"] = rng.uniform(0.0, 0.1)
+            row["net_roundtrip_ratio"] = rng.uniform(0.0, 0.1)
             row["self_matching_rate"] = rng.uniform(0.0, 0.1)
             row["order_cancellation_rate"] = rng.uniform(0.0, 0.3)
             row["volume_per_counterparty_ratio"] = rng.uniform(10, 1000)
