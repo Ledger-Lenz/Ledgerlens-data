@@ -32,6 +32,8 @@ class Config:
         os.getenv("BENFORD_WINDOWS_HOURS", "1,4,24,168,720")
     )
 
+    ASSET_BENFORD_WINDOWS: dict[str, list[int]] = {}
+
     CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS: int = int(
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
     )
@@ -84,5 +86,27 @@ class Config:
     AL_ROLLBACK_AUC_DROP: float = float(os.getenv("AL_ROLLBACK_AUC_DROP", "0.01"))
     AL_QUEUE_PATH: str = os.getenv("AL_QUEUE_PATH", "data/annotation_queue.json")
 
+    def load_asset_benford_windows(self) -> None:
+        """Scan MODEL_DIR for per-asset windows JSON files and load them."""
+        import json
+        from pathlib import Path
+        model_dir = self.MODEL_DIR
+        self.ASSET_BENFORD_WINDOWS = {}
+        try:
+            p = Path(model_dir)
+            if p.exists() and p.is_dir():
+                for f in p.glob("*_benford_windows.json"):
+                    asset_code = f.name[:-21]
+                    try:
+                        with f.open() as file_obj:
+                            windows = json.load(file_obj)
+                            if isinstance(windows, list):
+                                self.ASSET_BENFORD_WINDOWS[asset_code] = [int(w) for w in windows]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
 
 config = Config()
+config.load_asset_benford_windows()

@@ -108,13 +108,38 @@ def compute_benford_metrics(amounts: pd.Series) -> dict:
     Returns a dict with `chi_square`, `mad`, `mad_nonconforming`, and
     `z_scores` (per-digit dict), suitable for use as a feature row.
     """
+    from config import config
+
+    n = int((amounts > 0).sum())
+    if n < config.MIN_TRADES_FOR_SCORING:
+        return {
+            "chi_square": float("nan"),
+            "mad": float("nan"),
+            "mad_nonconforming": False,
+            "z_scores": {d: float("nan") for d in range(1, 10)},
+            "sample_size": n,
+        }
+
     return {
         "chi_square": chi_square_statistic(amounts),
         "mad": mad_score(amounts),
         "mad_nonconforming": mad_score(amounts) > MAD_NONCONFORMITY_THRESHOLD,
         "z_scores": z_scores(amounts),
-        "sample_size": int((amounts > 0).sum()),
+        "sample_size": n,
     }
+
+
+def get_benford_windows(asset: str | None = None) -> list[int]:
+    """Look up custom Benford windows for an asset, falling back to global config."""
+    from config import config
+
+    if asset:
+        if asset in config.ASSET_BENFORD_WINDOWS:
+            return config.ASSET_BENFORD_WINDOWS[asset]
+        code = asset.split(":")[0]
+        if code in config.ASSET_BENFORD_WINDOWS:
+            return config.ASSET_BENFORD_WINDOWS[code]
+    return config.BENFORD_WINDOWS_HOURS
 
 
 def compute_benford_metrics_for_windows(
@@ -123,6 +148,7 @@ def compute_benford_metrics_for_windows(
     time_col: str = "ledger_close_time",
     windows_hours: list[int] | None = None,
     reference_time: pd.Timestamp | None = None,
+    asset: str | None = None,  # NEW: looks up per-asset windows
 ) -> dict[int, dict]:
     """Compute Benford metrics over multiple trailing windows ending at
     `reference_time` (defaults to the max timestamp in `df`).
@@ -130,9 +156,7 @@ def compute_benford_metrics_for_windows(
     Returns a dict mapping window size (hours) -> metrics dict.
     """
     if windows_hours is None:
-        from config import config
-
-        windows_hours = config.BENFORD_WINDOWS_HOURS
+        windows_hours = get_benford_windows(asset)
 
     if df.empty:
         return {w: compute_benford_metrics(pd.Series(dtype=float)) for w in windows_hours}

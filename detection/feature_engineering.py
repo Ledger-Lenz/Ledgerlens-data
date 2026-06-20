@@ -50,7 +50,7 @@ def compute_benford_features(
     and ``benford_residual_mad_{h}h`` — Benford metrics on STL residuals.
     Residual features are set to ``NaN`` for insufficient-data windows.
     """
-    per_window = compute_benford_metrics_for_windows(wallet_trades)
+    per_window = compute_benford_metrics_for_windows(wallet_trades, asset=asset)
 
     features: dict = {}
     for hours, metrics in per_window.items():
@@ -59,7 +59,7 @@ def compute_benford_features(
         features[f"benford_z_max_{hours}h"] = max(metrics["z_scores"].values(), default=0.0)
 
     if decompose and not wallet_trades.empty:
-        for hours, res_metrics in _compute_residual_benford_for_windows(wallet_trades).items():
+        for hours, res_metrics in _compute_residual_benford_for_windows(wallet_trades, asset=asset).items():
             features[f"benford_residual_chi_square_{hours}h"] = res_metrics.get(
                 "chi_square", float("nan")
             )
@@ -117,17 +117,19 @@ def _add_calibrated_benford_features(
     )
 
 
-def _compute_residual_benford_for_windows(wallet_trades: pd.DataFrame) -> dict[int, dict]:
+def _compute_residual_benford_for_windows(
+    wallet_trades: pd.DataFrame, asset: str | None = None
+) -> dict[int, dict]:
     """Compute Benford metrics on STL residuals for each configured window.
 
     For each window, the trade sub-frame is decomposed via STL and Benford
     metrics are computed on the absolute residuals.  Returns NaN entries for
     windows where decomposition is not possible (insufficient data).
     """
-    from detection.benford_engine import compute_benford_metrics
+    from detection.benford_engine import compute_benford_metrics, get_benford_windows
     from detection.ts_decomposition import decompose_trade_amounts
 
-    windows_hours = config.BENFORD_WINDOWS_HOURS
+    windows_hours = get_benford_windows(asset)
     timestamps = pd.to_datetime(wallet_trades["ledger_close_time"])
     ref = timestamps.max()
 
@@ -472,6 +474,7 @@ def build_feature_vector(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    asset: str | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -489,8 +492,11 @@ def build_feature_vector(
         else pd.Timestamp.now(tz="UTC")
     )
 
+    if asset is None and not wallet_trades.empty and "base_asset" in wallet_trades.columns:
+        asset = wallet_trades["base_asset"].iloc[0]
+
     features = {"wallet": wallet}
-    features.update(compute_benford_features(wallet_trades))
+    features.update(compute_benford_features(wallet_trades, asset=asset))
     features.update(compute_trade_pattern_features(wallet, wallet_trades, orderbook_events))
     features.update(compute_volume_timing_features(wallet_trades))
     features.update(compute_wallet_graph_features(wallet, activity, reference_time, funding_graph))
@@ -560,6 +566,7 @@ def build_feature_matrix(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    asset: str | None = None,
 ) -> pd.DataFrame:
     """Build a feature matrix with one row per wallet observed in `trades_df`.
 
@@ -584,6 +591,7 @@ def build_feature_matrix(
                 orderbook_events=orderbook_events,
                 funding_graph=funding_graph,
                 all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
+                asset=asset,
             )
         )
 
