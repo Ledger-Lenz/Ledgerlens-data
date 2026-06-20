@@ -64,5 +64,10 @@ class Config:
         if require_onchain and not self.LEDGERLENS_CONTRACT_ID:
             raise ValueError("LEDGERLENS_CONTRACT_ID is not configured")
 
+    # Adversarial training augmentation
+    # Ratio of adversarially-perturbed copies to add per clean training sample.
+    # Only active when --adversarial-augmentation flag is passed to model_training.py.
+    ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))
+
 
 config = Config()

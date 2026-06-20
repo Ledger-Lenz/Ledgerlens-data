@@ -63,6 +63,10 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
             row["cross_pair_volume_correlation"] = rng.uniform(0.4, 1.0)
             row["pair_diversity_score"] = rng.uniform(0.0, 0.3)
             row["cross_pair_mad_std"] = rng.uniform(0.01, 0.05)
+            # Hardening features (wash: low entropy, low CV, high correlation)
+            row["inter_arrival_cv"] = rng.uniform(0.0, 0.2)
+            row["entropy_of_amounts"] = rng.uniform(0.0, 1.0)
+            row["cross_wallet_volume_corr"] = rng.uniform(0.5, 1.0)
         else:
             row["counterparty_concentration_ratio"] = rng.uniform(0.0, 0.5)
             row["round_trip_frequency"] = rng.uniform(0.0, 0.1)
@@ -83,6 +87,10 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
             row["cross_pair_volume_correlation"] = rng.uniform(-0.5, 0.3)
             row["pair_diversity_score"] = rng.uniform(0.5, 1.0)
             row["cross_pair_mad_std"] = rng.uniform(0.0, 0.01)
+            # Hardening features (legit: higher entropy/CV, lower correlation)
+            row["inter_arrival_cv"] = rng.uniform(0.5, 2.0)
+            row["entropy_of_amounts"] = rng.uniform(3.0, 6.0)
+            row["cross_wallet_volume_corr"] = rng.uniform(-0.3, 0.3)
 
         row["label"] = int(is_wash)
         rows.append(row)

@@ -108,7 +108,82 @@ def split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return df[feature_cols], df["label"]
 
 
-def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42) -> dict:
+def sha256_dataframe(df: pd.DataFrame) -> str:
+    """Return a deterministic SHA-256 of *df* (row-sorted for reproducibility)."""
+    sorted_df = df.sort_values(by=list(df.columns)).reset_index(drop=True)
+    h = hashlib.sha256(sorted_df.to_csv(index=False).encode()).hexdigest()
+    return h
+
+
+LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
+    config.MODEL_DIR, "label_distribution_baseline.json"
+)
+
+
+def detect_label_poisoning(
+    label_distribution: dict,
+    baseline_path: str | None = None,
+    threshold: float | None = None,
+) -> bool:
+    """Return True if the wash-trade label ratio has shifted beyond *threshold*
+    compared with the stored baseline.
+
+    If no baseline file exists yet, one is written and False is returned.
+    """
+    baseline_path = baseline_path or LABEL_DISTRIBUTION_BASELINE_PATH
+    threshold = threshold if threshold is not None else config.POISON_LABEL_RATIO_THRESHOLD
+
+    total = sum(label_distribution.values())
+    if total == 0:
+        return False
+    current_ratio = label_distribution.get(1, 0) / total
+
+    if not os.path.exists(baseline_path):
+        os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+        with open(baseline_path, "w") as f:
+            json.dump({"wash_trade_ratio": current_ratio}, f)
+        return False
+
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+
+    baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
+    return abs(current_ratio - baseline_ratio) > threshold
+
+
+def _adversarial_augment(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    aug_ratio: float,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Augment training data with feature-space perturbations mimicking AmountJitter."""
+    if aug_ratio <= 0:
+        return X_train, y_train
+
+    rng = np.random.default_rng(random_state)
+    wash_mask = y_train == 1
+    X_wash = X_train[wash_mask]
+    n_aug = max(1, int(len(X_wash) * aug_ratio))
+
+    idx = rng.choice(len(X_wash), size=n_aug, replace=True)
+    X_aug = X_wash.iloc[idx].copy().reset_index(drop=True)
+    noise = rng.normal(1.0, 0.005, size=X_aug.shape)
+    X_aug = X_aug * noise
+    y_aug = pd.Series([1] * n_aug, name=y_train.name)
+
+    X_out = pd.concat([X_train, X_aug], ignore_index=True)
+    y_out = pd.concat([y_train, y_aug], ignore_index=True)
+    return X_out, y_out
+
+
+def train_models(
+    df: pd.DataFrame,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    adversarial_augmentation: bool = False,
+    aug_ratio: float | None = None,
+) -> dict:
     """Train all models in `MODEL_REGISTRY` and return fitted estimators
     plus evaluation metrics and split info.
 
@@ -122,14 +197,33 @@ def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 4
           "n_train": int,
           "n_test": int
         }
+
+    If ``adversarial_augmentation`` is True, ``auc_roc_adversarial`` is also
+    included in each model's metrics dict.
     """
+
     X, y = split_features_labels(df)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
+    if adversarial_augmentation:
+        ratio = aug_ratio if aug_ratio is not None else config.ADVERSARIAL_AUG_RATIO
+        if ratio <= 0:
+            logger.warning(
+                "ADVERSARIAL_AUG_RATIO is 0 — augmentation requested but ratio is 0. "
+                "Set ADVERSARIAL_AUG_RATIO > 0 in config/.env to enable."
+            )
+        X_train, y_train = _adversarial_augment(X_train, y_train, ratio, random_state)
+        logger.info("Adversarial augmentation: training set expanded to %d rows", len(X_train))
+
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+
+    # Build an adversarially-perturbed test set for adv. AUC-ROC measurement
+    rng = np.random.default_rng(random_state)
+    noise = rng.normal(1.0, 0.005, size=X_test.shape)
+    X_test_adv = X_test * noise
 
     results = {}
     for name, model_cls in MODEL_REGISTRY.items():
@@ -138,16 +232,21 @@ def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 4
 
         probs = model.predict_proba(X_test)[:, 1]
         preds = model.predict(X_test)
+        probs_adv = model.predict_proba(X_test_adv)[:, 1]
 
         precision, recall, _ = precision_recall_curve(y_test, probs)
 
+        metrics = {
+            "auc_roc": float(roc_auc_score(y_test, probs)),
+            "pr_auc": float(auc(recall, precision)),
+            "f1": float(f1_score(y_test, preds)),
+        }
+        if adversarial_augmentation:
+            metrics["auc_roc_adversarial"] = float(roc_auc_score(y_test, probs_adv))
+
         results[name] = {
             "model": model,
-            "metrics": {
-                "auc_roc": float(roc_auc_score(y_test, probs)),
-                "pr_auc": float(auc(recall, precision)),
-                "f1": float(f1_score(y_test, preds)),
-            },
+            "metrics": metrics,
         }
 
     return {
@@ -225,6 +324,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--random-state", type=int, default=42)
+    parser.add_argument(
+        "--adversarial-augmentation",
+        action="store_true",
+        default=False,
+        help=(
+            "Augment training data with AmountJitter / TemporalSpreading-style "
+            "perturbed copies of wash-trade rows. Augmentation ratio is controlled "
+            "by ADVERSARIAL_AUG_RATIO in config / .env (default 0.0 = disabled)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -235,7 +344,38 @@ def main() -> None:
     df = load_training_data(args.data_path)
     logger.info("Loaded %d rows", len(df))
 
-    training_output = train_models(df, test_size=args.test_size, random_state=args.random_state)
+    # Provenance
+    data_sha = sha256_dataframe(df)
+    label_dist = df["label"].value_counts().to_dict()
+    logger.info("training_data_sha256=%s  label_distribution=%s", data_sha, label_dist)
+
+    if detect_label_poisoning(label_dist):
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        os.makedirs("reports", exist_ok=True)
+        alert_path = f"reports/poisoning_alert_{ts}.json"
+        with open(alert_path, "w") as f:
+            json.dump(
+                {
+                    "detected_at": ts,
+                    "label_distribution": label_dist,
+                    "training_data_sha256": data_sha,
+                },
+                f,
+                indent=2,
+            )
+        logger.critical(
+            "LABEL POISONING DETECTED — wash-trade ratio shifted beyond threshold. "
+            "Training aborted. Alert written to %s",
+            alert_path,
+        )
+        return
+
+    training_output = train_models(
+        df,
+        test_size=args.test_size,
+        random_state=args.random_state,
+        adversarial_augmentation=args.adversarial_augmentation,
+    )
     results = training_output["results"]
     for name, result in results.items():
         logger.info("%s metrics: %s", name, result["metrics"])

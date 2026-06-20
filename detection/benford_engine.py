@@ -165,3 +165,93 @@ def cross_pair_benford_consistency(per_pair_metrics: dict[str, dict]) -> float:
         return 0.0
 
     return float(np.std(mad_scores))
+
+
+# ---------------------------------------------------------------------------
+# Hardening measures
+# ---------------------------------------------------------------------------
+
+
+def leading_digits_log(amounts: pd.Series) -> pd.Series:
+    """Extract leading digits after applying a log10 transform.
+
+    Applying log10 before digit extraction defeats the AmountRounding attack:
+    rounding to N significant figures collapses log10 values to a narrow
+    range, which still reveals the deviation from Benford's Law.
+    """
+    amounts = amounts[amounts > 0]
+    if amounts.empty:
+        return amounts
+    log_amounts = np.log10(amounts)
+    # Shift so all values are > 1, preserving leading-digit semantics
+    shift = math.floor(log_amounts.min()) - 1
+    shifted = log_amounts - shift
+    magnitudes = np.floor(np.log10(shifted)).astype(int)
+    normalized = shifted / (10.0**magnitudes)
+    return np.floor(normalized).astype(int).clip(1, 9)
+
+
+def second_digits(amounts: pd.Series) -> pd.Series:
+    """Extract the second significant digit of each amount (0–9).
+
+    The Newcomb–Benford generalisation extends to second digits.  The
+    expected distribution of the second digit is flatter but still
+    non-uniform, and adversarial rounding typically produces a very
+    different second-digit pattern.
+    """
+    amounts = amounts[amounts > 0]
+    if amounts.empty:
+        return amounts
+    magnitudes = np.floor(np.log10(amounts)).astype(int)
+    normalized = amounts / (10.0**magnitudes)  # first digit is floor(normalized)
+    # Remove first digit contribution, scale up and take floor
+    second = np.floor((normalized - np.floor(normalized)) * 10).astype(int).clip(0, 9)
+    return second
+
+
+def chi_square_log(amounts: pd.Series) -> float:
+    """Chi-square statistic computed on log-transformed leading digits.
+
+    Hardened against AmountRounding by working in log space.
+    """
+    digits = leading_digits_log(amounts)
+    n = len(digits)
+    if n == 0:
+        return 0.0
+    observed_counts = digits.value_counts()
+    chi_sq = 0.0
+    for d in range(1, 10):
+        expected_count = BENFORD_EXPECTED[d] * n
+        observed_count = observed_counts.get(d, 0)
+        if expected_count > 0:
+            chi_sq += (observed_count - expected_count) ** 2 / expected_count
+    return float(chi_sq)
+
+
+def bootstrap_chi_square_ci(
+    amounts: pd.Series,
+    n_bootstrap: int = 500,
+    ci: float = 0.95,
+    rng: np.random.Generator | None = None,
+) -> tuple[float, float]:
+    """Bootstrap confidence interval for the Benford chi-square statistic.
+
+    Returns ``(lower, upper)`` bounds.  A suspiciously *low* chi-square
+    (upper bound near zero) can signal manufactured conformance — an
+    adversary who over-tunes their distribution to match Benford's Law too
+    precisely.
+    """
+    rng = rng or np.random.default_rng(0)
+    amounts = amounts[amounts > 0].reset_index(drop=True)
+    n = len(amounts)
+    if n == 0:
+        return (0.0, 0.0)
+
+    samples = [
+        chi_square_statistic(amounts.iloc[rng.choice(n, size=n, replace=True)])
+        for _ in range(n_bootstrap)
+    ]
+    alpha = 1.0 - ci
+    lower = float(np.percentile(samples, alpha / 2 * 100))
+    upper = float(np.percentile(samples, (1 - alpha / 2) * 100))
+    return (lower, upper)

@@ -15,6 +15,7 @@ buffered into a DataFrame) for a single wallet.
 import math
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 
 from config import config
@@ -392,8 +393,63 @@ def build_feature_vector(
     features.update(compute_wallet_graph_features(wallet, activity, reference_time, funding_graph))
     if all_pairs_df is not None:
         features.update(compute_cross_asset_features(wallet, all_pairs_df))
+    features.update(compute_hardening_features(wallet_trades))
 
     return features
+
+
+def compute_hardening_features(wallet_trades: pd.DataFrame) -> dict:
+    """Hardening features resistant to common adversarial attacks.
+
+    - ``inter_arrival_cv``: coefficient of variation of inter-trade intervals
+      (robust to TemporalSpreading — uniform spreading drives CV toward 0).
+    - ``entropy_of_amounts``: Shannon entropy of the amount distribution
+      (robust to AmountRounding — rounding collapses entropy).
+    - ``cross_wallet_volume_corr``: Pearson correlation of per-minute volumes
+      across the two most-frequent counterparties (lag-0).
+    """
+    if wallet_trades.empty:
+        return {
+            "inter_arrival_cv": 0.0,
+            "entropy_of_amounts": 0.0,
+            "cross_wallet_volume_corr": 0.0,
+        }
+
+    timestamps = pd.to_datetime(wallet_trades["ledger_close_time"]).sort_values()
+
+    # Inter-arrival CV
+    if len(timestamps) > 1:
+        inter_arrivals = timestamps.diff().dt.total_seconds().dropna()
+        mean_ia = inter_arrivals.mean()
+        cv = float(inter_arrivals.std() / mean_ia) if mean_ia > 0 else 0.0
+    else:
+        cv = 0.0
+
+    # Shannon entropy of amounts (binned into up to 50 bins)
+    amounts = wallet_trades["amount"].clip(lower=1e-12)
+    counts, _ = np.histogram(amounts, bins=min(50, len(amounts)))
+    counts = counts[counts > 0]
+    probs = counts / counts.sum()
+    entropy = float(-np.sum(probs * np.log2(probs)))
+
+    # Cross-wallet volume correlation (top-2 counterparties, lag-0)
+    corr = 0.0
+    top_cps = wallet_trades["counter_account"].value_counts().head(2).index.tolist()
+    if len(top_cps) >= 2:
+        df_tmp = wallet_trades.copy()
+        df_tmp["minute"] = pd.to_datetime(df_tmp["ledger_close_time"]).dt.floor("min")
+
+        vol_a = df_tmp[df_tmp["counter_account"] == top_cps[0]].groupby("minute")["amount"].sum()
+        vol_b = df_tmp[df_tmp["counter_account"] == top_cps[1]].groupby("minute")["amount"].sum()
+        aligned = pd.concat([vol_a, vol_b], axis=1, keys=["a", "b"]).fillna(0.0)
+        if len(aligned) > 1 and aligned["a"].std() > 0 and aligned["b"].std() > 0:
+            corr = float(aligned["a"].corr(aligned["b"]))
+
+    return {
+        "inter_arrival_cv": cv,
+        "entropy_of_amounts": entropy,
+        "cross_wallet_volume_corr": float(np.nan_to_num(corr)),
+    }
 
 
 def build_feature_matrix(

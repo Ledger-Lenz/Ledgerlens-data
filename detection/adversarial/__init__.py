@@ -1,0 +1,3 @@
+# Adversarial attack library — intentionally NOT re-exported from detection/__init__.py
+# to prevent accidental import in production code paths.
+# Import directly: from detection.adversarial.attacks import ...
