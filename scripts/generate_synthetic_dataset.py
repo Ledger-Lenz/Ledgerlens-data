@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import sys
 
 import numpy as np
 import pandas as pd
@@ -198,6 +199,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_dataset_summary(df: pd.DataFrame) -> None:
+    """Print label and profile distribution details for generated data."""
+    total = len(df)
+    print("Label distribution:", file=sys.stderr)
+    if total == 0 or "label" not in df.columns:
+        print("  no labelled rows generated", file=sys.stderr)
+    else:
+        counts = df["label"].value_counts().sort_index()
+        for label, label_name in [(0, "legitimate"), (1, "wash_trade")]:
+            count = int(counts.get(label, 0))
+            pct = (count / total * 100) if total else 0.0
+            print(f"  {label_name:<12} (label={label}): {count:>5}  {pct:5.1f}%", file=sys.stderr)
+
+    if "profile" in df.columns:
+        print("Profile distribution:", file=sys.stderr)
+        for profile, count in df["profile"].value_counts().sort_index().items():
+            pct = (int(count) / total * 100) if total else 0.0
+            print(f"  {profile:<24} {int(count):>5}  {pct:5.1f}%", file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -220,6 +241,7 @@ def main() -> None:
         model_path=args.model_path,
     )
     df.to_parquet(args.output)
+    _print_dataset_summary(df)
     print(f"Wrote {len(df)} rows to {args.output}")
 
 
