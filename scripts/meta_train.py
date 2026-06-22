@@ -37,7 +37,8 @@ def meta_train(
     n_inner_steps: int = 5,
     inner_lr: float = 0.01,
     outer_lr: float = 0.001,
-    model_dir: str = None
+    model_dir: str = None,
+    use_dp: bool = False,
 ):
     model_dir = model_dir or config.MODEL_DIR
 
@@ -129,10 +130,53 @@ def meta_train(
 
     logger.info(f"Meta-training complete. Checkpoints saved to {model_dir}")
 
+    if use_dp:
+        from detection.privacy.meta_learner_dp import train_meta_learner_dp
+        from detection.privacy.metrics import record_dp_metrics
+
+        all_emb = []
+        all_y = []
+        for support_df, query_df in generate_tasks(3):
+            for part in (support_df, query_df):
+                X_part, y_part = split_features_labels(part)
+                all_emb.append(extractor.transform(X_part))
+                all_y.append(y_part.values)
+        embeddings = np.concatenate(all_emb, axis=0)
+        labels = np.concatenate(all_y, axis=0).astype(np.float32)
+
+        dp_report = train_meta_learner_dp(
+            embeddings,
+            labels,
+            epochs=config.DP_EPOCHS,
+            use_dp=True,
+        )
+        torch.save(dp_report.model.state_dict(), os.path.join(model_dir, "maml_adapter_dp.pt"))
+        record_dp_metrics(
+            model_dir,
+            "meta_learner",
+            {
+                "target_epsilon": config.DP_TARGET_EPSILON,
+                "target_delta": config.DP_TARGET_DELTA,
+                "achieved_epsilon": dp_report.achieved_epsilon,
+                "max_grad_norm": config.DP_MAX_GRAD_NORM,
+                "epochs": config.DP_EPOCHS,
+                "auc_roc": dp_report.auc_roc,
+                "baseline_auc_roc": dp_report.baseline_auc_roc,
+                "auc_roc_degradation": dp_report.auc_roc_degradation,
+                "membership_inference_success_rate": dp_report.membership_inference_success_rate,
+            },
+        )
+        logger.info(
+            "DP meta-learner saved (ε=%.4f, MIA=%.2f%%)",
+            dp_report.achieved_epsilon or 0.0,
+            dp_report.membership_inference_success_rate * 100,
+        )
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--model-dir", type=str, default=None)
+    parser.add_argument("--dp", action="store_true", help="Also train DP-SGD meta-learner head")
     args = parser.parse_args()
 
-    meta_train(n_epochs=args.epochs, model_dir=args.model_dir)
+    meta_train(n_epochs=args.epochs, model_dir=args.model_dir, use_dp=args.dp)
