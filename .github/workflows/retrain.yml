@@ -138,7 +138,7 @@ jobs:
 
   # Optional: upload to S3/GCS if MODEL_STORE_TYPE is remote
   upload-artifacts:
-    if: env.MODEL_STORE_TYPE == 's3' || env.MODEL_STORE_TYPE == 'gcs'
+    if: ${{ vars.MODEL_STORE_TYPE == 's3' || vars.MODEL_STORE_TYPE == 'gcs' }}
     needs: detect-and-retrain
     runs-on: ubuntu-latest
     permissions:
@@ -149,14 +149,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configure AWS credentials (OIDC)
-        if: env.MODEL_STORE_TYPE == 's3'
+        if: ${{ vars.MODEL_STORE_TYPE == 's3' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Upload models to S3
-        if: env.MODEL_STORE_TYPE == 's3'
+        if: ${{ vars.MODEL_STORE_TYPE == 's3' }}
         run: |
           aws s3 sync models/ s3://${{ vars.MODEL_BUCKET }}/${{ github.repository }}/
           aws s3 sync reports/ s3://${{ vars.MODEL_BUCKET }}/${{ github.repository }}/reports/

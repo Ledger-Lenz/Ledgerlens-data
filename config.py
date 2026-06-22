@@ -22,11 +22,35 @@ def _parse_int_list(raw: str) -> list[int]:
     return [int(v.strip()) for v in raw.split(",") if v.strip()]
 
 
+def _parse_pool_ids(raw: str) -> list[str]:
+    import re
+
+    pool_id_re = re.compile(r"^[0-9a-f]{64}$")
+    ids = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if not pool_id_re.match(entry):
+            raise ValueError(
+                f"WATCHED_AMM_POOLS contains invalid pool ID {entry!r} — "
+                "must be a 64-character lowercase hex string"
+            )
+        ids.append(entry)
+    return ids
+
+
 class Config:
     HORIZON_URL: str = os.getenv("HORIZON_URL", "https://horizon.stellar.org")
     STELLAR_NETWORK: str = os.getenv("STELLAR_NETWORK", "PUBLIC")
 
-    WATCHED_ASSET_PAIRS: list[tuple[str, str]] = _parse_pairs(os.getenv("WATCHED_ASSET_PAIRS", ""))
+    WATCHED_ASSET_PAIRS: list[tuple[str, str]] = _parse_pairs(
+        os.getenv(
+            "WATCHED_ASSET_PAIRS", "USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+        )
+    )
+
+    WATCHED_AMM_POOLS: list[str] = _parse_pool_ids(os.getenv("WATCHED_AMM_POOLS", ""))
 
     BENFORD_WINDOWS_HOURS: list[int] = _parse_int_list(
         os.getenv("BENFORD_WINDOWS_HOURS", "1,4,24,168,720")
@@ -77,12 +101,28 @@ class Config:
     WS_BIND_HOST: str = os.getenv("WS_BIND_HOST", "127.0.0.1")
     WS_ALLOW_EXTERNAL: bool = os.getenv("WS_ALLOW_EXTERNAL", "") == "1"
 
-    def validate(self, require_onchain: bool = True) -> None:
-        """Raise ValueError if required config is missing."""
-        if not self.WATCHED_ASSET_PAIRS:
-            raise ValueError("WATCHED_ASSET_PAIRS is not configured")
-        if require_onchain and not self.LEDGERLENS_CONTRACT_ID:
-            raise ValueError("LEDGERLENS_CONTRACT_ID is not configured")
+    @classmethod
+    def validate(cls, require_onchain: bool = False):
+        errors = []
+
+        if not cls.WATCHED_ASSET_PAIRS:
+            errors.append("WATCHED_ASSET_PAIRS is not set.")
+
+        if not cls.RISK_SCORE_DB_URL.strip():
+            errors.append("RISK_SCORE_DB_URL is not set.")
+
+        if not cls.MODEL_DIR.strip():
+            errors.append("MODEL_DIR is not set.")
+
+        if require_onchain:
+            if not cls.LEDGERLENS_CONTRACT_ID.strip():
+                errors.append("LEDGERLENS_CONTRACT_ID is not set.")
+
+            if not cls.LEDGERLENS_SUBMITTER_SECRET.strip():
+                errors.append("LEDGERLENS_SUBMITTER_SECRET is not set.")
+
+        if errors:
+            raise OSError("LedgerLens configuration errors:\n- " + "\n- ".join(errors))
 
     # Adversarial training augmentation
     ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))

@@ -465,6 +465,24 @@ def compute_cross_asset_features(
     return features
 
 
+def compute_cross_venue_features(
+    wallet: str,
+    sdex_trades: pd.DataFrame,
+    amm_trades: pd.DataFrame,
+) -> dict:
+    """Compute 7 cross-venue coordination features for a wallet.
+
+    Delegates to ``detection.cross_venue_features`` and returns a dict with
+    keys: venue_trade_ratio, cross_venue_volume_correlation,
+    cross_venue_timing_synchrony, cross_venue_net_flow,
+    counterparty_venue_overlap, simultaneous_order_pair,
+    cross_venue_cluster_score.
+    """
+    from detection.cross_venue_features import compute_cross_venue_features as _cvf
+
+    return _cvf(wallet, sdex_trades, amm_trades)
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
@@ -472,6 +490,7 @@ def build_feature_vector(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    amm_trades: pd.DataFrame | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -481,6 +500,7 @@ def build_feature_vector(
     compute `order_cancellation_rate`. `funding_graph` (optional) is the
     output of `detection.wallet_graph.build_funding_graph`, used for the
     wallet graph features. `all_pairs_df` (optional) enables cross-asset
+    coordination features. `amm_trades` (optional) enables cross-venue
     coordination features.
     """
     reference_time = (
@@ -497,6 +517,8 @@ def build_feature_vector(
     if all_pairs_df is not None:
         features.update(compute_cross_asset_features(wallet, all_pairs_df))
     features.update(compute_hardening_features(wallet_trades))
+    if amm_trades is not None:
+        features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
 
     return features
 
@@ -560,6 +582,7 @@ def build_feature_matrix(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    amm_trades: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a feature matrix with one row per wallet observed in `trades_df`.
 
@@ -567,7 +590,8 @@ def build_feature_matrix(
     through to `build_feature_vector` for `order_cancellation_rate` and the
     wallet graph features respectively. `all_pairs_df` (optional, should be
     the same as `trades_df` or a superset with a `pair_id` column) enables
-    cross-asset coordination features.
+    cross-asset coordination features. `amm_trades` (optional) enables
+    cross-venue coordination features.
     """
     if trades_df.empty:
         return pd.DataFrame()
@@ -584,6 +608,7 @@ def build_feature_matrix(
                 orderbook_events=orderbook_events,
                 funding_graph=funding_graph,
                 all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
+                amm_trades=amm_trades,
             )
         )
 

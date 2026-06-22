@@ -23,6 +23,7 @@ import time
 from stellar_sdk import Asset as SdkAsset
 
 from config import config
+from ingestion.amm_pool_loader import PoolNotFoundError, stream_amm_pool_trades
 from ingestion.horizon_streamer import stream_trades
 from streaming.alert_dispatcher import AlertDispatcher
 from streaming.feature_buffer import FeatureBuffer
@@ -41,7 +42,7 @@ class StreamingPipeline:
         scorer: StreamingScorer,
         dispatcher: AlertDispatcher,
         pairs: list[tuple[str, str]] | None = None,
-        role: str = "all",
+        amm_pools: list[str] | None = None,
     ):
         if role not in ("all", "producer", "worker"):
             raise ValueError(f"Unknown role: {role!r}")
@@ -49,10 +50,9 @@ class StreamingPipeline:
         self._scorer = scorer
         self._dispatcher = dispatcher
         self._pairs = list(pairs) if pairs is not None else list(config.WATCHED_ASSET_PAIRS)
-        # role applies only to the Kafka backend: "producer" runs SSE→Kafka
-        # producers, "worker" runs the consuming scorer, "all" runs both in one
-        # process. The sse backend ignores role.
-        self._role = role
+        self._amm_pools = (
+            list(amm_pools) if amm_pools is not None else list(config.WATCHED_AMM_POOLS)
+        )
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
 
@@ -98,7 +98,20 @@ class StreamingPipeline:
             t.start()
             self._worker_threads.append(t)
 
-        logger.info("Streaming pipeline running with %d pair(s)", len(self._worker_threads))
+        for pool_id in self._amm_pools:
+            t = threading.Thread(
+                target=self._stream_amm_pool,
+                args=(pool_id,),
+                daemon=True,
+            )
+            t.start()
+            self._worker_threads.append(t)
+
+        logger.info(
+            "Streaming pipeline running with %d SDEX pair(s) and %d AMM pool(s)",
+            len(sdk_pairs),
+            len(self._amm_pools),
+        )
 
         try:
             while not self._stop_event.is_set():
@@ -226,5 +239,31 @@ class StreamingPipeline:
                 logger.warning(
                     "Stream error for pair %s: %s — will reconnect",
                     pair_label,
+                    exc,
+                )
+
+    def _stream_amm_pool(self, pool_id: str) -> None:
+        while not self._stop_event.is_set():
+            try:
+                for trade in stream_amm_pool_trades(pool_id):
+                    if self._stop_event.is_set():
+                        return
+                    self._buffer.update(trade)
+                    pair_id = trade.base_asset.pair_id(trade.counter_asset)
+                    for wallet in (trade.base_account, trade.counter_account):
+                        if not wallet:
+                            continue
+                        score = self._scorer.score_wallet(wallet, self._buffer)
+                        if score is not None:
+                            self._dispatcher.dispatch(wallet, score, pair_id)
+            except PoolNotFoundError as exc:
+                logger.error("AMM pool %s not found — stopping stream: %s", pool_id, exc)
+                return
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return
+                logger.warning(
+                    "AMM stream error for pool %s: %s — will reconnect",
+                    pool_id,
                     exc,
                 )

@@ -33,18 +33,23 @@ class RiskScoreRecord(Base):
     benford_flag: Mapped[bool] = mapped_column(nullable=False, default=False)
     ml_flag: Mapped[bool] = mapped_column(nullable=False, default=False)
     confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Non-breaking addition: NULL means propagation has not been run yet.
+    propagated_risk: Mapped[float | None] = mapped_column(nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
     def to_risk_score(self) -> dict:
-        return {
+        result = {
             "score": self.score,
             "benford_flag": self.benford_flag,
             "ml_flag": self.ml_flag,
             "timestamp": int(self.updated_at.timestamp()),
             "confidence": self.confidence,
         }
+        if self.propagated_risk is not None:
+            result["propagated_risk"] = self.propagated_risk
+        return result
 
 
 def get_engine(db_url: str | None = None) -> Engine:

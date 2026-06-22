@@ -20,9 +20,9 @@ Wash trading — simultaneously buying and selling the same asset to artificiall
 
 ## What This Repo Does
 
-- **Ingests** — Streams and bulk-loads trade history, order book events, and account activity from the Stellar Horizon API
-- **Detects** — Computes Benford's Law anomaly metrics (chi-square, per-digit Z-scores, MAD) per wallet, per asset, and per trading pair across rolling time windows
-- **Scores** — Extracts 30+ on-chain features and runs ensemble ML classifiers (Random Forest, XGBoost, LightGBM) to produce a 0–100 risk score per wallet/asset pair
+- **Ingests** — Streams and bulk-loads trade history from both the Stellar SDEX (order book) and AMM liquidity pools, plus order book events and account activity from the Stellar Horizon API
+- **Detects** — Computes Benford's Law anomaly metrics (chi-square, per-digit Z-scores, MAD) per wallet, per asset, and per trading pair across rolling time windows; detects **cross-venue coordination** between SDEX and AMM pool activity
+- **Scores** — Extracts 37+ on-chain features (including 7 cross-venue coordination features) and runs ensemble ML classifiers (Random Forest, XGBoost, LightGBM) to produce a 0–100 risk score per wallet/asset pair
 - **Explains** — Generates SHAP-based interpretability output so every risk score is auditable
 
 ## Architecture

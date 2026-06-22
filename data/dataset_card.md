@@ -41,6 +41,24 @@ plus ground-truth labels and provenance metadata.
 | `funding_source_similarity` | float | Max Jaccard similarity of funding ancestors |
 | `network_centrality` | float | Degree centrality in the funding graph |
 | `account_age_days` | float | Account age at the time of last trade in window |
+| `inter_arrival_cv` | float | Coefficient of variation of inter-trade intervals |
+| `entropy_of_amounts` | float | Shannon entropy of the trade amount distribution |
+| `cross_wallet_volume_corr` | float | Pearson correlation of per-minute volumes across top-2 counterparties |
+
+### Cross-venue coordination features (from `compute_cross_venue_features`)
+
+These features are populated when AMM pool data is available (via `WATCHED_AMM_POOLS`).
+When AMM data is unavailable, all cross-venue features default to `0.0`.
+
+| Column | Type | Description |
+|---|---|---|
+| `venue_trade_ratio` | float | Ratio of SDEX to AMM trade count; balanced ratios indicate wash trading |
+| `cross_venue_volume_correlation` | float | Pearson correlation of 1-hour SDEX and AMM trade volumes |
+| `cross_venue_timing_synchrony` | float | Fraction of AMM trades occurring within 10 s of a paired SDEX trade |
+| `cross_venue_net_flow` | float | Absolute net XLM flow across SDEX and AMM venues (near-zero = wash) |
+| `counterparty_venue_overlap` | float | Fraction of SDEX counterparties also seen as AMM liquidity providers |
+| `simultaneous_order_pair` | float | Binary: 1.0 if wallet has overlapping SDEX and AMM activity windows |
+| `cross_venue_cluster_score` | float | Centrality within Louvain cross-venue coordination cluster |
 
 ### Label and provenance columns
 
