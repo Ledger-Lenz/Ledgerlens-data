@@ -102,6 +102,18 @@ def test_score_wallet_invalid_wallet_id_exits_1(capsys):
     assert "Invalid wallet ID format" in out
 
 
+def test_score_wallet_version_flag_exits_0(capsys):
+    with (
+        patch("sys.argv", ["score_wallet.py", "--version"]),
+        patch("scripts.score_wallet.importlib.metadata.version", return_value="0.2.0"),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+    assert excinfo.value.code == 0
+    out, _ = capsys.readouterr()
+    assert "score_wallet.py 0.2.0" in out
+
+
 def test_score_wallet_missing_models_exits_1(capsys, mock_ingestion):
     with patch(
         "scripts.score_wallet.RiskScorer", side_effect=RuntimeError("No trained models found")

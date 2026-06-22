@@ -12,6 +12,7 @@ SHAP feature attributions, and prints the result to stdout.
 """
 
 import argparse
+import importlib.metadata
 import json
 import sys
 from datetime import UTC, datetime
@@ -30,6 +31,8 @@ from ingestion.orderbook_loader import (
     load_orderbook_events,
     orderbook_events_to_dataframe,
 )
+
+PACKAGE_NAME = "ledgerlens-data"
 
 
 def validate_wallet_id(wallet_id: str) -> None:
@@ -67,6 +70,15 @@ def parse_asset_pair(pair_str: str) -> tuple[SdkAsset, SdkAsset]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Score a single wallet on demand")
+    try:
+        package_version = importlib.metadata.version(PACKAGE_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        package_version = "unknown"
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version}",
+    )
     parser.add_argument("--wallet", required=True, help="Stellar wallet public key (G...)")
     parser.add_argument(
         "--pair",
