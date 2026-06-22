@@ -1,9 +1,39 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import scripts.score_wallet as score_wallet
 from scripts.score_wallet import main
+
+
+class DummyAsset:
+    def __init__(self, code="XLM", issuer="native"):
+        self.code = code
+        self.issuer = issuer
+
+    @classmethod
+    def native(cls):
+        return cls()
+
+
+@pytest.fixture(autouse=True)
+def mock_runtime_dependencies(monkeypatch):
+    monkeypatch.setattr(score_wallet, "_load_runtime_dependencies", lambda: None)
+    monkeypatch.setattr(score_wallet, "SdkAsset", DummyAsset)
+    monkeypatch.setattr(score_wallet, "config", SimpleNamespace(RISK_SCORE_FLAG_THRESHOLD=70))
+    monkeypatch.setattr(score_wallet, "pd", SimpleNamespace(Series=lambda data: data))
+    monkeypatch.setattr(score_wallet, "build_feature_vector", MagicMock(return_value={"score": 1}))
+    monkeypatch.setattr(score_wallet, "trades_to_dataframe", MagicMock(return_value=EmptyFrame()))
+    monkeypatch.setattr(
+        score_wallet, "orderbook_events_to_dataframe", MagicMock(return_value=EmptyFrame())
+    )
+
+
+class EmptyFrame:
+    empty = True
+    columns = []
 
 
 @pytest.fixture
@@ -71,6 +101,51 @@ def test_score_wallet_json_output_is_valid_json(
     assert data["wallet"] == test_wallet
     assert data["score"] == 83
     assert len(data["shap_explanations"]) == 5
+
+
+def test_score_wallet_quiet_outputs_compact_json_only(
+    capsys, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    with patch(
+        "sys.argv",
+        ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G...", "--quiet"],
+    ):
+        main()
+
+    out, err = capsys.readouterr()
+    lines = out.splitlines()
+    assert err == ""
+    assert len(lines) == 1
+    assert ": " not in lines[0]
+
+    data = json.loads(lines[0])
+    assert data["wallet"] == test_wallet
+    assert data["score"] == 83
+    assert len(data["shap_explanations"]) == 5
+
+
+def test_score_wallet_quiet_and_log_level_are_mutually_exclusive(capsys):
+    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    with patch(
+        "sys.argv",
+        [
+            "score_wallet.py",
+            "--wallet",
+            test_wallet,
+            "--pair",
+            "USDC:G...",
+            "--quiet",
+            "--log-level",
+            "DEBUG",
+        ],
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+
+    assert excinfo.value.code == 2
+    _, err = capsys.readouterr()
+    assert "not allowed with argument" in err
 
 
 def test_score_wallet_flagged_label(capsys, mock_scorer, mock_ingestion, mock_explainer):

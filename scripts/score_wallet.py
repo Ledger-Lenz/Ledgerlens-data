@@ -11,25 +11,109 @@ builds its feature vector, scores it using the trained ensemble, computes
 SHAP feature attributions, and prints the result to stdout.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
+import logging
 import sys
 from datetime import UTC, datetime
+from typing import Any
 
-import pandas as pd
-from stellar_sdk import Asset as SdkAsset
+CounterfactualAttributor: Any = None
+ForensicReportGenerator: Any = None
+RiskScorer: Any = None
+SdkAsset: Any = None
+ShapExplainer: Any = None
+build_feature_vector: Any = None
+config: Any = None
+load_orderbook_events: Any = None
+load_trades: Any = None
+orderbook_events_to_dataframe: Any = None
+pd: Any = None
+trades_to_dataframe: Any = None
+write_report_secure: Any = None
 
-from config import config
-from detection.causal_attribution import CounterfactualAttributor
-from detection.feature_engineering import build_feature_vector
-from detection.forensic_report import ForensicReportGenerator, write_report_secure
-from detection.model_inference import RiskScorer
-from detection.shap_explainer import ShapExplainer
-from ingestion.historical_loader import load_trades, trades_to_dataframe
-from ingestion.orderbook_loader import (
-    load_orderbook_events,
-    orderbook_events_to_dataframe,
-)
+
+def _load_runtime_dependencies() -> None:
+    """Import scoring dependencies lazily so CLI parsing stays lightweight."""
+    global CounterfactualAttributor
+    global RiskScorer
+    global SdkAsset
+    global ShapExplainer
+    global build_feature_vector
+    global config
+    global load_orderbook_events
+    global load_trades
+    global orderbook_events_to_dataframe
+    global pd
+    global trades_to_dataframe
+
+    if pd is None:
+        import pandas as pandas
+
+        pd = pandas
+    if SdkAsset is None:
+        from stellar_sdk import Asset
+
+        SdkAsset = Asset
+    if config is None:
+        from config import config as app_config
+
+        config = app_config
+    if CounterfactualAttributor is None:
+        from detection.causal_attribution import CounterfactualAttributor as Attributor
+
+        CounterfactualAttributor = Attributor
+    if build_feature_vector is None:
+        from detection.feature_engineering import build_feature_vector as build_features
+
+        build_feature_vector = build_features
+    if RiskScorer is None:
+        from detection.model_inference import RiskScorer as RuntimeRiskScorer
+
+        RiskScorer = RuntimeRiskScorer
+    if ShapExplainer is None:
+        from detection.shap_explainer import ShapExplainer as RuntimeShapExplainer
+
+        ShapExplainer = RuntimeShapExplainer
+    if load_trades is None or trades_to_dataframe is None:
+        from ingestion.historical_loader import (
+            load_trades as runtime_load_trades,
+        )
+        from ingestion.historical_loader import (
+            trades_to_dataframe as runtime_trades_to_dataframe,
+        )
+
+        load_trades = runtime_load_trades
+        trades_to_dataframe = runtime_trades_to_dataframe
+    if load_orderbook_events is None or orderbook_events_to_dataframe is None:
+        from ingestion.orderbook_loader import (
+            load_orderbook_events as runtime_load_orderbook_events,
+        )
+        from ingestion.orderbook_loader import (
+            orderbook_events_to_dataframe as runtime_orderbook_events_to_dataframe,
+        )
+
+        load_orderbook_events = runtime_load_orderbook_events
+        orderbook_events_to_dataframe = runtime_orderbook_events_to_dataframe
+
+
+def _load_report_dependencies() -> None:
+    """Import forensic reporting dependencies only when report generation runs."""
+    global ForensicReportGenerator
+    global write_report_secure
+
+    if ForensicReportGenerator is None or write_report_secure is None:
+        from detection.forensic_report import (
+            ForensicReportGenerator as ReportGenerator,
+        )
+        from detection.forensic_report import (
+            write_report_secure as write_secure,
+        )
+
+        ForensicReportGenerator = ReportGenerator
+        write_report_secure = write_secure
 
 
 def validate_wallet_id(wallet_id: str) -> None:
@@ -85,6 +169,18 @@ def parse_args() -> argparse.Namespace:
         help="Skip loading order-book events",
     )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
+    logging_group = parser.add_mutually_exclusive_group()
+    logging_group.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="Suppress logs and print only one compact JSON result line",
+    )
+    logging_group.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set CLI log verbosity",
+    )
     parser.add_argument(
         "--causal",
         action="store_true",
@@ -119,8 +215,27 @@ def _parse_remove_trade_ids(
     return requested
 
 
+def _configure_cli_logging(args: argparse.Namespace) -> int:
+    previous_logging_disable = logging.root.manager.disable
+    if args.quiet:
+        logging.disable(logging.CRITICAL)
+    elif args.log_level:
+        logging.basicConfig(level=getattr(logging, args.log_level), force=True)
+    return previous_logging_disable
+
+
 def main() -> None:
     args = parse_args()
+    previous_logging_disable = _configure_cli_logging(args)
+    try:
+        _run(args)
+    finally:
+        if args.quiet:
+            logging.disable(previous_logging_disable)
+
+
+def _run(args: argparse.Namespace) -> None:
+    _load_runtime_dependencies()
 
     validate_wallet_id(args.wallet)
     base_asset, counter_asset = parse_asset_pair(args.pair)
@@ -207,7 +322,7 @@ def main() -> None:
         shap_explanations = []
 
     # 6. Output
-    if args.json:
+    if args.json or args.quiet:
         output = {
             "wallet": args.wallet,
             "asset_pair": args.pair,
@@ -219,7 +334,10 @@ def main() -> None:
         }
         if causal_result is not None:
             output["causal_attribution"] = causal_result
-        print(json.dumps(output, indent=2))
+        if args.quiet:
+            print(json.dumps(output, separators=(",", ":")))
+        else:
+            print(json.dumps(output, indent=2))
     else:
         status = "FLAGGED" if result["score"] >= config.RISK_SCORE_FLAG_THRESHOLD else "OK"
         print(f"Wallet:   {args.wallet}")
@@ -251,6 +369,7 @@ def _generate_report(args, result, shap_explanations, trades_df, feature_row, sc
     """Generate and optionally anchor a forensic report."""
     from pathlib import Path
 
+    _load_report_dependencies()
     generator = ForensicReportGenerator()
 
     model_metadata = {}

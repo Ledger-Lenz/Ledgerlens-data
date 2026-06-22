@@ -209,6 +209,8 @@ python -m scripts.score_wallet \
 | `--since` | ISO date to start loading trades from |
 | `--no-orderbook` | Skip loading order-book events |
 | `--json` | Output result as a machine-parseable JSON object |
+| `-q`, `--quiet` | Suppress logs and print only one compact JSON result line |
+| `--log-level` | Set CLI log verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`) |
 
 ### Output Example (Human-readable)
 
