@@ -9,5 +9,7 @@ venv/
 
 models/*.pkl
 models/*.joblib
+models/archive/
+reports/
 
 .DS_Store

@@ -22,8 +22,10 @@ class RiskScoreStore:
         """Insert or update the `RiskScore` record for `(wallet, asset_pair)`.
 
         `risk_score` is the dict returned by `RiskScorer.score()`:
-        `{"score", "benford_flag", "ml_flag", "confidence"}` (and optionally
-        `"timestamp"`, which is ignored — `updated_at` is set server-side).
+        ``{"score", "benford_flag", "ml_flag", "confidence"}`` plus the
+        optional ``"propagated_risk"`` float produced by
+        :func:`detection.risk_propagation.propagate_risk_scores`.
+        ``"timestamp"`` is ignored — ``updated_at`` is set server-side.
         """
         with self._session_factory() as session:
             existing = session.scalar(
@@ -40,6 +42,9 @@ class RiskScoreStore:
             existing.benford_flag = bool(risk_score["benford_flag"])
             existing.ml_flag = bool(risk_score["ml_flag"])
             existing.confidence = int(risk_score["confidence"])
+            # Non-breaking: only written when propagation has been run
+            if "propagated_risk" in risk_score:
+                existing.propagated_risk = float(risk_score["propagated_risk"])
 
             session.commit()
             session.refresh(existing)

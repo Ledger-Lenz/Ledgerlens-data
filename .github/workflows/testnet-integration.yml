@@ -1,0 +1,80 @@
+name: Testnet Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sundays at 03:00 UTC
+    - cron: "0 3 * * 0"
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    environment: testnet
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff black pytest-timeout
+
+      - name: Download ledgerlens-score WASM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download v0.1.0 \
+            --repo Ledger-Lenz/ledgerlens-contract \
+            --pattern 'ledgerlens_score.wasm' \
+            --dir .
+
+      - name: Set up Testnet account and deploy contract
+        env:
+          # Re-use a funded keypair from secrets if available; otherwise
+          # testnet_setup.py generates a fresh one and funds it via Friendbot.
+          LEDGERLENS_SUBMITTER_SECRET: ${{ secrets.LEDGERLENS_TESTNET_SUBMITTER_SECRET }}
+          LEDGERLENS_CONTRACT_ID: ${{ secrets.LEDGERLENS_TESTNET_CONTRACT_ID }}
+          WASM_SHA256: ${{ vars.LEDGERLENS_WASM_SHA256 }}
+        run: |
+          python -m scripts.testnet_setup \
+            --wasm-path ledgerlens_score.wasm \
+            --wasm-sha256 "${WASM_SHA256:-}" \
+            --salt ci-testnet \
+            --env-file .env.testnet \
+            $( [ -z "${WASM_SHA256}" ] && echo "--skip-hash-check" || echo "" )
+
+      - name: Run integration tests
+        env:
+          LEDGERLENS_INTEGRATION_TESTS: "1"
+        run: |
+          # Source the env file written by testnet_setup.py
+          set -a && source .env.testnet && set +a
+          pytest tests/integration/ -v --timeout=120
+
+      - name: Post success comment on latest open PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=$(gh pr list --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" \
+              --body "✅ **Testnet integration tests passed** (run: ${{ github.run_id }})"
+          fi
+
+      - name: Create issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Testnet integration tests failed ($(date -u '+%Y-%m-%d'))" \
+            --body "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --assignee "${{ github.repository_owner }}" \
+            --label "bug"

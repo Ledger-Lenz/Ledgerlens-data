@@ -21,7 +21,14 @@ def _run_dry_run(argv: list[str]) -> MagicMock:
     pipeline produces a flagged wallet without touching Horizon, the DB, or the
     network. Returns the MagicMock standing in for `RiskScorer`.
     """
-    trades = pd.DataFrame({"base_account": ["GA"], "counter_account": ["GB"]})
+    trades = pd.DataFrame(
+        {
+            "base_account": ["GA"],
+            "counter_account": ["GB"],
+            "ledger_close_time": [pd.Timestamp("2024-01-01", tz="UTC")],
+            "amount": [100.0],
+        }
+    )
     feature_matrix = pd.DataFrame({"wallet": ["GA", "GB"], "benford_mad_1h": [0.02, 0.0]})
     scored = pd.DataFrame(
         {
@@ -38,10 +45,11 @@ def _run_dry_run(argv: list[str]) -> MagicMock:
 
     with ExitStack() as stack:
         stack.enter_context(patch("sys.argv", ["run_pipeline.py", *argv]))
+        # Patch load_pair_to_dataframe so the per-pair loop has one pair to process
         stack.enter_context(
             patch.object(
                 run_pipeline,
-                "load_watched_pairs_to_dataframe",
+                "load_pair_to_dataframe",
                 return_value=trades,
             )
         )
@@ -49,6 +57,14 @@ def _run_dry_run(argv: list[str]) -> MagicMock:
             patch.object(run_pipeline, "build_feature_matrix", return_value=feature_matrix)
         )
         stack.enter_context(patch("detection.model_inference.RiskScorer", return_value=fake_scorer))
+        # Provide one watched pair so the loop executes
+        stack.enter_context(
+            patch.object(
+                run_pipeline.config,
+                "WATCHED_ASSET_PAIRS",
+                [("USDC", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")],
+            )
+        )
         run_pipeline.main()
 
     return fake_scorer

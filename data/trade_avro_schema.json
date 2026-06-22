@@ -1,0 +1,16 @@
+{
+  "type": "record",
+  "name": "Trade",
+  "namespace": "io.ledgerlens",
+  "fields": [
+    {"name": "trade_id", "type": "string"},
+    {"name": "base_account", "type": "string"},
+    {"name": "counter_account", "type": "string"},
+    {"name": "base_amount", "type": "double"},
+    {"name": "counter_amount", "type": "double"},
+    {"name": "price", "type": "double"},
+    {"name": "asset_pair", "type": "string"},
+    {"name": "ledger_close_time", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+    {"name": "ingestion_timestamp_ms", "type": "long"}
+  ]
+}

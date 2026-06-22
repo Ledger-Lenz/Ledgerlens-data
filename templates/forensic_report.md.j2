@@ -1,0 +1,55 @@
+# Forensic Report
+
+Wallet: {{ report.wallet }}
+Asset pair: {{ report.asset_pair }}
+Risk score: {{ report.risk_score.score }}
+
+## Summary
+
+- Benford flag: {{ report.risk_score.benford_flag }}
+- ML flag: {{ report.risk_score.ml_flag }}
+- Confidence: {{ report.risk_score.confidence }}
+
+## SHAP
+
+{% for item in report.shap_explanations %}
+- {{ item.feature }}: {{ item.contribution }} (value: {{ item.value }})
+{% endfor %}
+
+## Causal Attribution
+
+{% if report.causal_attribution %}
+- Minimal exonerating trades: {{ report.causal_attribution.minimal_exonerating_trades | join(', ') }}
+- Counterfactual score: {{ report.causal_attribution.counterfactual_score }}
+- Root cause wallet: {{ report.causal_attribution.root_cause_wallet }}
+- Interventional score if no wash: {{ report.causal_attribution.interventional_score_if_no_wash }}
+
+### Causal chain
+
+{% for hop in report.causal_attribution.causal_chain %}
+- Hop {{ hop.hop }}: {{ hop.wallet }} ({{ hop.role }})
+{% endfor %}
+
+> The presence of a minimal exonerating set does not indicate the wallet is innocent; it indicates which specific trades are most anomalous.
+{% else %}
+- Causal attribution disabled.
+{% endif %}
+
+## Propagation Path
+
+{% if report.propagation_path and report.propagation_path.propagated_risk > 0 %}
+Propagated risk score: {{ report.propagation_path.propagated_risk }}
+
+The following wallets contributed risk to this wallet through the funding / co-trade graph:
+
+| Source wallet | Base score | PPR weight | Contribution | Fraction |
+|---------------|-----------|------------|--------------|----------|
+{% for c in report.propagation_path.contributors %}
+| {{ c.source_wallet }} | {{ c.base_score }} | {{ c.ppr_weight }} | {{ c.contribution }} | {{ "%.1f"|format(c.fraction * 100) }}% |
+{% endfor %}
+
+> Propagated scores decay with hop distance (α = 0.15). Direct funders/receivers
+> of a seed wallet receive ~85 % of teleport weight; two-hop neighbours ~12 %.
+{% else %}
+- No risk propagation detected (propagated score is 0 or propagation was not run).
+{% endif %}
