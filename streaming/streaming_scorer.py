@@ -115,6 +115,15 @@ class StreamingScorer:
         Returns a risk-score dict ``{score, benford_flag, ml_flag, confidence}``
         or ``None`` if the wallet has fewer than ``min_trades`` buffered trades.
         """
+        override_val = self._risk_scorer.list_override.check(wallet)
+        if override_val is not None:
+            return {
+                "score": override_val,
+                "benford_flag": False,
+                "ml_flag": bool(override_val >= 50),
+                "confidence": 100,
+            }
+
         if buffer.wallet_trade_count(wallet) < self.min_trades:
             return None
 

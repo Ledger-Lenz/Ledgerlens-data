@@ -25,6 +25,7 @@ from detection.model_training import (
     MODEL_REGISTRY,
     compute_feature_schema_hash,
 )
+from detection.list_override import ListOverride
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -104,6 +105,7 @@ class RiskScorer:
 
     def __init__(self, model_dir: str | None = None):
         self.model_dir = model_dir or config.MODEL_DIR
+        self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
         from detection.meta_learner import LeafEmbeddingExtractor
@@ -185,6 +187,18 @@ class RiskScorer:
         When consensus cannot be reached:
             {"score": 100, "consensus_failure": True, ...}
         """
+        if isinstance(feature_row, pd.Series):
+            wallet = feature_row.get("wallet")
+            if wallet is not None:
+                override_val = self.list_override.check(wallet)
+                if override_val is not None:
+                    return {
+                        "score": override_val,
+                        "benford_flag": False,
+                        "ml_flag": bool(override_val >= 50),
+                        "confidence": 100,
+                    }
+
         if not self.models:
             raise RuntimeError(
                 f"No trained models found in {self.model_dir}. Run model_training.py first."

@@ -138,73 +138,86 @@ def main() -> None:
             )
         sys.exit(1)
 
-    # 2. Ingest
-    try:
-        trades = list(load_trades(base_asset, counter_asset, start_time=args.since))
-        trades_df = trades_to_dataframe(trades)
-
-        # Filter trades to only those involving the target wallet
-        if not trades_df.empty:
-            mask = (trades_df["base_account"] == args.wallet) | (
-                trades_df["counter_account"] == args.wallet
-            )
-            trades_df = trades_df[mask]
-
-        orderbook_events_df = None
-        if not args.no_orderbook:
-            events = list(load_orderbook_events(args.wallet))
-            orderbook_events_df = orderbook_events_to_dataframe(events)
-
-    except Exception as e:
-        print(f"Error fetching data from Horizon: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # 3. Feature Engineering
-    feature_vector = build_feature_vector(
-        args.wallet, trades_df, orderbook_events=orderbook_events_df
-    )
-    feature_row = pd.Series(feature_vector)
-
-    # 4. Score
-    try:
-        result = scorer.score(feature_row)
-    except Exception as e:
-        print(f"Error during scoring: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    remove_trade_ids = []
-    causal_result = None
-    if args.what_if_remove or args.causal:
-        try:
-            remove_trade_ids = _parse_remove_trade_ids(args.what_if_remove, trades_df, args.wallet)
-        except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise
-
-        attributor = CounterfactualAttributor(scorer)
-        if remove_trade_ids:
-            causal_result = attributor.counterfactual_score(
-                args.wallet,
-                trades_df,
-                remove_trade_ids,
-                orderbook_events=orderbook_events_df,
-            )
-        elif args.causal:
-            causal_result = attributor.counterfactual_score(
-                args.wallet,
-                trades_df,
-                [],
-                orderbook_events=orderbook_events_df,
-            )
-
-    # 5. Explain
-    try:
-        explainer = ShapExplainer()
-        models = scorer.models
-        shap_explanations = explainer.explain_ensemble(feature_row, models, top_n=5)
-    except Exception:
-        # Fallback: empty explanations if SHAP fails
+    override_val = scorer.list_override.check(args.wallet)
+    if override_val is not None:
+        result = {
+            "score": override_val,
+            "benford_flag": False,
+            "ml_flag": bool(override_val >= 50),
+            "confidence": 100,
+        }
+        trades_df = pd.DataFrame()
+        feature_row = pd.Series({"wallet": args.wallet})
         shap_explanations = []
+        causal_result = None
+    else:
+        # 2. Ingest
+        try:
+            trades = list(load_trades(base_asset, counter_asset, start_time=args.since))
+            trades_df = trades_to_dataframe(trades)
+
+            # Filter trades to only those involving the target wallet
+            if not trades_df.empty:
+                mask = (trades_df["base_account"] == args.wallet) | (
+                    trades_df["counter_account"] == args.wallet
+                )
+                trades_df = trades_df[mask]
+
+            orderbook_events_df = None
+            if not args.no_orderbook:
+                events = list(load_orderbook_events(args.wallet))
+                orderbook_events_df = orderbook_events_to_dataframe(events)
+
+        except Exception as e:
+            print(f"Error fetching data from Horizon: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # 3. Feature Engineering
+        feature_vector = build_feature_vector(
+            args.wallet, trades_df, orderbook_events=orderbook_events_df
+        )
+        feature_row = pd.Series(feature_vector)
+
+        # 4. Score
+        try:
+            result = scorer.score(feature_row)
+        except Exception as e:
+            print(f"Error during scoring: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        remove_trade_ids = []
+        causal_result = None
+        if args.what_if_remove or args.causal:
+            try:
+                remove_trade_ids = _parse_remove_trade_ids(args.what_if_remove, trades_df, args.wallet)
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                raise
+
+            attributor = CounterfactualAttributor(scorer)
+            if remove_trade_ids:
+                causal_result = attributor.counterfactual_score(
+                    args.wallet,
+                    trades_df,
+                    remove_trade_ids,
+                    orderbook_events=orderbook_events_df,
+                )
+            elif args.causal:
+                causal_result = attributor.counterfactual_score(
+                    args.wallet,
+                    trades_df,
+                    [],
+                    orderbook_events=orderbook_events_df,
+                )
+
+        # 5. Explain
+        try:
+            explainer = ShapExplainer()
+            models = scorer.models
+            shap_explanations = explainer.explain_ensemble(feature_row, models, top_n=5)
+        except Exception:
+            # Fallback: empty explanations if SHAP fails
+            shap_explanations = []
 
     # 6. Output
     if args.json:
