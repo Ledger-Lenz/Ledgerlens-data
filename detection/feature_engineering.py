@@ -16,6 +16,7 @@ buffered into a DataFrame) for a single wallet.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import TYPE_CHECKING, Optional
 
@@ -32,6 +33,8 @@ from detection.benford_engine import (
 from detection.streaming_benford import StreamingBenfordSketch
 from detection.wallet_graph import compute_wallet_graph_metrics
 from ingestion.data_models import AccountActivity
+
+logger = logging.getLogger(__name__)
 
 FEATURE_DESCRIPTIONS: dict[str, str] = {
     # Benford features — 5 windows (1h, 4h, 24h, 168h, 720h)
@@ -147,6 +150,50 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "consistent with a systematic automated trading pattern."
     ),
 }
+
+FEATURE_RANGES: dict[str, tuple[float | None, float | None]] = {
+    "counterparty_concentration_ratio": (0.0, 1.0),
+    "round_trip_frequency": (0.0, 1.0),
+    "net_roundtrip_ratio": (0.0, 1.0),
+    "self_matching_rate": (0.0, 1.0),
+    "order_cancellation_rate": (0.0, 1.0),
+    "intra_minute_clustering": (0.0, 1.0),
+    "off_hours_activity_ratio": (0.0, 1.0),
+    "volume_spike_frequency": (0.0, 1.0),
+    "funding_source_similarity": (0.0, 1.0),
+    "network_centrality": (0.0, 1.0),
+    "cross_pair_trade_synchrony": (0.0, 1.0),
+    "net_asset_flow_deviation": (0.0, 1.0),
+    "cross_pair_counterparty_overlap": (0.0, 1.0),
+    "cross_pair_volume_correlation": (-1.0, 1.0),
+    "pair_diversity_score": (0.0, 1.0),
+    "cross_pair_mad_std": (0.0, None),
+    "inter_arrival_cv": (0.0, None),
+    "entropy_of_amounts": (0.0, None),
+    "cross_wallet_volume_corr": (-1.0, 1.0),
+}
+
+
+def validate_feature_ranges(matrix: pd.DataFrame) -> list[str]:
+    """Warn when feature values are non-finite or outside expected ranges."""
+    warnings: list[str] = []
+    for column, (minimum, maximum) in FEATURE_RANGES.items():
+        if column not in matrix.columns:
+            continue
+
+        values = pd.to_numeric(matrix[column], errors="coerce")
+        invalid = values.isna() | ~np.isfinite(values)
+        if minimum is not None:
+            invalid |= values < minimum
+        if maximum is not None:
+            invalid |= values > maximum
+
+        if invalid.any():
+            message = f"{column} has {int(invalid.sum())} value(s) outside expected range"
+            logger.warning(message)
+            warnings.append(message)
+
+    return warnings
 
 
 def compute_benford_features(
@@ -760,4 +807,6 @@ def build_feature_matrix(
             )
         )
 
-    return pd.DataFrame(rows)
+    matrix = pd.DataFrame(rows)
+    validate_feature_ranges(matrix)
+    return matrix

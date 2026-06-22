@@ -15,6 +15,7 @@ from detection.feature_engineering import (
     compute_hardening_features,
     compute_trade_pattern_features,
     compute_volume_timing_features,
+    validate_feature_ranges,
 )
 
 # ---------------------------------------------------------------------------
@@ -197,6 +198,23 @@ def test_build_feature_matrix_includes_hardening_features():
     assert "inter_arrival_cv" in matrix.columns
     assert "entropy_of_amounts" in matrix.columns
     assert "cross_wallet_volume_corr" in matrix.columns
+
+
+def test_validate_feature_ranges_warns_for_out_of_range_values(caplog):
+    matrix = pd.DataFrame(
+        {
+            "wallet": ["A", "B"],
+            "counterparty_concentration_ratio": [0.5, 1.5],
+            "cross_pair_volume_correlation": [0.0, float("inf")],
+        }
+    )
+
+    warnings = validate_feature_ranges(matrix)
+
+    assert len(warnings) == 2
+    assert "counterparty_concentration_ratio" in warnings[0]
+    assert "cross_pair_volume_correlation" in warnings[1]
+    assert "outside expected range" in caplog.text
 
 
 def test_build_feature_matrix_accepts_gnn_embedding_features():
