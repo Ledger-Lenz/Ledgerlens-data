@@ -8,6 +8,8 @@ can be exercised end-to-end without live Horizon data.
 
 Usage:
     python -m scripts.generate_synthetic_dataset --n-wallets 500 --output data/synthetic.parquet
+    python -m scripts.generate_synthetic_dataset --profile RingAttacker --n-wallets 10 --output data/ring.parquet
+    python -m scripts.generate_synthetic_dataset --profile AdaptiveAttacker --gan-rounds 5
 """
 
 import argparse
@@ -20,11 +22,33 @@ from config import config
 BENFORD_FEATURE_TEMPLATE = ["benford_chi_square_{h}h", "benford_mad_{h}h", "benford_z_max_{h}h"]
 
 
-def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataFrame:
+def generate_synthetic_dataset(
+    n_wallets: int = 500,
+    seed: int = 42,
+    profile: str = "NaiveAttacker",
+    model_path: str | None = None,
+) -> pd.DataFrame:
     """Generate `n_wallets` rows, roughly half legitimate (label 0) and half
     wash-trading-like (label 1) with systematically different feature
     distributions.
+
+    When *profile* is ``"NaiveAttacker"`` (default), uses the original
+    feature-level generation for backward compatibility.  Otherwise, uses
+    the Wash Trade Simulation Engine to generate trade-level data and then
+    computes features with ``build_feature_matrix``.
     """
+    if profile == "NaiveAttacker":
+        return _generate_feature_level(n_wallets=n_wallets, seed=seed)
+    return _generate_from_simulator(
+        profile=profile,
+        n_wallets=n_wallets,
+        seed=seed,
+        model_path=model_path,
+    )
+
+
+def _generate_feature_level(n_wallets: int, seed: int) -> pd.DataFrame:
+    """Original feature-level generation (backward-compatible path)."""
     rng = np.random.default_rng(seed)
     n_legit = n_wallets // 2
 
@@ -33,7 +57,6 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
         is_wash = i >= n_legit
         row = {"wallet": f"GSYNTH{i:06d}"}
 
-        # Raw Benford features — one group per window (matches compute_benford_features order)
         for hours in config.BENFORD_WINDOWS_HOURS:
             if is_wash:
                 row[f"benford_chi_square_{hours}h"] = rng.uniform(20, 100)
@@ -44,8 +67,6 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
                 row[f"benford_mad_{hours}h"] = rng.uniform(0.0, 0.014)
                 row[f"benford_z_max_{hours}h"] = rng.uniform(0, 2)
 
-        # Residual Benford features (after STL seasonal stripping) — appended
-        # after all raw features to match build_feature_vector column order.
         for hours in config.BENFORD_WINDOWS_HOURS:
             if is_wash:
                 row[f"benford_residual_chi_square_{hours}h"] = rng.uniform(15, 80)
@@ -67,14 +88,12 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
             row["funding_source_similarity"] = rng.uniform(0.5, 1.0)
             row["network_centrality"] = rng.uniform(0.3, 1.0)
             row["account_age_days"] = rng.uniform(0, 30)
-            # Cross-asset features for wash traders (coordinated across pairs)
             row["cross_pair_trade_synchrony"] = rng.uniform(0.4, 1.0)
             row["net_asset_flow_deviation"] = rng.uniform(0.0, 0.3)
             row["cross_pair_counterparty_overlap"] = rng.uniform(0.5, 1.0)
             row["cross_pair_volume_correlation"] = rng.uniform(0.4, 1.0)
             row["pair_diversity_score"] = rng.uniform(0.0, 0.3)
             row["cross_pair_mad_std"] = rng.uniform(0.01, 0.05)
-            # Hardening features (wash: low entropy, low CV, high correlation)
             row["inter_arrival_cv"] = rng.uniform(0.0, 0.2)
             row["entropy_of_amounts"] = rng.uniform(0.0, 1.0)
             row["cross_wallet_volume_corr"] = rng.uniform(0.5, 1.0)
@@ -91,14 +110,12 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
             row["funding_source_similarity"] = rng.uniform(0.0, 0.3)
             row["network_centrality"] = rng.uniform(0.0, 0.2)
             row["account_age_days"] = rng.uniform(30, 1000)
-            # Cross-asset features for legitimate traders (diverse activity)
             row["cross_pair_trade_synchrony"] = rng.uniform(0.0, 0.2)
             row["net_asset_flow_deviation"] = rng.uniform(0.5, 1.0)
             row["cross_pair_counterparty_overlap"] = rng.uniform(0.0, 0.3)
             row["cross_pair_volume_correlation"] = rng.uniform(-0.5, 0.3)
             row["pair_diversity_score"] = rng.uniform(0.5, 1.0)
             row["cross_pair_mad_std"] = rng.uniform(0.0, 0.01)
-            # Hardening features (legit: higher entropy/CV, lower correlation)
             row["inter_arrival_cv"] = rng.uniform(0.5, 2.0)
             row["entropy_of_amounts"] = rng.uniform(3.0, 6.0)
             row["cross_wallet_volume_corr"] = rng.uniform(-0.3, 0.3)
@@ -110,17 +127,91 @@ def generate_synthetic_dataset(n_wallets: int = 500, seed: int = 42) -> pd.DataF
     return df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
 
+def _generate_from_simulator(
+    profile: str,
+    n_wallets: int,
+    seed: int,
+    model_path: str | None = None,
+) -> pd.DataFrame:
+    """Generate a feature matrix via the Wash Trade Simulation Engine."""
+    from scripts.wash_trade_simulator import (
+        AdaptiveAttacker,
+        create_profile,
+        trades_to_feature_matrix,
+    )
+
+    if profile == "AdaptiveAttacker" and model_path:
+        attacker = AdaptiveAttacker(
+            n_wallets=n_wallets,
+            model_path=model_path,
+            seed=seed,
+        )
+    else:
+        attacker = create_profile(
+            profile,
+            n_wallets=n_wallets,
+            seed=seed,
+        )
+
+    trades = attacker.generate_trades()
+    df = trades_to_feature_matrix(trades)
+
+    if df.empty:
+        return _generate_feature_level(n_wallets=n_wallets, seed=seed)
+
+    df["profile"] = profile
+    return df
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n-wallets", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="data/synthetic_dataset.parquet")
+    parser.add_argument(
+        "--profile",
+        default="NaiveAttacker",
+        choices=[
+            "NaiveAttacker",
+            "TimingJitterAttacker",
+            "AmountConformanceAttacker",
+            "RingAttacker",
+            "LayeringAttacker",
+            "CrossPairAttacker",
+            "AdaptiveAttacker",
+        ],
+        help="Attacker profile for the Wash Trade Simulation Engine (default: NaiveAttacker)",
+    )
+    parser.add_argument(
+        "--gan-rounds",
+        type=int,
+        default=0,
+        help="Run N rounds of adversarial training loop (0 = skip). "
+        "Requires --profile AdaptiveAttacker.",
+    )
+    parser.add_argument("--model-path", default=None, help="Path to trained model for AdaptiveAttacker")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    df = generate_synthetic_dataset(n_wallets=args.n_wallets, seed=args.seed)
+
+    if args.gan_rounds > 0:
+        from scripts.adversarial_training_loop import run_adversarial_loop
+
+        run_adversarial_loop(
+            gan_rounds=args.gan_rounds,
+            n_wallets=args.n_wallets,
+            seed=args.seed,
+        )
+        return
+
+    df = generate_synthetic_dataset(
+        n_wallets=args.n_wallets,
+        seed=args.seed,
+        profile=args.profile,
+        model_path=args.model_path,
+    )
     df.to_parquet(args.output)
     print(f"Wrote {len(df)} rows to {args.output}")
 

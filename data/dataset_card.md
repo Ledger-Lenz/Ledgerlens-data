@@ -104,6 +104,47 @@ python -m scripts.build_labelled_dataset \
     --config data/build_config.json
 ```
 
+## Simulation Engine — Wash Trade Simulation Engine (WTSE)
+
+The dataset can also be generated synthetically using the Wash Trade Simulation
+Engine in `scripts/wash_trade_simulator.py`. The WTSE implements 7 attacker
+strategy profiles, each modelling a different wash-trading behaviour pattern.
+
+| Profile | Description | Parameters | Wash / Legitimate Ratio |
+|---|---|---|---|
+| `NaiveAttacker` | Fixed amounts, regular intervals — baseline | `fixed_amount=500.0`, `interval_seconds=60` | 100% wash (label=1) |
+| `TimingJitterAttacker` | Poisson-distributed trade intervals | `lambda_seconds=60.0` | 100% wash |
+| `AmountConformanceAttacker` | Benford-conforming amounts via log-uniform sampling | `min_amount=50.0`, `max_amount=5000.0` | 100% wash |
+| `RingAttacker` | N-wallet ring where each wallet trades with its neighbour | `fixed_amount=500.0` | 100% wash |
+| `LayeringAttacker` | Interleaves wash trades with noise trades at 3:1 ratio | `wash_to_noise_ratio=3` | 25% wash / 75% noise |
+| `CrossPairAttacker` | Rotates wash volume across K asset pairs | `n_pairs=3` | 100% wash |
+| `AdaptiveAttacker` | Reads model feature importances and down-weights top features | `model_path`, `top_k=3` | 100% wash |
+
+### Distribution Plot Description
+
+When the CI notebook job runs, it generates per-profile distribution plots
+showing the feature value distributions for each attacker profile overlaid
+with the legitimate-trader distribution from the real labelled dataset.
+These plots validate that each profile produces realistic feature separations.
+The generated plots are available in the `reports/` directory.
+
+### Usage
+
+```bash
+# Generate using a specific profile
+python -m scripts.generate_synthetic_dataset \
+    --profile RingAttacker \
+    --n-wallets 20 \
+    --output data/ring_dataset.parquet
+
+# Run the full adversarial loop (5 rounds by default)
+python -m scripts.generate_synthetic_dataset \
+    --profile AdaptiveAttacker \
+    --gan-rounds 5
+```
+
+---
+
 ## Known Biases and Limitations
 
 1. Three asset pairs only — does not cover all SDEX activity.
