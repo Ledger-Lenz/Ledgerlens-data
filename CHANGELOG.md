@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Adversarial robustness evaluation framework (`detection/adversarial/`):
+  FGSM and PGD attacks (Madry et al., 2018) against the wash-trade ensemble
+  using finite-difference gradients on the continuous ensemble score, an
+  `AdversarialEvaluator` reporting attack success rate, per-feature minimum
+  L-infinity epsilon, and most-vulnerable features, and an
+  `adversarial_augmentation_gain` adversarial-training loop measuring the
+  AUC-ROC robustness gain.
+- `scripts/run_adversarial_eval.py` CLI that produces a JSON robustness report
+  (with usage docs in `scripts/README.md`).
+- Test coverage for the adversarial attacks, evaluator, and augmentation loop
+  (`tests/test_adversarial.py`).
+
 ## [0.2.0] - 2026-06-13
 
 ### Added
