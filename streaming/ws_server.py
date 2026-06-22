@@ -18,20 +18,11 @@ import re
 import threading
 import time
 from collections import deque
-<<<<<<< HEAD
-from dataclasses import dataclass, asdict
-from typing import Any
-
-import websockets
-from pydantic import BaseModel, Field, ValidationError
-from prometheus_client import Counter, Gauge
-=======
 from typing import Any
 
 import websockets
 from prometheus_client import Counter, Gauge
 from pydantic import BaseModel, Field, ValidationError
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
 
 from config import config
 from streaming.pubsub_router import PubSubRouter
@@ -344,10 +335,6 @@ async def _handler(websocket) -> None:
 
         client_queue = asyncio.Queue(maxlen=config.WS_CLIENT_QUEUE_DEPTH)
         rate_limiter = TokenBucket(config.WS_RATE_LIMIT_MSGS_PER_SECOND)
-<<<<<<< HEAD
-        dropped_count = 0
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
 
         with _clients_lock:
             _clients[client_id] = {
@@ -604,11 +591,6 @@ async def _process_outbound(websocket, queue: asyncio.Queue, client_id: str, rat
         client_id: Client ID
         rate_limiter: Token-bucket rate limiter for this client
     """
-<<<<<<< HEAD
-    dropped_count = 0
-
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
     try:
         while True:
             try:
@@ -683,11 +665,6 @@ async def publish_score_update(score_event: dict) -> None:
         pair_channel = f"pair/{asset_pair}"
 
         # Route to subscribers
-<<<<<<< HEAD
-        subscriber_ids = _router.get_clients_for_event(wallet_id, asset_pair)
-
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
         # Send to wallet channel subscribers
         for client_id in _router.get_subscribers(wallet_channel):
             message = {

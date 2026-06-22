@@ -6,10 +6,6 @@ sub (subject/client_id), and scope (must contain "scores:read").
 """
 
 import os
-<<<<<<< HEAD
-from datetime import datetime, timezone
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
 from typing import Any
 
 from jose import JWTError, jwt
@@ -36,11 +32,7 @@ class JWTAuthenticator:
                 f"JWT public key not found at {self._public_key_path}. "
                 "Generate one or set JWT_PUBLIC_KEY_PATH in .env"
             )
-<<<<<<< HEAD
-        with open(self._public_key_path, "r") as f:
-=======
         with open(self._public_key_path) as f:
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
             self._public_key = f.read()
 
     def verify(self, token: str) -> dict[str, Any] | None:
