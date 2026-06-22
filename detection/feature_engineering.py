@@ -20,11 +20,128 @@ import pandas as pd
 
 from config import config
 from detection.benford_engine import (
+    BenfordMetrics,
     compute_benford_metrics_for_windows,
     cross_pair_benford_consistency,
 )
+from detection.streaming_benford import StreamingBenfordSketch
 from detection.wallet_graph import compute_wallet_graph_metrics
 from ingestion.data_models import AccountActivity
+
+FEATURE_DESCRIPTIONS: dict[str, str] = {
+    # Benford features — 5 windows (1h, 4h, 24h, 168h, 720h)
+    **{
+        f"benford_chi_square_{h}h": (
+            f"Chi-square goodness-of-fit of trade amounts against Benford's Law "
+            f"over the trailing {h}-hour window. High values indicate the digit "
+            f"distribution is statistically inconsistent with natural trading."
+        )
+        for h in [1, 4, 24, 168, 720]
+    },
+    **{
+        f"benford_mad_{h}h": (
+            f"Mean Absolute Deviation between observed and expected Benford digit "
+            f"frequencies over the trailing {h}-hour window. Values above 0.015 "
+            f"indicate non-conformity (Nigrini, 2012)."
+        )
+        for h in [1, 4, 24, 168, 720]
+    },
+    **{
+        f"benford_z_max_{h}h": (
+            f"Maximum per-digit Z-score against the Benford expected proportion "
+            f"over the trailing {h}-hour window. Highlights the single most "
+            f"anomalous digit in the distribution."
+        )
+        for h in [1, 4, 24, 168, 720]
+    },
+    # Trade pattern features
+    "counterparty_concentration_ratio": (
+        "Fraction of total trade volume transacted with a single counterparty. "
+        "Values near 1.0 indicate the wallet trades almost exclusively with one "
+        "other account, a hallmark of wash-trading arrangements."
+    ),
+    "round_trip_frequency": (
+        "Proportion of trades where the base and counter account are identical, "
+        "indicating the wallet is trading with itself. Any non-zero value is a "
+        "strong wash-trade signal."
+    ),
+    "self_matching_rate": (
+        "Rate at which the wallet appears on both sides of a trade. Identical to "
+        "round_trip_frequency in the current implementation; included as a "
+        "separate signal for ensemble diversity."
+    ),
+    "order_cancellation_rate": (
+        "Fraction of the wallet's manage-offer operations that were cancellations "
+        "rather than fills or updates. High cancellation rates can indicate "
+        "layering or spoofing strategies."
+    ),
+    # Volume and timing features
+    "volume_per_counterparty_ratio": (
+        "Total traded volume divided by the number of unique counterparties. "
+        "Very high values suggest concentrated wash trading with few accounts."
+    ),
+    "intra_minute_clustering": (
+        "Fraction of time-buckets (1-minute resolution) containing more than one "
+        "trade. High clustering indicates burst activity consistent with "
+        "automated wash-trade scripts."
+    ),
+    "off_hours_activity_ratio": (
+        "Fraction of trades executed between UTC 00:00 and 05:00. Legitimate "
+        "retail activity tends to follow business-hours patterns; sustained "
+        "off-hours activity may indicate bot-driven manipulation."
+    ),
+    "volume_spike_frequency": (
+        "Fraction of trades whose amount exceeds 3× the 10-trade rolling mean. "
+        "Frequent spikes can indicate pump-and-dump volume inflation."
+    ),
+    # Wallet graph features
+    "funding_source_similarity": (
+        "Cosine similarity between this wallet's funding-source fingerprint and "
+        "known wash-trade clusters in the funding graph. High values suggest the "
+        "wallet shares infrastructure with flagged accounts."
+    ),
+    "network_centrality": (
+        "Betweenness centrality of the wallet in the funding graph. High "
+        "centrality indicates the wallet acts as a hub routing funds between "
+        "multiple suspicious accounts."
+    ),
+    "account_age_days": (
+        "Age of the Stellar account in days at the time of scoring. "
+        "Very young accounts (< 7 days) combined with high risk scores are a "
+        "strong indicator of throwaway wash-trade accounts."
+    ),
+    # Cross-asset coordination features
+    "cross_pair_trade_synchrony": (
+        "Fraction of trades where the wallet also transacted on a different asset "
+        "pair within the synchrony window. Simultaneous multi-pair activity is "
+        "difficult to explain by normal market-making behaviour."
+    ),
+    "net_asset_flow_deviation": (
+        "Maximum absolute net asset flow (normalised by total volume) across all "
+        "assets. Values near 0 indicate a fully closed cycle — the defining "
+        "characteristic of wash trading where no real economic transfer occurs."
+    ),
+    "cross_pair_counterparty_overlap": (
+        "Jaccard similarity of counterparty sets across asset pairs. High overlap "
+        "means the wallet uses the same small set of counterparties on every pair, "
+        "consistent with a coordinated wash-trade network."
+    ),
+    "cross_pair_volume_correlation": (
+        "Pearson correlation of per-minute trade volumes across asset pairs. "
+        "Strong positive correlation indicates the wallet inflates volume on "
+        "multiple pairs simultaneously."
+    ),
+    "pair_diversity_score": (
+        "Shannon entropy of volume distribution across traded asset pairs, "
+        "normalised to [0, 1]. Low values indicate concentration on a single pair; "
+        "high values indicate diversified (potentially synthetic) activity."
+    ),
+    "cross_pair_mad_std": (
+        "Standard deviation of per-pair Benford MAD scores. Low values mean "
+        "Benford non-conformity is equally distributed across all pairs — "
+        "consistent with a systematic automated trading pattern."
+    ),
+}
 
 
 def compute_benford_features(
@@ -32,6 +149,7 @@ def compute_benford_features(
     decompose: bool = True,
     liquidity_profiler=None,
     asset: str | None = None,
+    precomputed_metrics: dict[int, BenfordMetrics] | None = None,
 ) -> dict:
     """Flatten per-window Benford metrics into a feature row.
 
@@ -50,7 +168,7 @@ def compute_benford_features(
     and ``benford_residual_mad_{h}h`` — Benford metrics on STL residuals.
     Residual features are set to ``NaN`` for insufficient-data windows.
     """
-    per_window = compute_benford_metrics_for_windows(wallet_trades)
+    per_window = precomputed_metrics or compute_benford_metrics_for_windows(wallet_trades)
 
     features: dict = {}
     for hours, metrics in per_window.items():
@@ -276,6 +394,7 @@ def compute_wallet_graph_features(
 def compute_cross_asset_features(
     wallet: str,
     all_pairs_df: pd.DataFrame,
+    pair_benford_sketches: dict[str, dict[int, StreamingBenfordSketch]] | None = None,
 ) -> dict:
     """Cross-asset coordination features computed from multi-pair trade data.
 
@@ -450,19 +569,51 @@ def compute_cross_asset_features(
     # Feature 6: cross_pair_mad_std
     # Standard deviation of Benford MAD scores across pairs
     per_pair_metrics = {}
-    for pair_id in wallet_trades["pair_id"].unique():
-        pair_trades = wallet_trades[wallet_trades["pair_id"] == pair_id]
-        metrics = compute_benford_metrics_for_windows(pair_trades)
-        # Average MAD across all windows for this pair
-        per_pair_metrics[pair_id] = {
-            "mad": (
-                sum(m.get("mad", 0.0) for m in metrics.values()) / len(metrics) if metrics else 0.0
+    if pair_benford_sketches:
+        for pair_id, sketches in pair_benford_sketches.items():
+            metrics = {h: s.to_metrics() for h, s in sketches.items()}
+            # Average MAD across all windows for this pair
+            per_pair_metrics[pair_id] = BenfordMetrics(
+                chi_square=0.0,
+                mad=(sum(m.mad for m in metrics.values()) / len(metrics) if metrics else 0.0),
+                mad_nonconforming=False,
+                z_scores={},
+                sample_size=0,
             )
-        }
+    else:
+        for pair_id in wallet_trades["pair_id"].unique():
+            pair_trades = wallet_trades[wallet_trades["pair_id"] == pair_id]
+            metrics = compute_benford_metrics_for_windows(pair_trades)
+            # Average MAD across all windows for this pair
+            per_pair_metrics[pair_id] = BenfordMetrics(
+                chi_square=0.0,
+                mad=(sum(m.mad for m in metrics.values()) / len(metrics) if metrics else 0.0),
+                mad_nonconforming=False,
+                z_scores={},
+                sample_size=0,
+            )
 
     features["cross_pair_mad_std"] = cross_pair_benford_consistency(per_pair_metrics)
 
     return features
+
+
+def compute_cross_venue_features(
+    wallet: str,
+    sdex_trades: pd.DataFrame,
+    amm_trades: pd.DataFrame,
+) -> dict:
+    """Compute 7 cross-venue coordination features for a wallet.
+
+    Delegates to ``detection.cross_venue_features`` and returns a dict with
+    keys: venue_trade_ratio, cross_venue_volume_correlation,
+    cross_venue_timing_synchrony, cross_venue_net_flow,
+    counterparty_venue_overlap, simultaneous_order_pair,
+    cross_venue_cluster_score.
+    """
+    from detection.cross_venue_features import compute_cross_venue_features as _cvf
+
+    return _cvf(wallet, sdex_trades, amm_trades)
 
 
 def build_feature_vector(
@@ -472,6 +623,7 @@ def build_feature_vector(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    amm_trades: pd.DataFrame | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -481,6 +633,7 @@ def build_feature_vector(
     compute `order_cancellation_rate`. `funding_graph` (optional) is the
     output of `detection.wallet_graph.build_funding_graph`, used for the
     wallet graph features. `all_pairs_df` (optional) enables cross-asset
+    coordination features. `amm_trades` (optional) enables cross-venue
     coordination features.
     """
     reference_time = (
@@ -490,13 +643,19 @@ def build_feature_vector(
     )
 
     features = {"wallet": wallet}
-    features.update(compute_benford_features(wallet_trades))
+    features.update(compute_benford_features(wallet_trades, precomputed_metrics=benford_metrics))
     features.update(compute_trade_pattern_features(wallet, wallet_trades, orderbook_events))
     features.update(compute_volume_timing_features(wallet_trades))
     features.update(compute_wallet_graph_features(wallet, activity, reference_time, funding_graph))
     if all_pairs_df is not None:
-        features.update(compute_cross_asset_features(wallet, all_pairs_df))
+        features.update(
+            compute_cross_asset_features(
+                wallet, all_pairs_df, pair_benford_sketches=pair_benford_sketches
+            )
+        )
     features.update(compute_hardening_features(wallet_trades))
+    if amm_trades is not None:
+        features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
 
     return features
 
@@ -560,6 +719,7 @@ def build_feature_matrix(
     orderbook_events: pd.DataFrame | None = None,
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
+    amm_trades: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Build a feature matrix with one row per wallet observed in `trades_df`.
 
@@ -567,7 +727,8 @@ def build_feature_matrix(
     through to `build_feature_vector` for `order_cancellation_rate` and the
     wallet graph features respectively. `all_pairs_df` (optional, should be
     the same as `trades_df` or a superset with a `pair_id` column) enables
-    cross-asset coordination features.
+    cross-asset coordination features. `amm_trades` (optional) enables
+    cross-venue coordination features.
     """
     if trades_df.empty:
         return pd.DataFrame()
@@ -584,6 +745,7 @@ def build_feature_matrix(
                 orderbook_events=orderbook_events,
                 funding_graph=funding_graph,
                 all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
+                amm_trades=amm_trades,
             )
         )
 

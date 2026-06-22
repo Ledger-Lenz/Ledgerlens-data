@@ -253,7 +253,8 @@ class IncrementalTrainer:
                 else:
                     combined = new_labelled
                     logger.warning("No historical dataset found — retraining on new data only")
-                results = train_models(combined, random_state=self.random_state)
+                training_output = train_models(combined, random_state=self.random_state)
+                results = training_output["results"]
                 updated_models = {name: res["model"] for name, res in results.items()}
                 save_models(results, model_dir)
 

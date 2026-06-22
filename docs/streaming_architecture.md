@@ -216,3 +216,115 @@ All threads are `daemon=True` so they are automatically killed if the main proce
 - The URL is never written to logs.
 - The WebSocket server binds to `127.0.0.1` by default; opt-in is required for external binding.
 - `_clients` is mutated only inside the asyncio event loop, preventing data races.
+
+---
+
+## Kafka Streaming Backend (Issue #36)
+
+The default `sse` backend runs one thread per pair inside a single process — it
+cannot scale beyond one machine, replay missed events, or apply backpressure.
+Setting `STREAMING_BACKEND=kafka` swaps the transport for an Apache Kafka log
+that decouples ingestion from scoring and allows horizontal scale-out. The
+`sse` backend remains the default and is unchanged.
+
+### Topology
+
+```
+Horizon SSE (one producer thread per pair)
+      │  Trade → Avro (data/trade_avro_schema.json)
+      ▼
+HorizonKafkaProducer  (ingestion/kafka_producer.py)
+      │  key = wallet_id (base_account)
+      ▼
+Kafka topics: ledgerlens.trades.{asset_pair_sanitised}     (+ ledgerlens.trades.dlq)
+      │  regex subscription ^ledgerlens\.trades\..*
+      ▼
+KafkaWorker × N replicas   group.id = "ledgerlens-scorer"   (streaming/kafka_worker.py)
+      │  FeatureBuffer → StreamingScorer → AlertDispatcher
+      ▼
+Alerts (stdout / webhook / websocket)  +  Prometheus /metrics
+```
+
+### Partition strategy
+
+Messages are keyed by **`wallet_id` (the base account)**. Kafka hashes the key
+to a partition, so every trade for a given wallet lands in the same partition
+and is therefore consumed in order by exactly one worker. This preserves the
+per-wallet ordering that feature computation depends on, while still spreading
+distinct wallets across partitions for parallelism. New per-pair topics are
+picked up automatically by the workers' regex subscription — no restart needed.
+
+### At-least-once semantics
+
+* Consumers run with `enable.auto.commit=false`.
+* `KafkaWorker.process_message` commits a message's offset **only after** the
+  scorer and `AlertDispatcher.dispatch` have completed for that message.
+* If `dispatch` raises, the offset is left uncommitted; the message is
+  redelivered after the next restart/rebalance. Duplicate alerts are absorbed
+  by the dispatcher's per-wallet cooldown.
+
+### Avro schema & validation
+
+The wire format is schemaless Avro binary encoding of the `Trade` record in
+`data/trade_avro_schema.json`. The producer validates every record **before**
+serialisation; the worker validates again **after** decode. Records that are
+missing fields or have wrong-typed values never reach the scorer:
+
+* On the **producer**, a serialisation/validation failure routes the raw
+  payload plus a `reason` to the dead-letter queue `ledgerlens.trades.dlq`.
+* On the **consumer**, a decode/validation failure (a poison pill) is logged,
+  counted (`kafka_poison_messages_total`), and its offset committed (skipped) so
+  one bad record cannot wedge a partition.
+
+DLQ messages are **never** retried automatically — the worker's regex
+subscription explicitly skips the DLQ topic, and triage is a human task.
+
+### Backpressure & lag alerting
+
+Per-partition lag (high watermark − committed offset) is published as the
+Prometheus gauge `kafka_lag_by_partition`. When lag exceeds
+`KAFKA_LAG_ALERT_THRESHOLD` (default 500) the worker emits a **CRITICAL** log
+and keeps running. Scaling `ledgerlens-scorer` replicas adds consumers to the
+`ledgerlens-scorer` group, redistributing partitions to drain the backlog.
+
+### Security
+
+* Broker credentials are read from `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD`
+  **environment variables only**; when both are set the clients use
+  `SASL_SSL` / `PLAIN`. They are never logged or committed.
+* The producer enables idempotence (`enable.idempotence=true`, `acks=all`).
+
+### Prometheus metrics (exposed by each worker on `KAFKA_METRICS_PORT`)
+
+| Metric | Type | Description |
+|---|---|---|
+| `kafka_messages_consumed_total` | Counter | Trade messages fully processed |
+| `kafka_lag_by_partition` | Gauge (`topic`, `partition`) | Consumer lag |
+| `scoring_latency_ms` | Histogram | Per-wallet scoring latency |
+| `alerts_dispatched_total` | Counter | Alerts dispatched |
+| `kafka_poison_messages_total` | Counter | Decode/validation failures dropped |
+
+### Deployment
+
+```bash
+docker-compose up --scale ledgerlens-scorer=3
+```
+
+Brings up Zookeeper, Kafka, one `ledgerlens-producer`, three `ledgerlens-scorer`
+replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
+"LedgerLens Kafka Streaming").
+
+### Kafka environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `STREAMING_BACKEND` | `sse` | `sse` (threaded) or `kafka` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | Broker list |
+| `KAFKA_SASL_USERNAME` | — | SASL username (env only) |
+| `KAFKA_SASL_PASSWORD` | — | SASL password (env only) |
+| `KAFKA_CONSUMER_GROUP` | `ledgerlens-scorer` | Worker consumer group |
+| `KAFKA_TOPIC_PREFIX` | `ledgerlens.trades` | Per-pair topic prefix |
+| `KAFKA_DLQ_TOPIC` | `ledgerlens.trades.dlq` | Dead-letter topic |
+| `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
+| `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
+| `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |

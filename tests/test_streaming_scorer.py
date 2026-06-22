@@ -124,7 +124,7 @@ def test_score_wallet_returns_risk_score_dict(trained_scorer):
     result = trained_scorer.score_wallet(WALLET_A, buf)
 
     assert result is not None
-    assert set(result) == {"score", "benford_flag", "ml_flag", "confidence"}
+    assert {"score", "benford_flag", "ml_flag", "confidence"} <= set(result)
     assert 0 <= result["score"] <= 100
     assert isinstance(result["benford_flag"], bool)
     assert isinstance(result["ml_flag"], bool)

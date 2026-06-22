@@ -18,7 +18,6 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 from datetime import UTC, datetime
 
 import joblib
@@ -98,6 +97,10 @@ def compute_feature_schema_hash(feature_columns: list[str]) -> str:
     sorted_cols = sorted(feature_columns)
     schema_str = "\n".join(sorted_cols)
     return f"sha256:{hashlib.sha256(schema_str.encode()).hexdigest()}"
+
+LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
+    config.MODEL_DIR, "label_distribution_baseline.json"
+)
 
 
 LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
@@ -205,6 +208,30 @@ def train_models(
     If ``adversarial_augmentation`` is True, ``auc_roc_adversarial`` is also
     included in each model's metrics dict.
     """
+    baseline_path = baseline_path or LABEL_DISTRIBUTION_BASELINE_PATH
+    threshold = threshold if threshold is not None else config.POISON_LABEL_RATIO_THRESHOLD
+
+    total = sum(label_distribution.values())
+    if total == 0:
+        return False
+    current_ratio = label_distribution.get(1, 0) / total
+
+    if not os.path.exists(baseline_path):
+        os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
+        with open(baseline_path, "w") as f:
+            json.dump({"wash_trade_ratio": current_ratio}, f)
+        return False
+
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+
+    baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
+    return abs(current_ratio - baseline_ratio) > threshold
+
+
+def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42) -> dict:
+    """Train all models in `MODEL_REGISTRY` and return fitted estimators
+    plus evaluation metrics."""
     X, y = split_features_labels(df)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
@@ -263,23 +290,21 @@ def train_models(
 def save_models(results: dict, model_dir: str | None = None) -> None:
     model_dir = model_dir or config.MODEL_DIR
     os.makedirs(model_dir, exist_ok=True)
-    for name, result in results.items():
+    # results can be the full training_output dict or just the "results" inner dict
+    to_save = results.get("results", results) if isinstance(results, dict) else results
+    for name, result in to_save.items():
         joblib.dump(result["model"], os.path.join(model_dir, f"{name}.joblib"))
 
 
-def save_training_artifacts(
-    training_output: dict,
-    data_path: str,
+def save_metrics_report(
+    results: dict,
     model_dir: str | None = None,
-) -> None:
-    """Write metrics.json and model_metadata.json to the model directory.
-
-    NOTE: data_path is stored as-is from the CLI. If this path contains
-    sensitive information (e.g. S3 credentials), it will be persisted
-    in the metadata file.
-    """
+    extra: dict | None = None,
+) -> str:
+    """Write metrics (plus optional *extra* provenance fields) to metrics.json."""
     model_dir = model_dir or config.MODEL_DIR
     os.makedirs(model_dir, exist_ok=True)
+    path = os.path.join(model_dir, "metrics.json")
 
     results = training_output["results"]
     feature_columns = training_output["feature_columns"]
@@ -302,12 +327,22 @@ def save_training_artifacts(
         "feature_distributions": feature_distributions,
     }
 
-    metadata_path = os.path.join(model_dir, "model_metadata.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+    # Embed artifact SHA-256 for each saved model
+    for name in results:
+        artifact_path = os.path.join(model_dir, f"{name}.joblib")
+        if os.path.exists(artifact_path):
+            sha = hashlib.sha256()
+            with open(artifact_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha.update(chunk)
+            payload[name]["artifact_sha256"] = sha.hexdigest()
 
-    logger.info("Saved metrics to %s", metrics_path)
-    logger.info("Saved model metadata to %s", metadata_path)
+    if extra:
+        payload.update(extra)
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return path
 
 
 def save_metrics_report(

@@ -75,6 +75,17 @@ python -m scripts.generate_synthetic_dataset \
     --n-wallets 500 \
     --seed 42 \
     --output data/synthetic_dataset.parquet
+
+# Use a specific attacker profile
+python -m scripts.generate_synthetic_dataset \
+    --profile RingAttacker \
+    --n-wallets 20 \
+    --output data/ring_dataset.parquet
+
+# Run the full adversarial training loop
+python -m scripts.generate_synthetic_dataset \
+    --profile AdaptiveAttacker \
+    --gan-rounds 5
 ```
 
 | Flag | Default | Description |
@@ -82,6 +93,87 @@ python -m scripts.generate_synthetic_dataset \
 | `--n-wallets` | `500` | Number of synthetic wallet rows to generate |
 | `--seed` | `42` | Random seed (controls both data generation and the final shuffle) |
 | `--output` | `data/synthetic_dataset.parquet` | Output parquet path |
+| `--profile` | `NaiveAttacker` | Attacker profile: `NaiveAttacker`, `TimingJitterAttacker`, `AmountConformanceAttacker`, `RingAttacker`, `LayeringAttacker`, `CrossPairAttacker`, `AdaptiveAttacker` |
+| `--gan-rounds` | `0` | Run N rounds of adversarial training (0 = skip). Requires `--profile AdaptiveAttacker` |
+| `--model-path` | — | Path to trained model `.joblib` file for `AdaptiveAttacker` |
+
+---
+
+## `wash_trade_simulator.py`
+
+The Wash Trade Simulation Engine (WTSE) implements 7 attacker strategy
+profiles for generating realistic trade-level data.
+
+### Profiles
+
+| Profile | Description |
+|---|---|
+| `NaiveAttacker` | Fixed amounts, regular intervals — baseline |
+| `TimingJitterAttacker` | Poisson-distributed trade intervals |
+| `AmountConformanceAttacker` | Benford-conforming amounts via log-uniform sampling |
+| `RingAttacker` | N-wallet ring where each wallet trades with neighbours |
+| `LayeringAttacker` | Interleaves wash trades with noise trades (3:1 ratio) |
+| `CrossPairAttacker` | Rotates wash volume across K asset pairs |
+| `AdaptiveAttacker` | Reads model feature importances and down-weights top features |
+
+### Programmatic usage
+
+```python
+from scripts.wash_trade_simulator import NaiveAttacker, trades_to_feature_matrix
+
+profile = NaiveAttacker(n_wallets=10, trades_per_wallet=50)
+trades = profile.generate_trades()
+features = trades_to_feature_matrix(trades)
+```
+
+---
+
+## `adversarial_training_loop.py`
+
+Runs a GAN-style adversarial training loop: Round 0 uses `NaiveAttacker`,
+subsequent rounds use `AdaptiveAttacker` (which reads the previous round's
+model feature importances). Per-round metrics are written to
+`reports/adversarial_loop_{timestamp}.json`.
+
+### Usage
+
+```bash
+python -m scripts.adversarial_training_loop \
+    --gan-rounds 5 \
+    --n-wallets 50
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--gan-rounds` | `5` | Number of adversarial rounds |
+| `--n-wallets` | `50` | Wallets per generated dataset |
+| `--trades-per-wallet` | `100` | Trades per wallet |
+| `--output-dir` | `reports` | Directory for output JSON |
+| `--seed` | `42` | Random seed |
+
+---
+
+## `evaluate_simulator_realism.py`
+
+Computes realism metrics for the simulator: Fréchet Feature Distance (FFD)
+and discriminator accuracy between simulated and real labelled data.
+
+### Usage
+
+```bash
+python -m scripts.evaluate_simulator_realism \
+    --simulated data/synthetic_dataset.parquet \
+    --real data/labelled_dataset.parquet
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--simulated` | `data/synthetic_dataset.parquet` | Path to simulated feature matrix |
+| `--real` | `data/labelled_dataset.parquet` | Path to real labelled dataset |
+| `--output-dir` | `reports` | Directory for output JSON |
+| `--seed` | `42` | Random seed |
+
+---
 
 ### Training on the generated dataset
 

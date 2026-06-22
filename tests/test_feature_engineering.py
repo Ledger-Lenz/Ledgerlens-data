@@ -199,5 +199,15 @@ def test_build_feature_matrix_includes_hardening_features():
     assert "cross_wallet_volume_corr" in matrix.columns
 
 
+def test_build_feature_matrix_accepts_gnn_embedding_features():
+    embeddings = {
+        "A": {f"gnn_embedding_{i}": float(i) for i in range(64)},
+        "B": {f"gnn_embedding_{i}": float(i + 1) for i in range(64)},
+    }
+    matrix = build_feature_matrix(_sample_trades(), gnn_embeddings=embeddings)
+    assert all(f"gnn_embedding_{i}" in matrix.columns for i in range(64))
+    assert matrix.loc[matrix["wallet"] == "A", "gnn_embedding_63"].iloc[0] == 63.0
+
+
 # Needed for approx assertions
 import pytest  # noqa: E402 (placed after test functions intentionally for clarity)

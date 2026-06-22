@@ -6,16 +6,21 @@ Supports three delivery channels:
   - websocket — push to an injected ws_client handle
 """
 
+from __future__ import annotations
+
 import json
 import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 
 from config import config
 from utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from streaming.rl_threshold_controller import ThresholdController
 
 logger = get_logger(__name__)
 
@@ -30,6 +35,7 @@ class AlertDispatcher:
         ws_client: Any = None,
         alert_cooldown_seconds: int = 3600,
         threshold: int | None = None,
+        threshold_controller: ThresholdController | None = None,
     ):
         if channel not in ("stdout", "webhook", "websocket"):
             raise ValueError(f"Unknown alert channel: {channel!r}")
@@ -41,6 +47,7 @@ class AlertDispatcher:
         self._ws_client = ws_client
         self._alert_cooldown_seconds = alert_cooldown_seconds
         self._threshold = threshold if threshold is not None else config.RISK_SCORE_FLAG_THRESHOLD
+        self._threshold_controller = threshold_controller
 
         if channel == "webhook":
             if not self._webhook_url:
@@ -57,7 +64,7 @@ class AlertDispatcher:
 
     def dispatch(self, wallet: str, risk_score: dict, pair_id: str) -> None:
         """Deliver an alert if *risk_score* exceeds threshold and wallet is not cooling down."""
-        if risk_score["score"] < self._threshold:
+        if risk_score["score"] < self._get_threshold(pair_id):
             return
 
         with self._lock:
@@ -71,6 +78,11 @@ class AlertDispatcher:
     # ------------------------------------------------------------------
     # Internal delivery
     # ------------------------------------------------------------------
+
+    def _get_threshold(self, asset: str) -> float:
+        if self._threshold_controller is not None:
+            return self._threshold_controller.get_threshold(asset)
+        return float(self._threshold)
 
     def _deliver(self, wallet: str, risk_score: dict, pair_id: str) -> None:
         if self._channel == "stdout":

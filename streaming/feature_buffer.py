@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from config import config
 from detection.feature_engineering import build_feature_vector
+from detection.streaming_benford import StreamingBenfordSketch
 from ingestion.data_models import Trade
 
 if TYPE_CHECKING:
@@ -36,6 +38,11 @@ class FeatureBuffer:
         self._buffers: dict[str, deque] = {}
         self._wallet_locks: dict[str, threading.Lock] = {}
 
+        # Benford sketches: wallet -> window_hours -> StreamingBenfordSketch
+        self._benford_sketches: dict[str, dict[int, StreamingBenfordSketch]] = {}
+        # Per-pair Benford sketches: wallet -> pair_id -> window_hours -> StreamingBenfordSketch
+        self._pair_benford_sketches: dict[str, dict[str, dict[int, StreamingBenfordSketch]]] = {}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -46,6 +53,10 @@ class FeatureBuffer:
             if wallet not in self._wallet_locks:
                 self._wallet_locks[wallet] = threading.Lock()
                 self._buffers[wallet] = deque(maxlen=self.max_trades)
+                self._benford_sketches[wallet] = {
+                    h: StreamingBenfordSketch(h * 3600) for h in config.BENFORD_WINDOWS_HOURS
+                }
+                self._pair_benford_sketches[wallet] = {}
             return self._wallet_locks[wallet]
 
     # ------------------------------------------------------------------
@@ -67,10 +78,24 @@ class FeatureBuffer:
             "counter_asset": str(trade.counter_asset.code),
             "amount": trade.amount,
         }
+        pair_id = trade.base_asset.pair_id(trade.counter_asset)
+
         for wallet in (trade.base_account, trade.counter_account):
             lock = self._ensure_wallet(wallet)
             with lock:
                 self._buffers[wallet].append(record)
+
+                # Update wallet-level Benford sketches
+                for sketch in self._benford_sketches[wallet].values():
+                    sketch.update(trade.amount, trade.ledger_close_time)
+
+                # Update pair-level Benford sketches
+                if pair_id not in self._pair_benford_sketches[wallet]:
+                    self._pair_benford_sketches[wallet][pair_id] = {
+                        h: StreamingBenfordSketch(h * 3600) for h in config.BENFORD_WINDOWS_HOURS
+                    }
+                for sketch in self._pair_benford_sketches[wallet][pair_id].values():
+                    sketch.update(trade.amount, trade.ledger_close_time)
 
     def get_feature_row(self, wallet: str) -> pd.Series | None:
         """Build and return the feature row for *wallet*.
@@ -80,12 +105,25 @@ class FeatureBuffer:
         lock = self._ensure_wallet(wallet)
         with lock:
             records = list(self._buffers[wallet])
+            # Prepare pre-computed Benford metrics
+            benford_metrics = {
+                h: s.to_metrics() for h, s in self._benford_sketches[wallet].items()
+            }
+            # Prepare per-pair sketches for cross-asset features.
+            # Shallow copy to avoid RuntimeError if new pairs are added during iteration.
+            pair_benford_sketches = dict(self._pair_benford_sketches[wallet])
 
         if not records:
             return None
 
         wallet_df = pd.DataFrame(records)
-        features = build_feature_vector(wallet, wallet_df, all_pairs_df=wallet_df)
+        features = build_feature_vector(
+            wallet,
+            wallet_df,
+            all_pairs_df=wallet_df,
+            benford_metrics=benford_metrics,
+            pair_benford_sketches=pair_benford_sketches,
+        )
         return pd.Series(features)
 
     def wallet_trade_count(self, wallet: str) -> int:

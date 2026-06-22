@@ -11,9 +11,28 @@ group consumed by `feature_engineering.py`.
 """
 
 import math
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
+
+@dataclass
+class BenfordMetrics:
+    """Standardized Benford anomaly metrics."""
+
+    chi_square: float
+    mad: float
+    mad_nonconforming: bool
+    z_scores: dict[int, float]
+    sample_size: int
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
 
 # Benford's Law expected frequency for leading digits 1-9
 BENFORD_EXPECTED = {d: math.log10(1 + 1 / d) for d in range(1, 10)}
@@ -102,19 +121,19 @@ def mad_score(amounts: pd.Series) -> float:
     return float(sum(deviations) / len(deviations))
 
 
-def compute_benford_metrics(amounts: pd.Series) -> dict:
+def compute_benford_metrics(amounts: pd.Series) -> BenfordMetrics:
     """Compute the full set of Benford metrics for a series of amounts.
 
-    Returns a dict with `chi_square`, `mad`, `mad_nonconforming`, and
-    `z_scores` (per-digit dict), suitable for use as a feature row.
+    Returns a BenfordMetrics dataclass (backward compatible with dict access).
     """
-    return {
-        "chi_square": chi_square_statistic(amounts),
-        "mad": mad_score(amounts),
-        "mad_nonconforming": mad_score(amounts) > MAD_NONCONFORMITY_THRESHOLD,
-        "z_scores": z_scores(amounts),
-        "sample_size": int((amounts > 0).sum()),
-    }
+    mad = mad_score(amounts)
+    return BenfordMetrics(
+        chi_square=chi_square_statistic(amounts),
+        mad=mad,
+        mad_nonconforming=mad > MAD_NONCONFORMITY_THRESHOLD,
+        z_scores=z_scores(amounts),
+        sample_size=int((amounts > 0).sum()),
+    )
 
 
 def compute_benford_metrics_for_windows(
@@ -123,7 +142,7 @@ def compute_benford_metrics_for_windows(
     time_col: str = "ledger_close_time",
     windows_hours: list[int] | None = None,
     reference_time: pd.Timestamp | None = None,
-) -> dict[int, dict]:
+) -> dict[int, BenfordMetrics]:
     """Compute Benford metrics over multiple trailing windows ending at
     `reference_time` (defaults to the max timestamp in `df`).
 
@@ -149,10 +168,10 @@ def compute_benford_metrics_for_windows(
     return results
 
 
-def cross_pair_benford_consistency(per_pair_metrics: dict[str, dict]) -> float:
+def cross_pair_benford_consistency(per_pair_metrics: dict[str, BenfordMetrics]) -> float:
     """Compute cross-pair Benford MAD consistency.
 
-    `per_pair_metrics` maps pair_id -> metrics dict (from compute_benford_metrics).
+    `per_pair_metrics` maps pair_id -> BenfordMetrics.
     Returns the standard deviation of MAD scores across pairs. Low values indicate
     all pairs have similar Benford conformity (consistent wash trading pattern).
     High values indicate mixed conformity (concentrated on specific pairs).

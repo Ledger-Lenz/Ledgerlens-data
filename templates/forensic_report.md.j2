@@ -34,3 +34,22 @@ Risk score: {{ report.risk_score.score }}
 {% else %}
 - Causal attribution disabled.
 {% endif %}
+
+## Propagation Path
+
+{% if report.propagation_path and report.propagation_path.propagated_risk > 0 %}
+Propagated risk score: {{ report.propagation_path.propagated_risk }}
+
+The following wallets contributed risk to this wallet through the funding / co-trade graph:
+
+| Source wallet | Base score | PPR weight | Contribution | Fraction |
+|---------------|-----------|------------|--------------|----------|
+{% for c in report.propagation_path.contributors %}
+| {{ c.source_wallet }} | {{ c.base_score }} | {{ c.ppr_weight }} | {{ c.contribution }} | {{ "%.1f"|format(c.fraction * 100) }}% |
+{% endfor %}
+
+> Propagated scores decay with hop distance (α = 0.15). Direct funders/receivers
+> of a seed wallet receive ~85 % of teleport weight; two-hop neighbours ~12 %.
+{% else %}
+- No risk propagation detected (propagated score is 0 or propagation was not run).
+{% endif %}

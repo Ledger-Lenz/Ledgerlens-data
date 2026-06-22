@@ -19,9 +19,9 @@ from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 def trained_model_dir(tmp_path_factory):
     """Train a small ensemble and return the model directory."""
     df = generate_synthetic_dataset(n_wallets=80, seed=10)
-    results = train_models(df, test_size=0.25, random_state=10)
+    output = train_models(df, test_size=0.25, random_state=10)
     model_dir = str(tmp_path_factory.mktemp("models"))
-    save_models(results, model_dir)
+    save_models(output["results"], model_dir)
     return model_dir, df
 
 

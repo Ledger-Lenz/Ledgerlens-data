@@ -14,10 +14,10 @@ from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 @pytest.fixture(scope="module")
 def trained_models(tmp_path_factory):
     df = generate_synthetic_dataset(n_wallets=60, seed=2)
-    results = train_models(df, test_size=0.3, random_state=2)
+    output = train_models(df, test_size=0.3, random_state=2)
     model_dir = str(tmp_path_factory.mktemp("models"))
-    save_models(results, model_dir)
-    return results, model_dir, df
+    save_models(output["results"], model_dir)
+    return output, model_dir, df
 
 
 # ---------------------------------------------------------------------------

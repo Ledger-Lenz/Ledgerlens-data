@@ -6,6 +6,8 @@ documented in the README's "Shared Contracts" section:
   - `submit_score(wallet, asset_pair, score, benford_flag, ml_flag,
     timestamp, confidence)` — writes a `RiskScore` record on-chain. Requires
     `LEDGERLENS_SUBMITTER_SECRET` (an authorized service-account secret key).
+    - `submit_score_with_commitment(...)` — writes the same score plus a
+        deterministic commitment and attestation metadata.
   - `get_score(wallet, asset_pair)` — permissionless read of the on-chain
     `RiskScore`.
 
@@ -50,10 +52,21 @@ class LedgerLensContractClient:
             network_passphrase=self.network_passphrase,
         )
 
-    def submit_score(self, wallet: str, asset_pair: str, risk_score: dict) -> object:
+    def submit_score(
+        self,
+        wallet: str,
+        asset_pair: str,
+        risk_score: dict,
+        *,
+        commitment: str | None = None,
+        trade_data_hash: str | None = None,
+        model_version_hash: str | None = None,
+    ) -> object:
         """Submit a `RiskScore` record (the dict shape from `RiskScorer.score()`,
         plus an integer `timestamp`) for `(wallet, asset_pair)`.
 
+        When `commitment` is provided, the client calls the attested contract
+        entry point and includes the commitment metadata alongside the score.
         Returns the parsed contract result. Requires `LEDGERLENS_SUBMITTER_SECRET`.
         """
         if not self.submitter_secret:
@@ -71,16 +84,84 @@ class LedgerLensContractClient:
             scval.to_uint32(int(risk_score["confidence"])),
         ]
 
-        tx = self._client.invoke(
-            "submit_score",
-            params,
-            source=signer.public_key,
-            signer=signer,
-        )
+        if commitment is None:
+            tx = self._client.invoke(
+                "submit_score",
+                params,
+                source=signer.public_key,
+                signer=signer,
+            )
+        else:
+            if trade_data_hash is None or model_version_hash is None:
+                raise ValueError(
+                    "trade_data_hash and model_version_hash are required when commitment is set"
+                )
+            params = params + [
+                scval.to_string(commitment),
+                scval.to_string(trade_data_hash),
+                scval.to_string(model_version_hash),
+            ]
+            tx = self._client.invoke(
+                "submit_score_with_commitment",
+                params,
+                source=signer.public_key,
+                signer=signer,
+            )
         return tx.sign_and_submit()
+
+    def submit_score_with_commitment(
+        self,
+        wallet: str,
+        asset_pair: str,
+        risk_score: dict,
+        commitment: str,
+        trade_data_hash: str,
+        model_version_hash: str,
+    ) -> object:
+        """Explicit attested-submit helper for callers that already built a receipt."""
+        return self.submit_score(
+            wallet,
+            asset_pair,
+            risk_score,
+            commitment=commitment,
+            trade_data_hash=trade_data_hash,
+            model_version_hash=model_version_hash,
+        )
 
     def get_score(self, wallet: str, asset_pair: str) -> dict:
         """Read the on-chain `RiskScore` for `(wallet, asset_pair)`."""
         params = [scval.to_address(wallet), scval.to_string(asset_pair)]
         tx = self._client.invoke("get_score", params, simulate=True)
         return scval.to_native(tx.result())
+
+    def anchor_report(self, report: object) -> str:
+        """Submit a forensic report's SHA-256 fingerprint to Soroban.
+
+        Calls the contract's `anchor_report(report_id, sha256)` function and
+        returns the Stellar transaction hash.  The hash is also stored on
+        `report.soroban_anchor_tx` so the caller has it immediately.
+
+        Anyone can verify the anchor independently:
+            GET {HORIZON_URL}/transactions/{tx_hash}
+        and compare the embedded SHA-256 to the report on disk.
+        """
+        if not self.submitter_secret:
+            raise ValueError("LEDGERLENS_SUBMITTER_SECRET is not configured")
+
+        signer = Keypair.from_secret(self.submitter_secret)
+
+        params = [
+            scval.to_string(report.report_id),
+            scval.to_string(report.report_sha256),
+        ]
+
+        tx = self._client.invoke(
+            "anchor_report",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        result = tx.sign_and_submit()
+        tx_hash: str = str(result.hash)
+        report.soroban_anchor_tx = tx_hash
+        return tx_hash

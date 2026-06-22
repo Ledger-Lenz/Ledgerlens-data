@@ -59,6 +59,53 @@ def test_submit_score_invokes_contract():
     assert result is mock_tx.sign_and_submit.return_value
 
 
+def test_submit_score_with_commitment_invokes_attested_contract():
+    client = make_client()
+    mock_tx = MagicMock()
+    client._client.invoke.return_value = mock_tx
+
+    result = client.submit_score(
+        "GBC7IT5A5IFEADNWESIJFR4F4AW35BV7YIM42G6TR2W43IF3JTFBWRPD",
+        "USDC:issuer/XLM:native",
+        {
+            "score": 80,
+            "benford_flag": True,
+            "ml_flag": True,
+            "confidence": 80,
+            "timestamp": 123,
+        },
+        commitment="deadbeef",
+        trade_data_hash="cafebabe",
+        model_version_hash="sha256:feedface",
+    )
+
+    client._client.invoke.assert_called_once()
+    args, kwargs = client._client.invoke.call_args
+    assert args[0] == "submit_score_with_commitment"
+    assert len(args[1]) == 10
+    assert "source" in kwargs and "signer" in kwargs
+    mock_tx.sign_and_submit.assert_called_once()
+    assert result is mock_tx.sign_and_submit.return_value
+
+
+def test_submit_score_with_commitment_requires_hashes():
+    client = make_client()
+
+    with pytest.raises(ValueError):
+        client.submit_score(
+            "GBC7IT5A5IFEADNWESIJFR4F4AW35BV7YIM42G6TR2W43IF3JTFBWRPD",
+            "USDC:issuer/XLM:native",
+            {
+                "score": 80,
+                "benford_flag": True,
+                "ml_flag": True,
+                "confidence": 80,
+                "timestamp": 123,
+            },
+            commitment="deadbeef",
+        )
+
+
 def test_get_score_invokes_contract_and_parses_result():
     client = make_client()
     mock_tx = MagicMock()
