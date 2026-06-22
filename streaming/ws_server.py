@@ -18,20 +18,11 @@ import re
 import threading
 import time
 from collections import deque
-<<<<<<< HEAD
-from dataclasses import dataclass, asdict
 from typing import Any
 
 import websockets
 from pydantic import BaseModel, Field, ValidationError
 from prometheus_client import Counter, Gauge
-=======
-from typing import Any
-
-import websockets
-from prometheus_client import Counter, Gauge
-from pydantic import BaseModel, Field, ValidationError
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
 
 from config import config
 from streaming.pubsub_router import PubSubRouter
@@ -344,10 +335,6 @@ async def _handler(websocket) -> None:
 
         client_queue = asyncio.Queue(maxlen=config.WS_CLIENT_QUEUE_DEPTH)
         rate_limiter = TokenBucket(config.WS_RATE_LIMIT_MSGS_PER_SECOND)
-<<<<<<< HEAD
-        dropped_count = 0
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
 
         with _clients_lock:
             _clients[client_id] = {
@@ -516,7 +503,7 @@ async def _handle_subscribe(websocket, client_id: str, permissions: set[str], pa
 
         # Subscribe
         _router.subscribe(client_id, channels)
-        logger.debug("Client %s subscribed to %d channels", client_id, len(channels))
+        logger.info("Client %s subscribed to channels: %s", client_id, channels)
 
     except ValidationError as exc:
         error = ErrorMessage(code="validation_error", message=str(exc))
@@ -546,7 +533,7 @@ async def _handle_unsubscribe(websocket, client_id: str, payload: dict) -> None:
             return
 
         _router.unsubscribe(client_id, channels)
-        logger.debug("Client %s unsubscribed from %d channels", client_id, len(channels))
+        logger.info("Client %s unsubscribed from channels: %s", client_id, channels)
 
     except ValidationError as exc:
         error = ErrorMessage(code="validation_error", message=str(exc))
@@ -582,7 +569,13 @@ async def _handle_replay(websocket, client_id: str, permissions: set[str], paylo
 
         # Get messages from replay buffer
         messages = _replay_buffer.get_since(channel, since_seq)
-        logger.debug("Client %s replayed %d messages from seq %d", client_id, len(messages), since_seq)
+        logger.info(
+            "Client %s replayed %d messages from channel %s since seq %d",
+            client_id,
+            len(messages),
+            channel,
+            since_seq,
+        )
 
         # Send replayed messages
         for msg_dict in messages:
@@ -604,11 +597,6 @@ async def _process_outbound(websocket, queue: asyncio.Queue, client_id: str, rat
         client_id: Client ID
         rate_limiter: Token-bucket rate limiter for this client
     """
-<<<<<<< HEAD
-    dropped_count = 0
-
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
     try:
         while True:
             try:
@@ -683,11 +671,6 @@ async def publish_score_update(score_event: dict) -> None:
         pair_channel = f"pair/{asset_pair}"
 
         # Route to subscribers
-<<<<<<< HEAD
-        subscriber_ids = _router.get_clients_for_event(wallet_id, asset_pair)
-
-=======
->>>>>>> 14aa8ce (fix: resolve ruff linting errors in ws_auth and ws_server)
         # Send to wallet channel subscribers
         for client_id in _router.get_subscribers(wallet_channel):
             message = {
@@ -773,6 +756,7 @@ def _enqueue_for_client(client_id: str, message: dict) -> None:
             pass
 
         ws_messages_dropped_total.inc()
+        logger.warning("Dropped queued WebSocket message for client %s due to backpressure", client_id)
 
 
 def push_alert_sync(payload: dict) -> None:
@@ -806,6 +790,12 @@ async def run_ws_server(host: str = "127.0.0.1", port: int = 8765) -> None:
         raise ValueError("Binding WebSocket server to 0.0.0.0 requires WS_ALLOW_EXTERNAL=1")
 
     logger.info("WebSocket server listening on %s:%d", effective_host, effective_port)
+    logger.info(
+        "WebSocket limits configured: max_clients=%d, queue_depth=%d, replay_buffer=%d",
+        config.WS_MAX_CLIENTS,
+        config.WS_CLIENT_QUEUE_DEPTH,
+        config.WS_REPLAY_BUFFER_SIZE,
+    )
     async with websockets.serve(_handler, effective_host, effective_port):
         await asyncio.Future()  # run until cancelled
 
