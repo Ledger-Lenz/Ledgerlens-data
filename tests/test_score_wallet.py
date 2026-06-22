@@ -5,6 +5,8 @@ import pytest
 
 from scripts.score_wallet import main
 
+VALID_WALLET = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 
 @pytest.fixture
 def mock_scorer():
@@ -46,7 +48,7 @@ def mock_explainer():
 
 
 def test_score_wallet_outputs_score_and_shap(capsys, mock_scorer, mock_ingestion, mock_explainer):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -60,7 +62,7 @@ def test_score_wallet_outputs_score_and_shap(capsys, mock_scorer, mock_ingestion
 def test_score_wallet_json_output_is_valid_json(
     capsys, mock_scorer, mock_ingestion, mock_explainer
 ):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch(
         "sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G...", "--json"]
     ):
@@ -75,7 +77,7 @@ def test_score_wallet_json_output_is_valid_json(
 
 def test_score_wallet_flagged_label(capsys, mock_scorer, mock_ingestion, mock_explainer):
     mock_scorer.score.return_value["score"] = 85
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -85,7 +87,7 @@ def test_score_wallet_flagged_label(capsys, mock_scorer, mock_ingestion, mock_ex
 
 def test_score_wallet_ok_label(capsys, mock_scorer, mock_ingestion, mock_explainer):
     mock_scorer.score.return_value["score"] = 30
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -102,11 +104,21 @@ def test_score_wallet_invalid_wallet_id_exits_1(capsys):
     assert "Invalid wallet ID format" in out
 
 
+def test_score_wallet_rejects_non_base32_wallet_characters(capsys):
+    invalid_wallet = "G" + ("0" * 55)
+    with patch("sys.argv", ["score_wallet.py", "--wallet", invalid_wallet, "--pair", "USDC:G..."]):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+    assert excinfo.value.code == 1
+    out, _ = capsys.readouterr()
+    assert "Base32 characters" in out
+
+
 def test_score_wallet_missing_models_exits_1(capsys, mock_ingestion):
     with patch(
         "scripts.score_wallet.RiskScorer", side_effect=RuntimeError("No trained models found")
     ):
-        test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+        test_wallet = VALID_WALLET
         with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
             with pytest.raises(SystemExit) as excinfo:
                 main()
@@ -118,7 +130,7 @@ def test_score_wallet_missing_models_exits_1(capsys, mock_ingestion):
 def test_score_wallet_causal_json_output_includes_causal_section(
     capsys, mock_scorer, mock_ingestion, mock_explainer
 ):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch("scripts.score_wallet.CounterfactualAttributor") as mock_attributor:
         attributor_instance = mock_attributor.return_value
         attributor_instance.counterfactual_score.return_value = {
@@ -151,7 +163,7 @@ def test_score_wallet_causal_json_output_includes_causal_section(
 def test_score_wallet_what_if_remove_invalid_trade_raises_value_error(
     mock_scorer, mock_ingestion, mock_explainer
 ):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = VALID_WALLET
     with patch(
         "sys.argv",
         [

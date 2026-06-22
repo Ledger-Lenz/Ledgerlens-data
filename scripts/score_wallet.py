@@ -13,6 +13,7 @@ SHAP feature attributions, and prints the result to stdout.
 
 import argparse
 import json
+import re
 import sys
 from datetime import UTC, datetime
 
@@ -31,12 +32,14 @@ from ingestion.orderbook_loader import (
     orderbook_events_to_dataframe,
 )
 
+STELLAR_WALLET_RE = re.compile(r"^G[A-Z2-7]{55}$")
+
 
 def validate_wallet_id(wallet_id: str) -> None:
-    """Validate that wallet_id looks like a Stellar public key (56 chars, starts with G)."""
-    if len(wallet_id) != 56 or not wallet_id.startswith("G"):
+    """Validate that wallet_id looks like a Stellar public key."""
+    if not STELLAR_WALLET_RE.fullmatch(wallet_id):
         print(f"Error: Invalid wallet ID format '{wallet_id}'.")
-        print("Must be a 56-character Stellar public key starting with 'G'.")
+        print("Must be a Stellar public key matching G followed by 55 Base32 characters A-Z or 2-7.")
         sys.exit(1)
 
 
