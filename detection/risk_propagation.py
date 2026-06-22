@@ -30,14 +30,10 @@ graph a full pass completes in < 2 seconds on CPU.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 import networkx as nx
 import numpy as np
-from scipy.sparse import csr_matrix
-
-if TYPE_CHECKING:
-    pass
+from scipy.sparse import csr_matrix, diags
 
 logger = logging.getLogger(__name__)
 
@@ -54,12 +50,17 @@ def _build_combined_graph(
     """Merge *funding_graph* and *co_trade_graph* into a single DiGraph.
 
     Co-trade edges are treated as bidirectional (both directions added).
+    Nodes that appear only in *co_trade_graph* are included so that wallets
+    with no funding relationship but shared co-trade activity still receive
+    propagated scores.
     """
     combined: nx.DiGraph = nx.DiGraph()
     combined.add_nodes_from(funding_graph.nodes())
     combined.add_edges_from(funding_graph.edges())
 
     if co_trade_graph is not None:
+        # add_nodes_from is a no-op for nodes already present
+        combined.add_nodes_from(co_trade_graph.nodes())
         for u, v in co_trade_graph.edges():
             combined.add_edge(u, v)
             combined.add_edge(v, u)
@@ -186,7 +187,6 @@ def propagate_risk_scores(
         # Row-normalise: convert to dense temporarily, then back
         row_sums = np.asarray(adj_raw.sum(axis=1)).ravel()
         row_sums[row_sums == 0] = 1.0
-        from scipy.sparse import diags
         D_inv = diags(1.0 / row_sums)
         A_csr: csr_matrix = (D_inv @ adj_raw).tocsr()
     else:
@@ -262,7 +262,6 @@ def propagation_attribution(
         adj_raw = csr_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
         row_sums = np.asarray(adj_raw.sum(axis=1)).ravel()
         row_sums[row_sums == 0] = 1.0
-        from scipy.sparse import diags
         D_inv = diags(1.0 / row_sums)
         A_csr: csr_matrix = (D_inv @ adj_raw).tocsr()
     else:
