@@ -67,6 +67,11 @@ class Config:
 
     RISK_SCORE_DB_URL: str = os.getenv("RISK_SCORE_DB_URL", "sqlite:///ledgerlens.db")
 
+    # Database connection pooling
+    DB_POOL_SIZE: int = int(os.getenv("DB_POOL_SIZE", "5"))
+    DB_MAX_OVERFLOW: int = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+    DB_POOL_TIMEOUT: int = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+
     MODEL_DIR: str = os.getenv("MODEL_DIR", "./models")
 
     # ledgerlens-score Soroban contract
