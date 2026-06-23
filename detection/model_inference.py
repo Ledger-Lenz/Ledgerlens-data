@@ -288,6 +288,21 @@ class RiskScorer:
                 and (feature_row[benford_mad_cols] > BENFORD_MAD_FLAG_THRESHOLD).any()
             )
 
+            # Integrate Zero-Shot prototype score
+            if config.ZERO_SHOT_WEIGHT > 0.0:
+                try:
+                    from detection.zero_shot import PrototypeDetector
+                    import joblib
+                    zs_path = os.path.join(self.model_dir, "zero_shot.joblib")
+                    if os.path.exists(zs_path):
+                        zs_model = joblib.load(zs_path)
+                        emb = self.extractor.transform(X)[0]
+                        zs_score = zs_model.score(emb) * 100
+                        final_score = (1.0 - config.ZERO_SHOT_WEIGHT) * final_score + (config.ZERO_SHOT_WEIGHT * zs_score)
+                        logger.debug("Zero-shot score applied. New final_score: %.2f", final_score)
+                except Exception as e:
+                    logger.warning("Zero-shot scoring failed: %s", e)
+
             result = {
                 "score": int(round(final_score)),
                 "benford_flag": benford_flag,
