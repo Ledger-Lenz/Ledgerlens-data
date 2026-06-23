@@ -12,6 +12,10 @@ artifacts to `config.MODEL_DIR`, and writes `metrics.json` alongside them.
 
 After every training run, `metrics.json` is signed with the Ed25519 private
 key at `MODEL_SIGNING_PRIVATE_KEY_PATH` (if configured).
+
+Pass `--calibrate-ensemble` to additionally run NSGA-II Pareto front search
+over ensemble combination weights (see `detection/ensemble_calibrator.py`)
+and write `models/pareto_front.json`.
 """
 
 import argparse
@@ -200,6 +204,8 @@ def train_models(
           "feature_distributions": {...},
           "n_train": int,
           "n_test": int,
+          "X_test": pd.DataFrame,
+          "y_test": pd.Series,
         }
 
     If ``adversarial_augmentation`` is True, ``auc_roc_adversarial`` is also
@@ -257,6 +263,8 @@ def train_models(
         "feature_distributions": compute_feature_distributions(X),
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "X_test": X_test,
+        "y_test": y_test,
     }
 
 
@@ -355,6 +363,17 @@ def parse_args() -> argparse.Namespace:
             "by ADVERSARIAL_AUG_RATIO in config / .env (default 0.0 = disabled)."
         ),
     )
+    parser.add_argument(
+        "--calibrate-ensemble",
+        action="store_true",
+        default=False,
+        help=(
+            "After training, run NSGA-II Pareto front search over ensemble "
+            "combination weights (precision/recall/SHAP-stability) and write "
+            "models/pareto_front.json. Offline step, disabled by default since "
+            "it is significantly more expensive than training itself."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -403,6 +422,16 @@ def main() -> None:
 
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
+
+    if args.calibrate_ensemble:
+        from detection.ensemble_calibrator import EnsembleCalibrator, summarize_pareto_front
+
+        trained_models = {name: result["model"] for name, result in results.items()}
+        calibrator = EnsembleCalibrator(model_dir)
+        pareto_front = calibrator.run_search(
+            trained_models, training_output["X_test"], training_output["y_test"]
+        )
+        logger.info(summarize_pareto_front(pareto_front))
 
     if config.MODEL_SIGNING_PRIVATE_KEY_PATH:
         from detection.persistence import sign_metrics

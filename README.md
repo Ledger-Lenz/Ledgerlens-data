@@ -502,6 +502,7 @@ ledgerlens-data/
 │   ├── wallet_graph.py          ← funding-graph similarity/centrality
 │   ├── model_training.py        ← ensemble training CLI
 │   ├── model_inference.py       ← RiskScorer ensemble scoring
+│   ├── ensemble_calibrator.py   ← NSGA-II Pareto search over ensemble weights
 │   ├── shap_explainer.py        ← per-wallet + ensemble SHAP attributions
 │   ├── persistence.py           ← SQLAlchemy RiskScore model + engine
 │   └── risk_score_store.py      ← RiskScore upsert/read repository
@@ -562,6 +563,10 @@ Every trained model artifact is verified through a four-step chain before loadin
 ### Byzantine-Fault-Tolerant Ensemble Voting
 
 The three models (RF, XGBoost, LightGBM) vote using a **trimmed mean / median** scheme. If the spread across model scores exceeds `BFT_SCORE_DIVERGENCE_THRESHOLD` (default 30 points), the outlier scores are trimmed and the median is used — ensuring a single compromised model cannot shift the final score by more than ~17 points. Divergence events are logged, counted in a Prometheus counter (`bft_divergence_detected_total`), and surfaced in the score response as `bft_divergence: true`.
+
+### Multi-Objective Ensemble Calibration
+
+`detection/ensemble_calibrator.py` runs NSGA-II (via `pymoo`) over the ensemble's per-model combination weights to find the Pareto front of non-dominated tradeoffs between **precision**, **recall**, and **SHAP stability** (mean cosine similarity between SHAP vectors under small input perturbations — high values mean explanations don't flip under noise). Run it with `python -m detection.model_training --calibrate-ensemble ...`, which writes `models/pareto_front.json`. Operators then call `EnsembleCalibrator.select_operating_point(min_precision=..., min_recall=...)` to pick the most explanation-stable point that still satisfies their precision/recall floor, and pass the resulting weights to `RiskScorer(weights=...)` to score with that calibrated point instead of the default BFT trimmed-mean voting.
 
 ### Label Poisoning Detection
 

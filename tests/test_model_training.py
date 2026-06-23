@@ -10,7 +10,6 @@ from detection.model_training import (
     MODEL_REGISTRY,
     compute_feature_schema_hash,
     detect_label_poisoning,
-    save_metrics_report,
     save_models,
     save_training_artifacts,
     sha256_dataframe,
@@ -41,6 +40,13 @@ def test_train_models_returns_metrics_for_each_model(trained_output):
     for result in results.values():
         assert set(result["metrics"]) == {"auc_roc", "pr_auc", "f1"}
         assert 0.0 <= result["metrics"]["auc_roc"] <= 1.0
+
+
+def test_train_models_returns_held_out_split(trained_output):
+    output, _ = trained_output
+    assert len(output["X_test"]) == output["n_test"]
+    assert len(output["y_test"]) == output["n_test"]
+    assert "label" not in output["X_test"].columns
 
 
 def test_save_models_and_training_artifacts(tmp_path, trained_output):

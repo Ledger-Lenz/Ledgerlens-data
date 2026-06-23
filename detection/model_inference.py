@@ -10,9 +10,17 @@ BFT voting:
   use the median (for 3 models) — equivalent to a trimmed mean.
 - If fewer than BFT_MIN_CONSENSUS models agree (within 10 points), return
   a ``consensus_failure`` score with maximum uncertainty.
+
+Calibrated weighted mode:
+- ``RiskScorer(weights=...)`` accepts a ``{model_name: weight}`` mapping
+  (e.g. one selected from a Pareto front via
+  ``detection.ensemble_calibrator.EnsembleCalibrator.select_operating_point``)
+  and combines model probabilities as a weighted average instead of BFT
+  voting. ``weights=None`` (the default) preserves the BFT behaviour above.
 """
 
 import json
+import math
 import os
 import statistics
 
@@ -99,13 +107,30 @@ def _confidence_from_probs(probs: list[float], avg_prob: float) -> int:
     return int(round(certainty * 100))
 
 
+def _benford_flag(feature_row: pd.Series) -> bool:
+    benford_mad_cols = [c for c in feature_row.index if c.startswith("benford_mad_")]
+    return bool(
+        benford_mad_cols and (feature_row[benford_mad_cols] > BENFORD_MAD_FLAG_THRESHOLD).any()
+    )
+
+
 class RiskScorer:
     """Loads trained ensemble models and produces BFT-hardened risk scores."""
 
-    def __init__(self, model_dir: str | None = None):
+    def __init__(self, model_dir: str | None = None, weights: dict[str, float] | None = None):
         self.model_dir = model_dir or config.MODEL_DIR
+        self.weights = self._validate_weights(weights)
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+
+    @staticmethod
+    def _validate_weights(weights: dict[str, float] | None) -> dict[str, float] | None:
+        if weights is None:
+            return None
+        total = sum(weights.values())
+        if not math.isclose(total, 1.0, abs_tol=1e-6):
+            raise ValueError(f"RiskScorer weights must sum to 1.0, got {total}")
+        return weights
 
     def _load_metadata(self) -> dict | None:
         path = os.path.join(self.model_dir, "model_metadata.json")
@@ -176,6 +201,23 @@ class RiskScorer:
         probs = [model.predict_proba(X)[0][1] for model in self.models.values()]
         scores_100 = [p * 100 for p in probs]
 
+        if self.weights is not None:
+            missing = set(self.weights) - set(self.models)
+            if missing:
+                raise ValueError(f"weights reference unknown models: {sorted(missing)}")
+
+            avg_prob = sum(
+                self.weights.get(name, 0.0) * prob
+                for name, prob in zip(self.models, probs, strict=True)
+            )
+            return {
+                "score": int(round(avg_prob * 100)),
+                "benford_flag": _benford_flag(feature_row),
+                "ml_flag": bool(avg_prob >= ML_FLAG_THRESHOLD),
+                "confidence": _confidence_from_probs(probs, avg_prob),
+                "calibrated": True,
+            }
+
         result: dict = {}
 
         if not _has_consensus(scores_100):
@@ -205,15 +247,9 @@ class RiskScorer:
 
             avg_prob = final_score / 100.0
 
-            benford_mad_cols = [c for c in feature_row.index if c.startswith("benford_mad_")]
-            benford_flag = bool(
-                benford_mad_cols
-                and (feature_row[benford_mad_cols] > BENFORD_MAD_FLAG_THRESHOLD).any()
-            )
-
             result = {
                 "score": int(round(final_score)),
-                "benford_flag": benford_flag,
+                "benford_flag": _benford_flag(feature_row),
                 "ml_flag": bool(avg_prob >= ML_FLAG_THRESHOLD),
                 "confidence": _confidence_from_probs(probs, avg_prob),
             }
