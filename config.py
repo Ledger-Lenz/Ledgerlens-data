@@ -119,6 +119,12 @@ class Config:
     WS_REPLAY_BUFFER_SIZE: int = int(os.getenv("WS_REPLAY_BUFFER_SIZE", "1000"))
     WS_RATE_LIMIT_MSGS_PER_SECOND: int = int(os.getenv("WS_RATE_LIMIT_MSGS_PER_SECOND", "100"))
 
+    # Differentially private neural training (DP-SGD via Opacus)
+    DP_TARGET_EPSILON: float = float(os.getenv("DP_TARGET_EPSILON", "8.0"))
+    DP_TARGET_DELTA: float = float(os.getenv("DP_TARGET_DELTA", "1e-5"))
+    DP_MAX_GRAD_NORM: float = float(os.getenv("DP_MAX_GRAD_NORM", "1.0"))
+    DP_EPOCHS: int = int(os.getenv("DP_EPOCHS", "50"))
+
     # Adversarial training augmentation
     ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))
 

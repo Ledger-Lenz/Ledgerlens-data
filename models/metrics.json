@@ -1,0 +1,30 @@
+{
+  "differential_privacy": {
+    "dann_encoder": {
+      "recorded_at": "2026-06-22T17:08:40.483244Z",
+      "target_epsilon": 8.0,
+      "target_delta": 1e-05,
+      "achieved_epsilon": 7.994581272740462,
+      "max_grad_norm": 1.0,
+      "epochs": 50,
+      "auc_roc": 1.0,
+      "baseline_auc_roc": 1.0,
+      "auc_roc_degradation": 0.0,
+      "membership_inference_success_rate": 0.5549999999999999,
+      "non_private_mia_success_rate": 0.53
+    },
+    "meta_learner": {
+      "recorded_at": "2026-06-22T17:08:40.483556Z",
+      "target_epsilon": 8.0,
+      "target_delta": 1e-05,
+      "achieved_epsilon": 7.994581272740462,
+      "max_grad_norm": 1.0,
+      "epochs": 50,
+      "auc_roc": 1.0,
+      "baseline_auc_roc": 1.0,
+      "auc_roc_degradation": 0.0,
+      "membership_inference_success_rate": 0.5700000000000001,
+      "non_private_mia_success_rate": 0.54
+    }
+  }
+}
