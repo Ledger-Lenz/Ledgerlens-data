@@ -29,6 +29,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+import warnings
+
 from ingestion.data_models import AccountActivity
 
 # Stellar account ID format: G followed by 55 uppercase base-32 chars
@@ -312,3 +314,59 @@ def compute_wallet_graph_metrics(wallet: str, graph: nx.DiGraph) -> dict:
         "funding_source_similarity": _funding_source_similarity(wallet, graph),
         "network_centrality": _network_centrality(wallet, graph),
     }
+
+
+def build_co_trade_graph(trades: pd.DataFrame, window_hours: float = 24.0) -> nx.DiGraph:
+    """Build a directed graph of wallets co-active on an asset pair within window_hours.
+
+    Edges must be bidirectional and carry edge_type="co_trade", weight, and timestamp.
+    Invalid Stellar accounts are dropped using _validate_account_id.
+    """
+    g = nx.DiGraph()
+    if trades.empty:
+        return g
+
+    required = {"base_account", "counter_account", "ledger_close_time"}
+    missing = required - set(trades.columns)
+    if missing:
+        raise ValueError(f"trades missing required columns: {sorted(missing)}")
+
+    frame = trades.copy()
+    if "pair_id" not in frame:
+        if not {"base_asset", "counter_asset"}.issubset(frame.columns):
+            raise ValueError("trades require pair_id or base_asset/counter_asset columns")
+        frame["pair_id"] = (
+            frame["base_asset"].astype(str) + "/" + frame["counter_asset"].astype(str)
+        )
+    frame["ledger_close_time"] = pd.to_datetime(frame["ledger_close_time"], utc=True)
+    window = pd.Timedelta(hours=window_hours)
+
+    for _, pair_trades in frame.groupby("pair_id", sort=False):
+        records = pair_trades.sort_values("ledger_close_time").to_dict("records")
+        for left_index, left in enumerate(records):
+            left_time = left["ledger_close_time"]
+            active_wallets = {left["base_account"], left["counter_account"]}
+            for right in records[left_index + 1 :]:
+                if right["ledger_close_time"] - left_time > window:
+                    break
+                active_wallets.update((right["base_account"], right["counter_account"]))
+            
+            # Filter to valid accounts only
+            active_wallets = {w for w in active_wallets if _validate_account_id(w)}
+            
+            # Add bidirectional edges
+            for source, target in combinations(sorted(active_wallets), 2):
+                # Update or insert source -> target edge
+                if g.has_edge(source, target):
+                    g[source][target]["weight"] += 1
+                    g[source][target]["timestamp"] = max(g[source][target]["timestamp"], left_time)
+                else:
+                    g.add_edge(source, target, edge_type="co_trade", weight=1, timestamp=left_time)
+                
+                # Update or insert target -> source edge
+                if g.has_edge(target, source):
+                    g[target][source]["weight"] += 1
+                    g[target][source]["timestamp"] = max(g[target][source]["timestamp"], left_time)
+                else:
+                    g.add_edge(target, source, edge_type="co_trade", weight=1, timestamp=left_time)
+    return g

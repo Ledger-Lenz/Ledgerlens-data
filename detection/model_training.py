@@ -289,10 +289,23 @@ def save_training_artifacts(
     feature_columns = training_output["feature_columns"]
     feature_distributions = training_output.get("feature_distributions")
 
+    # Save metrics.json
     metrics_path = os.path.join(model_dir, "metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump({name: result["metrics"] for name, result in results.items()}, f, indent=2)
+    metrics_payload = {name: result["metrics"] for name, result in results.items()}
+    for name in results:
+        artifact_path = os.path.join(model_dir, f"{name}.joblib")
+        if os.path.exists(artifact_path):
+            sha = hashlib.sha256()
+            with open(artifact_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha.update(chunk)
+            metrics_payload[name]["artifact_sha256"] = sha.hexdigest()
 
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_payload, f, indent=2)
+
+    # Save model_metadata.json
+    metadata_path = os.path.join(model_dir, "model_metadata.json")
     metadata = {
         "trained_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "data_path": data_path,
