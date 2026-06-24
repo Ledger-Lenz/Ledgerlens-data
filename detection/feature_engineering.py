@@ -17,7 +17,6 @@ buffered into a DataFrame) for a single wallet.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
 
 import networkx as nx
 import numpy as np
@@ -183,10 +182,8 @@ def compute_benford_features(
 
     if decompose and not wallet_trades.empty:
         for hours, res_metrics in _compute_residual_benford_for_windows(wallet_trades).items():
-            features[f"benford_residual_chi_square_{hours}h"] = res_metrics.get(
-                "chi_square", float("nan")
-            )
-            features[f"benford_residual_mad_{hours}h"] = res_metrics.get("mad", float("nan"))
+            features[f"benford_residual_chi_square_{hours}h"] = res_metrics.get("chi_square", 0.0)
+            features[f"benford_residual_mad_{hours}h"] = res_metrics.get("mad", 0.0)
 
     if liquidity_profiler is not None and asset is not None:
         _add_calibrated_benford_features(
@@ -240,7 +237,7 @@ def _add_calibrated_benford_features(
     )
 
 
-def _compute_residual_benford_for_windows(wallet_trades: pd.DataFrame) -> dict[int, dict]:
+def _compute_residual_benford_for_windows(wallet_trades: pd.DataFrame) -> dict[int, BenfordMetrics | dict[Any, Any]]:
     """Compute Benford metrics on STL residuals for each configured window.
 
     For each window, the trade sub-frame is decomposed via STL and Benford
@@ -254,7 +251,7 @@ def _compute_residual_benford_for_windows(wallet_trades: pd.DataFrame) -> dict[i
     timestamps = pd.to_datetime(wallet_trades["ledger_close_time"])
     ref = timestamps.max()
 
-    results: dict[int, dict] = {}
+    results: dict[int, BenfordMetrics | dict] = {}
     for hours in windows_hours:
         window_start = ref - pd.Timedelta(hours=hours)
         window_df = wallet_trades[(timestamps > window_start) & (timestamps <= ref)]
@@ -268,6 +265,19 @@ def _compute_residual_benford_for_windows(wallet_trades: pd.DataFrame) -> dict[i
             results[hours] = compute_benford_metrics(pos_residuals)
 
     return results
+
+
+def compute_graph_embedding_features(
+    wallet: str,
+    funding_graph: nx.DiGraph,
+    gnn_encoder: object,
+) -> dict[str, float]:
+    """Return GNN embedding features for *wallet*, with zero-fallback on failure."""
+    try:
+        emb = gnn_encoder.encode(funding_graph, wallet)  # type: ignore[attr-defined]
+        return {f"gnn_{i}": float(emb[i]) for i in range(len(emb))}
+    except Exception:
+        return {f"gnn_{i}": 0.0 for i in range(config.GNN_EMBEDDING_DIM)}
 
 
 def compute_order_cancellation_rate(wallet: str, orderbook_events: pd.DataFrame | None) -> float:
@@ -294,7 +304,39 @@ def compute_trade_pattern_features(
     wallet_trades: pd.DataFrame,
     orderbook_events: pd.DataFrame | None = None,
 ) -> dict:
-    """Counterparty concentration, round-trips, self-matching, cancellations."""
+    """Compute trade-pattern features for a wallet.
+
+    Computes signals based on the wallet's trade history, and (optionally)
+    augments them with order-cancellation statistics derived from order-book
+    events.
+
+    Args:
+        wallet: Stellar account id to score.
+        wallet_trades: Trades involving ``wallet``. Expected columns include
+            ``base_account``, ``counter_account``, and ``amount``.
+        orderbook_events: Optional order-book event DataFrame as produced by
+            ``ingestion.orderbook_loader.load_accounts_orderbook_events``.
+            When provided, it must include ``account`` and ``action``
+            (with values such as ``created``, ``cancelled``, ``updated``).
+
+    Returns:
+        A dictionary with the following keys:
+
+        - ``counterparty_concentration_ratio``: Fraction of volume attributed
+          to the wallet's most-used counterparty.
+        - ``round_trip_frequency``: Fraction of trades where
+          ``base_account == counter_account``.
+        - ``net_roundtrip_ratio``: Currently identical to
+          ``round_trip_frequency``.
+        - ``self_matching_rate``: Currently identical to
+          ``round_trip_frequency``.
+        - ``order_cancellation_rate``: Fraction of the wallet's manage-offer
+          operations that were cancellations.
+
+    Raises:
+        KeyError: If required columns (e.g., ``base_account``,
+            ``counter_account``, ``amount``) are missing from ``wallet_trades``.
+    """
     order_cancellation_rate = compute_order_cancellation_rate(wallet, orderbook_events)
 
     if wallet_trades.empty:
@@ -330,7 +372,29 @@ def compute_trade_pattern_features(
 
 
 def compute_volume_timing_features(wallet_trades: pd.DataFrame) -> dict:
-    """Volume concentration and timing-based anomaly features."""
+    """Compute volume and timing anomaly features for a wallet.
+
+    Args:
+        wallet_trades: Trades involving a single wallet. Expected columns
+            include ``ledger_close_time`` (timestamp) and ``counter_account``.
+            Must also contain ``amount`` for volume-based calculations.
+
+    Returns:
+        A dictionary containing:
+
+        - ``volume_per_counterparty_ratio``: Total volume divided by the
+          number of unique counterparties.
+        - ``intra_minute_clustering``: Fraction of 1-minute buckets that
+          contain more than one trade.
+        - ``off_hours_activity_ratio``: Fraction of trades executed during
+          off-hours (UTC hours 00:00-04:59).
+        - ``volume_spike_frequency``: Fraction of trades whose amount exceeds
+          3× the rolling mean (window size = 10 trades).
+
+    Raises:
+        KeyError: If required columns (e.g., ``ledger_close_time``,
+            ``counter_account``, ``amount``) are missing.
+    """
     if wallet_trades.empty:
         return {
             "volume_per_counterparty_ratio": 0.0,
@@ -621,6 +685,24 @@ def compute_cross_venue_features(
     return _cvf(wallet, sdex_trades, amm_trades)
 
 
+def compute_graph_embedding_features(
+    wallet: str,
+    graph: nx.DiGraph,
+    encoder,
+) -> dict:
+    """Return GNN embedding features for *wallet* as a flat dict."""
+    dim = config.GNN_EMBEDDING_DIM
+    zero_features = {f"gnn_{i}": 0.0 for i in range(dim)}
+
+    try:
+        if wallet not in graph:
+            return zero_features
+        embedding = encoder.encode(graph, wallet)
+        return {f"gnn_{i}": float(embedding[i]) for i in range(len(embedding))}
+    except Exception:
+        return zero_features
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
@@ -629,6 +711,9 @@ def build_feature_vector(
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
     amm_trades: pd.DataFrame | None = None,
+    gnn_encoder=None,
+    benford_metrics: dict | None = None,
+    pair_benford_sketches: dict | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -647,7 +732,7 @@ def build_feature_vector(
         else pd.Timestamp.now(tz="UTC")
     )
 
-    features = {"wallet": wallet}
+    features: dict[str, float | str] = {"wallet": wallet}
     features.update(compute_benford_features(wallet_trades, precomputed_metrics=benford_metrics))
     features.update(compute_trade_pattern_features(wallet, wallet_trades, orderbook_events))
     features.update(compute_volume_timing_features(wallet_trades))
@@ -668,7 +753,7 @@ def build_feature_vector(
     else:
         features.update({f"gnn_{i}": 0.0 for i in range(config.GNN_EMBEDDING_DIM)})
 
-    return features
+    return {k: (0.0 if isinstance(v, float) and pd.isna(v) else v) for k, v in features.items()}
 
 
 def compute_hardening_features(wallet_trades: pd.DataFrame) -> dict:
@@ -731,6 +816,7 @@ def build_feature_matrix(
     funding_graph: nx.DiGraph | None = None,
     all_pairs_df: pd.DataFrame | None = None,
     amm_trades: pd.DataFrame | None = None,
+    gnn_embeddings: dict[str, dict] | None = None,
 ) -> pd.DataFrame:
     """Build a feature matrix with one row per wallet observed in `trades_df`.
 
@@ -749,15 +835,16 @@ def build_feature_matrix(
     rows = []
     for wallet in wallets:
         mask = (trades_df["base_account"] == wallet) | (trades_df["counter_account"] == wallet)
-        rows.append(
-            build_feature_vector(
-                wallet,
-                trades_df[mask],
-                orderbook_events=orderbook_events,
-                funding_graph=funding_graph,
-                all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
-                amm_trades=amm_trades,
-            )
+        row = build_feature_vector(
+            wallet,
+            trades_df[mask],
+            orderbook_events=orderbook_events,
+            funding_graph=funding_graph,
+            all_pairs_df=all_pairs_df if all_pairs_df is not None else trades_df,
+            amm_trades=amm_trades,
         )
+        if gnn_embeddings and wallet in gnn_embeddings:
+            row.update(gnn_embeddings[wallet])
+        rows.append(row)
 
     return pd.DataFrame(rows)

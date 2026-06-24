@@ -42,6 +42,13 @@ def test_train_models_returns_metrics_for_each_model(trained_output):
         assert 0.0 <= result["metrics"]["auc_roc"] <= 1.0
 
 
+def test_train_models_returns_held_out_split(trained_output):
+    output, _ = trained_output
+    assert len(output["X_test"]) == output["n_test"]
+    assert len(output["y_test"]) == output["n_test"]
+    assert "label" not in output["X_test"].columns
+
+
 def test_save_models_and_training_artifacts(tmp_path, trained_output):
     output, _ = trained_output
     results = output["results"]
@@ -58,6 +65,11 @@ def test_save_models_and_training_artifacts(tmp_path, trained_output):
     with open(os.path.join(model_dir, "metrics.json")) as f:
         metrics = json.load(f)
     assert set(MODEL_REGISTRY).issubset(set(metrics))
+
+    with open(os.path.join(model_dir, "model_metadata.json")) as f:
+        meta = json.load(f)
+    expected_hash = compute_feature_schema_hash(output["feature_columns"])
+    assert meta["feature_schema_hash"] == expected_hash
 
 
 # ---------------------------------------------------------------------------
@@ -147,93 +159,6 @@ def test_detect_label_poisoning_aborts_training(tmp_path, monkeypatch):
     mt.main()
 
     # No model artifacts should have been written
-    model_dir = str(tmp_path / "models")
-    for name in MODEL_REGISTRY:
-        assert not os.path.exists(os.path.join(model_dir, f"{name}.joblib"))
-
-    expected_hash = compute_feature_schema_hash(output["feature_columns"])
-    assert meta["feature_schema_hash"] == expected_hash
-
-
-# ---------------------------------------------------------------------------
-# Provenance: SHA-256 of training data
-# ---------------------------------------------------------------------------
-
-
-def test_training_data_sha256_changes_when_row_added():
-    df = generate_synthetic_dataset(n_wallets=20, seed=5)
-    sha1 = sha256_dataframe(df)
-
-    extra = df.iloc[[0]].copy()
-    extra["wallet"] = "GNEW"
-    df2 = pd.concat([df, extra], ignore_index=True)
-    sha2 = sha256_dataframe(df2)
-
-    assert sha1 != sha2
-
-
-# ---------------------------------------------------------------------------
-# Label poisoning detection
-# ---------------------------------------------------------------------------
-
-
-def test_detect_label_poisoning_returns_true_when_ratio_shifts(tmp_path):
-    baseline_path = str(tmp_path / "baseline.json")
-    with open(baseline_path, "w") as f:
-        json.dump({"wash_trade_ratio": 0.10}, f)
-
-    distribution = {0: 70, 1: 30}
-    assert detect_label_poisoning(distribution, baseline_path=baseline_path, threshold=0.15)
-
-
-def test_detect_label_poisoning_returns_false_when_ratio_ok(tmp_path):
-    baseline_path = str(tmp_path / "baseline.json")
-    with open(baseline_path, "w") as f:
-        json.dump({"wash_trade_ratio": 0.20}, f)
-
-    distribution = {0: 82, 1: 18}
-    assert not detect_label_poisoning(distribution, baseline_path=baseline_path, threshold=0.15)
-
-
-def test_detect_label_poisoning_creates_baseline_when_missing(tmp_path):
-    baseline_path = str(tmp_path / "new_baseline.json")
-    assert not os.path.exists(baseline_path)
-
-    distribution = {0: 90, 1: 10}
-    result = detect_label_poisoning(distribution, baseline_path=baseline_path)
-    assert result is False
-    assert os.path.exists(baseline_path)
-
-
-def test_detect_label_poisoning_aborts_training(tmp_path, monkeypatch):
-    """When poisoning is detected, no .pkl / .joblib files should be written."""
-    import detection.model_training as mt
-
-    baseline_path = str(tmp_path / "baseline.json")
-    with open(baseline_path, "w") as f:
-        json.dump({"wash_trade_ratio": 0.05}, f)
-
-    monkeypatch.setattr(mt, "LABEL_DISTRIBUTION_BASELINE_PATH", baseline_path)
-    monkeypatch.setattr(mt.config, "POISON_LABEL_RATIO_THRESHOLD", 0.05)
-    monkeypatch.setattr(mt.config, "MODEL_DIR", str(tmp_path / "models"))
-    monkeypatch.setattr(mt.config, "MODEL_SIGNING_PRIVATE_KEY_PATH", "")
-
-    df = generate_synthetic_dataset(n_wallets=40, seed=7)
-    df["label"] = [1 if i % 5 != 0 else 0 for i in range(len(df))]
-
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp_file:
-        df.to_parquet(tmp_file.name)
-        tmp_file_path = tmp_file.name
-
-    monkeypatch.setattr(
-        "sys.argv",
-        ["model_training", "--data-path", tmp_file_path, "--model-dir", str(tmp_path / "models")],
-    )
-
-    mt.main()
-
     model_dir = str(tmp_path / "models")
     for name in MODEL_REGISTRY:
         assert not os.path.exists(os.path.join(model_dir, f"{name}.joblib"))

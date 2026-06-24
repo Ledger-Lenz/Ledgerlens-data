@@ -9,15 +9,12 @@ computed with ``detection.feature_engineering.build_feature_matrix``.
 from __future__ import annotations
 
 import abc
-import json
 import math
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from config import config
 
 RANDOM_SEED = 42
 
@@ -80,7 +77,7 @@ class BaseAttackerProfile(abc.ABC):
         asset_fn=_default_asset_fn,
     ) -> list[dict]:
         rows = []
-        rng = self._rng()
+        self._rng()
         for wi in wallet_indices:
             wallet = _make_wallet(wi)
             cp = counterparty_fn(wi)
@@ -120,7 +117,7 @@ class NaiveAttacker(BaseAttackerProfile):
     interval_seconds: int = 60
 
     def generate_trades(self) -> pd.DataFrame:
-        rng = self._rng()
+        self._rng()
         base_time = pd.Timestamp("2024-01-01", tz="UTC")
         rows = self._make_trade_rows(
             wallet_indices=list(range(self.n_wallets)),
@@ -287,9 +284,7 @@ class LayeringAttacker(BaseAttackerProfile):
                 trade_idx += 1
 
                 for _ in range(self.wash_to_noise_ratio):
-                    noise_cp = _make_wallet(
-                        rng.integers(0, self.n_wallets * 10)
-                    )
+                    noise_cp = _make_wallet(rng.integers(0, self.n_wallets * 10))
                     noise_time = base_time + pd.Timedelta(minutes=trade_idx)
                     rows.append(
                         {
@@ -389,13 +384,13 @@ class AdaptiveAttacker(BaseAttackerProfile):
             if hasattr(model, "feature_importances_") and hasattr(model, "feature_names_in_"):
                 names = model.feature_names_in_
                 importances = model.feature_importances_
-                return dict(zip(names, importances))
+                return dict(zip(names, importances, strict=False))
             if isinstance(model, dict):
                 for _name, est in model.items():
                     if hasattr(est, "feature_importances_"):
                         names = est.feature_names_in_
                         importances = est.feature_importances_
-                        return dict(zip(names, importances))
+                        return dict(zip(names, importances, strict=False))
         except Exception:
             return {}
         return {}
@@ -407,7 +402,7 @@ class AdaptiveAttacker(BaseAttackerProfile):
         rows = []
 
         top_features = (
-            sorted(importances, key=importances.get, reverse=True)[: self.top_k]
+            sorted(importances, key=lambda k: importances[k], reverse=True)[: self.top_k]
             if importances
             else []
         )
@@ -427,7 +422,7 @@ class AdaptiveAttacker(BaseAttackerProfile):
                 elif uses_concentration:
                     amount = float(rng.uniform(amount * 0.5, amount * 1.5))
 
-                interval = self.interval_seconds
+                interval: float = float(self.interval_seconds)
                 if uses_timing:
                     interval = float(rng.uniform(interval * 0.5, interval * 2.0))
 
@@ -504,10 +499,8 @@ def trades_to_feature_matrix(trades: pd.DataFrame) -> pd.DataFrame:
     if has_is_wash and not df.empty:
         labels = {}
         for wallet in df["wallet"]:
-            mask = (trades["base_account"] == wallet) & (trades.get("is_wash", pd.Series([True])))
-            is_wash_trades = trades.loc[
-                trades["base_account"] == wallet, "is_wash"
-            ]
+            (trades["base_account"] == wallet) & (trades.get("is_wash", pd.Series([True])))
+            is_wash_trades = trades.loc[trades["base_account"] == wallet, "is_wash"]
             labels[wallet] = int(is_wash_trades.any()) if len(is_wash_trades) > 0 else 1
         df["label"] = df["wallet"].map(labels)
     else:

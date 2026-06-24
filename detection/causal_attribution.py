@@ -32,10 +32,12 @@ def _jsonable(value):
 
 
 def _other_party(trade_row: pd.Series, wallet: str) -> str | None:
-    if trade_row.get("base_account") == wallet:
-        return trade_row.get("counter_account")
-    if trade_row.get("counter_account") == wallet:
-        return trade_row.get("base_account")
+    base_account = trade_row.get("base_account")
+    counter_account = trade_row.get("counter_account")
+    if base_account == wallet:
+        return str(counter_account) if counter_account is not None else None
+    if counter_account == wallet:
+        return str(base_account) if base_account is not None else None
     return None
 
 

@@ -50,9 +50,11 @@ def generate_masks(
 
 def mask_delta(delta: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Return delta + mask (masked weight update sent to coordinator)."""
-    return delta + mask
+    result: np.ndarray = delta + mask
+    return result
 
 
 def secure_sum(masked_deltas: list[np.ndarray]) -> np.ndarray:
     """Sum masked deltas; masks cancel so result == sum of true deltas."""
-    return np.sum(masked_deltas, axis=0)
+    result: np.ndarray = np.sum(masked_deltas, axis=0)
+    return result

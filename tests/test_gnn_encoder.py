@@ -16,9 +16,7 @@ installed (CI environments without GPU/torch can still run all other tests).
 
 from __future__ import annotations
 
-import json
 import os
-import re
 
 import networkx as nx
 import numpy as np
@@ -121,7 +119,7 @@ class TestBuildCoTradeGraph:
 
     def test_no_edge_outside_window(self):
         """Trades farther apart than the window must NOT get an edge."""
-        df = _sample_trades_df()
+        _sample_trades_df()
         # Trade 1 (T=0) and Trade 2 (T=5min) are on USDC/XLM.
         # Trade 3 (T=2h) is on AQUA/XLM with different wallets.
         # With a 1-second window, only trades at exactly the same second can link.
@@ -163,7 +161,7 @@ class TestBuildCoTradeGraph:
         """Co-trade edges must carry edge_type, weight, and timestamp."""
         df = _sample_trades_df()
         g = build_co_trade_graph(df, window_hours=24)
-        for u, v, data in g.edges(data=True):
+        for _u, _v, data in g.edges(data=True):
             assert data["edge_type"] == "co_trade"
             assert data["weight"] >= 1
             assert "timestamp" in data
@@ -295,14 +293,14 @@ class TestGNNEncoderEncode:
 class TestGNNEncoderUpdateNode:
     def test_update_node_close_to_full_encode(self):
         """update_node result must be within cosine distance 0.05 of full re-encode."""
-        import torch
+
         from detection.gnn_encoder import GNNEncoder
 
         enc = GNNEncoder(embedding_dim=_GNN_DIM, random_state=7)
         g = _small_graph()
 
         # Full encode of W_B before new edge
-        full_before = enc.encode(g, W_B)
+        enc.encode(g, W_B)
 
         # Simulate adding one new co-trade edge B→C
         new_edge = (W_B, W_C)

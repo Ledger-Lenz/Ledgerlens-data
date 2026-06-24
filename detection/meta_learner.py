@@ -1,19 +1,16 @@
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional
-import joblib
-import os
-from config import config
+
 
 class LeafEmbeddingExtractor:
     """Extracts leaf indices from a trained ensemble of models."""
-    def __init__(self, models: Dict):
+
+    def __init__(self, models: dict):
         self.models = models
-        self.feature_columns = None
+        self.feature_columns: list[str] | None = None
 
     def fit(self, X: pd.DataFrame):
         """Identify feature columns used by the models."""
@@ -47,19 +44,24 @@ class LeafEmbeddingExtractor:
 
         return np.concatenate(all_leaves, axis=1)
 
+
 class MAMLAdapter(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x):
         return self.head(x)
 
-    def adapt(self, support_x: torch.Tensor, support_y: torch.Tensor, n_inner_steps: int = 10, lr: float = 0.01):
+    def adapt(
+        self,
+        support_x: torch.Tensor,
+        support_y: torch.Tensor,
+        n_inner_steps: int = 10,
+        lr: float = 0.01,
+    ):
         """Fine-tune the head on a new task's support set using SGD."""
         # Create a copy of the head to adapt
         # For a simple implementation, we can just use the current parameters
@@ -80,14 +82,15 @@ class MAMLAdapter(nn.Module):
             probs = torch.sigmoid(logits)
         return probs.numpy()
 
+
 class PrototypicalClassifier:
     def __init__(self):
-        self.prototypes = {} # {label: prototype_vector}
+        self.prototypes = {}  # {label: prototype_vector}
 
     def fit_prototype(self, support_embeddings: np.ndarray, labels: np.ndarray):
         unique_labels = np.unique(labels)
         for label in unique_labels:
-            mask = (labels == label)
+            mask = labels == label
             self.prototypes[label] = support_embeddings[mask].mean(axis=0)
 
     def predict_proba(self, X_embeddings: np.ndarray) -> np.ndarray:
@@ -116,6 +119,6 @@ class PrototypicalClassifier:
         max_neg_dist = np.maximum(-dist0_sq, -dist1_sq)
         exp0 = np.exp(-dist0_sq - max_neg_dist)
         exp1 = np.exp(-dist1_sq - max_neg_dist)
-        probs = exp1 / (exp0 + exp1)
+        probs: np.ndarray = exp1 / (exp0 + exp1)
 
         return probs

@@ -72,7 +72,8 @@ def _row_normalise(adj: np.ndarray) -> np.ndarray:
     """Row-normalise a dense or sparse matrix; rows with zero sum stay zero."""
     row_sums = adj.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1  # avoid division by zero for sink nodes
-    return adj / row_sums
+    result: np.ndarray = adj / row_sums
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +272,7 @@ def propagation_attribution(
     if not seeds_in_graph:
         return []
 
-    contributions = []
+    contributions: list[dict[str, float | str]] = []
     total_contribution = 0.0
 
     for source, score in seeds_in_graph.items():
@@ -294,7 +295,7 @@ def propagation_attribution(
         return []
 
     for c in contributions:
-        c["fraction"] = round(c["contribution"] / total_contribution, 4)
+        c["fraction"] = round(float(c["contribution"]) / total_contribution, 4)
 
-    contributions.sort(key=lambda x: x["contribution"], reverse=True)
+    contributions.sort(key=lambda x: float(x["contribution"]), reverse=True)
     return contributions[:top_n]

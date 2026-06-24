@@ -21,8 +21,8 @@ import torch
 from config import config
 from detection.dann_encoder import train_dann_encoder
 from detection.meta_learner import LeafEmbeddingExtractor
-from detection.privacy.metrics import record_dp_metrics
 from detection.privacy.meta_learner_dp import train_meta_learner_dp
+from detection.privacy.metrics import record_dp_metrics
 from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 from utils.logging import get_logger
 

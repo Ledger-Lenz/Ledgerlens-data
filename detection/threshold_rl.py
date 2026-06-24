@@ -38,9 +38,9 @@ THRESHOLDS: list[int] = list(range(50, 100, 5))
 _N_ARMS: int = len(THRESHOLDS)  # 10
 
 _DEFAULT_STATE_PATH: str = "data/threshold_agent.json"
-_ALPHA: float = 0.1   # learning rate
-_GAMMA: float = 0.0   # no discounting for stationary bandit
-_UCB_C: float = 1.0   # UCB exploration constant
+_ALPHA: float = 0.1  # learning rate
+_GAMMA: float = 0.0  # no discounting for stationary bandit
+_UCB_C: float = 1.0  # UCB exploration constant
 
 
 def compute_f1(tp: int, fp: int, fn: int) -> float:
@@ -147,7 +147,7 @@ class ThresholdAgent:
         os.replace(tmp, self._state_path)
 
     @classmethod
-    def load(cls, state_path: str = _DEFAULT_STATE_PATH) -> "ThresholdAgent":
+    def load(cls, state_path: str = _DEFAULT_STATE_PATH) -> ThresholdAgent:
         """Load agent from ``state_path``, or create a fresh one if absent."""
         if os.path.exists(state_path):
             with open(state_path) as f:
@@ -165,11 +165,11 @@ class ThresholdAgent:
 
     @property
     def q_values(self) -> list[float]:
-        return self._q.tolist()
+        return [float(v) for v in self._q.tolist()]
 
     @property
     def counts(self) -> list[int]:
-        return self._counts.tolist()
+        return [int(v) for v in self._counts.tolist()]
 
 
 def _get_pinned() -> int | None:

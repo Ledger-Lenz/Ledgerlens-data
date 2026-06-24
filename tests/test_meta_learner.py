@@ -1,14 +1,15 @@
+import time
 
-import pytest
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
-import time
-from detection.meta_learner import MAMLAdapter, PrototypicalClassifier, LeafEmbeddingExtractor
+from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
+
+from detection.meta_learner import LeafEmbeddingExtractor, MAMLAdapter, PrototypicalClassifier
+
 
 def test_maml_convergence_trivial():
     """Trivial meta-task (2-cluster Gaussian) converges in 5 inner steps."""
@@ -24,7 +25,7 @@ def test_maml_convergence_trivial():
         X0 = np.random.randn(5, input_dim) - offset
         X1 = np.random.randn(5, input_dim) + offset
         X = np.concatenate([X0, X1], axis=0)
-        y = np.array([0]*5 + [1]*5)
+        y = np.array([0] * 5 + [1] * 5)
         return torch.from_numpy(X).float(), torch.from_numpy(y).float()
 
     # Pre-adaptation performance
@@ -45,7 +46,8 @@ def test_maml_convergence_trivial():
 
     print(f"Loss before: {loss_before:.4f}, Loss after: {loss_after:.4f}")
     assert loss_after < loss_before
-    assert duration < 30.0 # Adaptation completes in < 30 seconds
+    assert duration < 30.0  # Adaptation completes in < 30 seconds
+
 
 def test_leaf_extraction_all_models():
     """Leaf-index embedding extraction works for RF, XGBoost, and LightGBM."""
@@ -64,6 +66,7 @@ def test_leaf_extraction_all_models():
     assert embeddings.shape[0] == 20
     assert embeddings.shape[1] > 0
 
+
 def test_prototypical_separation():
     """PrototypicalClassifier achieves non-trivial separation (AUC > 0.65) with 5 support examples."""
     from sklearn.metrics import roc_auc_score
@@ -71,20 +74,18 @@ def test_prototypical_separation():
     proto = PrototypicalClassifier()
 
     # Generate 5 support examples per class
-    support_emb = np.concatenate([
-        np.random.randn(5, 10) - 2.0, # Class 0
-        np.random.randn(5, 10) + 2.0  # Class 1
-    ], axis=0)
-    support_y = np.array([0]*5 + [1]*5)
+    support_emb = np.concatenate(
+        [np.random.randn(5, 10) - 2.0, np.random.randn(5, 10) + 2.0], axis=0  # Class 0  # Class 1
+    )
+    support_y = np.array([0] * 5 + [1] * 5)
 
     proto.fit_prototype(support_emb, support_y)
 
     # Generate query set
-    query_emb = np.concatenate([
-        np.random.randn(50, 10) - 2.0,
-        np.random.randn(50, 10) + 2.0
-    ], axis=0)
-    query_y = np.array([0]*50 + [1]*50)
+    query_emb = np.concatenate(
+        [np.random.randn(50, 10) - 2.0, np.random.randn(50, 10) + 2.0], axis=0
+    )
+    query_y = np.array([0] * 50 + [1] * 50)
 
     probs = proto.predict_proba(query_emb)
     auc = roc_auc_score(query_y, probs)

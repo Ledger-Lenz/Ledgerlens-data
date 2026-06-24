@@ -70,13 +70,13 @@ def apply_labelling_rules(
         n_cp = sum(1 for w in n_counterparties if w != wallet)
 
         if rt_flag and gr_flag:
-            label = 1
+            label: float = 1.0
             signal = "roundtrip_and_graph"
         elif rt_flag and not gr_flag:
-            label = np.nan
+            label = float("nan")
             signal = "roundtrip_only"
         elif gr_flag and not rt_flag:
-            label = np.nan
+            label = float("nan")
             signal = "graph_only"
         elif (
             not rt_flag
@@ -84,10 +84,10 @@ def apply_labelling_rules(
             and n_trades > MIN_TRADES_FOR_NEGATIVE
             and n_cp > MIN_COUNTERPARTIES_FOR_NEGATIVE
         ):
-            label = 0
+            label = 0.0
             signal = "clean"
         else:
-            label = np.nan
+            label = float("nan")
             signal = "insufficient_data"
 
         rows.append({"wallet": wallet, "label": label, "labelling_signal": signal})

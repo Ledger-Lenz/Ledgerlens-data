@@ -12,6 +12,7 @@ returning wallet IDs (``wallet`` column values).
 from __future__ import annotations
 
 import abc
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ def _feature_cols(df: pd.DataFrame) -> list[str]:
 
 def _proba(model, X: pd.DataFrame) -> np.ndarray:
     """Return (n_samples, 2) probability array."""
-    return model.predict_proba(X)
+    return cast(np.ndarray, model.predict_proba(X))
 
 
 class BaseQueryStrategy(abc.ABC):
@@ -49,7 +50,7 @@ class LeastConfidence(BaseQueryStrategy):
         probs = _proba(model, X)
         scores = probs.max(axis=1)  # lower = more uncertain
         idx = np.argsort(scores)[: min(n_query, len(pool))]
-        return pool.iloc[idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[idx]["wallet"].tolist())
 
 
 class MarginSampling(BaseQueryStrategy):
@@ -63,7 +64,7 @@ class MarginSampling(BaseQueryStrategy):
         sorted_probs = np.sort(probs, axis=1)
         margins = sorted_probs[:, -1] - sorted_probs[:, -2]
         idx = np.argsort(margins)[: min(n_query, len(pool))]
-        return pool.iloc[idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[idx]["wallet"].tolist())
 
 
 class Entropy(BaseQueryStrategy):
@@ -78,7 +79,7 @@ class Entropy(BaseQueryStrategy):
         probs = np.clip(probs, 1e-10, 1.0)
         entropy = -np.sum(probs * np.log2(probs), axis=1)
         idx = np.argsort(-entropy)[: min(n_query, len(pool))]
-        return pool.iloc[idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[idx]["wallet"].tolist())
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +123,15 @@ class CoreSet(BaseQueryStrategy):
             remaining = np.minimum(remaining, dist_to_chosen)
             remaining[chosen] = -np.inf  # don't re-select
 
-        return pool.iloc[selected_idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[selected_idx]["wallet"].tolist())
 
 
 def _min_dist_to_set(points: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """For each point, return the distance to its nearest reference point."""
     diffs = points[:, np.newaxis, :] - reference[np.newaxis, :, :]  # (N, M, D)
     dists = np.sqrt((diffs**2).sum(axis=2))  # (N, M)
-    return dists.min(axis=1)  # (N,)
+    result: np.ndarray = dists.min(axis=1)  # (N,)
+    return result
 
 
 class BADGE(BaseQueryStrategy):
@@ -154,7 +156,7 @@ class BADGE(BaseQueryStrategy):
         embeddings = X * uncertainty[:, np.newaxis]
 
         selected_idx = _kmeans_pp_indices(embeddings, min(n_query, len(pool)))
-        return pool.iloc[selected_idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[selected_idx]["wallet"].tolist())
 
 
 def _kmeans_pp_indices(X: np.ndarray, k: int) -> list[int]:
@@ -201,7 +203,7 @@ class CommitteeDisagreement(BaseQueryStrategy):
         # variance across committee members per sample
         disagreement = all_probs.var(axis=1)
         idx = np.argsort(-disagreement)[: min(n_query, len(pool))]
-        return pool.iloc[idx]["wallet"].tolist()
+        return cast(list[str], pool.iloc[idx]["wallet"].tolist())
 
 
 # ---------------------------------------------------------------------------

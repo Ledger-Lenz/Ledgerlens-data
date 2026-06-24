@@ -1,7 +1,5 @@
 """Property-based tests for scripts.generate_synthetic_dataset using Hypothesis."""
 
-import numpy as np
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -54,6 +52,7 @@ wash_offset_st = st.floats(min_value=-5.0, max_value=5.0, allow_nan=False, allow
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+
 def _make(n_wallets=10, seed=42, wash_noise=1.0, wash_offset=0.0):
     return _generate_feature_level(
         n_wallets=n_wallets, seed=seed, wash_noise=wash_noise, wash_offset=wash_offset
@@ -61,6 +60,7 @@ def _make(n_wallets=10, seed=42, wash_noise=1.0, wash_offset=0.0):
 
 
 # ── property tests ────────────────────────────────────────────────────────────
+
 
 @given(n_wallets=n_wallets_st, seed=seed_st)
 @settings(max_examples=50)

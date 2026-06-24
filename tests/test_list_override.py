@@ -1,7 +1,7 @@
 import json
-import os
 import time
 from unittest.mock import MagicMock, patch
+
 import pandas as pd
 import pytest
 
@@ -88,7 +88,9 @@ def test_streaming_scorer_override_integration(temp_lists):
     scorer = StreamingScorer.__new__(StreamingScorer)
     scorer.min_trades = 20
     scorer._risk_scorer = RiskScorer.__new__(RiskScorer)
-    scorer._risk_scorer.list_override = ListOverride(allowlist_path=str(allowpath), denylist_path=str(denypath))
+    scorer._risk_scorer.list_override = ListOverride(
+        allowlist_path=str(allowpath), denylist_path=str(denypath)
+    )
 
     # A wallet with 0 trades in the buffer should still score if overridden
     buf = FeatureBuffer()
@@ -111,16 +113,19 @@ def test_score_wallet_cli_bypasses_ingest(mock_scorer_cls, mock_load_trades, tem
 
     # Set up mock RiskScorer
     mock_scorer = MagicMock()
-    mock_scorer.list_override = ListOverride(allowlist_path=str(allowpath), denylist_path=str(denypath))
+    mock_scorer.list_override = ListOverride(
+        allowlist_path=str(allowpath), denylist_path=str(denypath)
+    )
     mock_scorer_cls.return_value = mock_scorer
 
-    # Allowlisted wallet
-    test_wallet = "GALLOW12356789012356789012356789012356789012356789012"  # Must look like Stellar public key
+    # Allowlisted wallet (56-char Stellar public key)
+    test_wallet = "GALLOW" + "1" * 50
     allowpath.write_text(json.dumps([test_wallet]))
     mock_scorer.list_override._reload()
 
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         from scripts.score_wallet import main as cli_main
+
         cli_main()
 
     # Verify load_trades was NOT called

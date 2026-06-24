@@ -106,9 +106,7 @@ class FeatureBuffer:
         with lock:
             records = list(self._buffers[wallet])
             # Prepare pre-computed Benford metrics
-            benford_metrics = {
-                h: s.to_metrics() for h, s in self._benford_sketches[wallet].items()
-            }
+            benford_metrics = {h: s.to_metrics() for h, s in self._benford_sketches[wallet].items()}
             # Prepare per-pair sketches for cross-asset features.
             # Shallow copy to avoid RuntimeError if new pairs are added during iteration.
             pair_benford_sketches = dict(self._pair_benford_sketches[wallet])
@@ -124,7 +122,7 @@ class FeatureBuffer:
             benford_metrics=benford_metrics,
             pair_benford_sketches=pair_benford_sketches,
         )
-        return pd.Series(features)
+        return pd.Series(features).fillna(0.0)
 
     def wallet_trade_count(self, wallet: str) -> int:
         """Return the number of trades currently buffered for *wallet*."""

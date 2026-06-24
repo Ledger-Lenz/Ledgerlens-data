@@ -11,8 +11,7 @@ and the worker (``streaming/kafka_worker.py``) in lock-step on field names,
 types, and the canonical ``asset_pair`` string format.
 """
 
-from __future__ import annotations
-
+from typing import Any, cast
 import io
 import json
 import time
@@ -31,7 +30,7 @@ def load_schema(schema_path: str | None = None) -> dict:
     path = schema_path or config.TRADE_AVRO_SCHEMA_PATH
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
-    return fastavro.parse_schema(raw)
+    return cast(dict[Any, Any], fastavro.parse_schema(raw))
 
 
 def trade_to_record(trade: Trade) -> dict:
@@ -96,12 +95,12 @@ def serialize(record: dict, schema: dict) -> bytes:
     fastavro.validation.validate(record, schema, raise_errors=True)
     buffer = io.BytesIO()
     fastavro.schemaless_writer(buffer, schema, record)
-    return buffer.getvalue()
+    return cast(bytes, buffer.getvalue())
 
 
 def deserialize(value: bytes, schema: dict) -> dict:
     """Decode schemaless Avro binary *value* back into a record dict."""
-    return fastavro.schemaless_reader(io.BytesIO(value), schema)
+    return cast(dict[Any, Any], fastavro.schemaless_reader(io.BytesIO(value), schema))
 
 
 def validate(record: dict, schema: dict) -> None:

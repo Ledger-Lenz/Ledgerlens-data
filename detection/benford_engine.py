@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+
 @dataclass
 class BenfordMetrics:
     """Standardized Benford anomaly metrics."""

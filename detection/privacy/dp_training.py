@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 import torch.nn as nn
@@ -19,7 +19,7 @@ try:
 
     _OPACUS_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    PrivacyEngine = None  # type: ignore[assignment,misc]
+    PrivacyEngine = None
     _OPACUS_AVAILABLE = False
 
 
@@ -44,7 +44,7 @@ def opacus_available() -> bool:
 def unwrap_private_model(model: nn.Module) -> nn.Module:
     """Return the inner module when Opacus wraps it for DP-SGD."""
     inner = getattr(model, "_module", None)
-    if inner is not None:
+    if isinstance(inner, nn.Module):
         return inner
     return model
 

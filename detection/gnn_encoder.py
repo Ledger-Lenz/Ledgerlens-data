@@ -36,8 +36,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
-from typing import Optional
 
 import networkx as nx
 import numpy as np
@@ -51,7 +49,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Optional torch / torch_geometric imports — graceful absence supported
 # ---------------------------------------------------------------------------
-try:
+if TYPE_CHECKING:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -59,13 +57,22 @@ try:
     from torch_geometric.nn import SAGEConv
 
     _TORCH_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _TORCH_AVAILABLE = False
-    torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    F = None  # type: ignore[assignment]
-    Data = None  # type: ignore[assignment]
-    SAGEConv = None  # type: ignore[assignment]
+else:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch_geometric.data import Data
+        from torch_geometric.nn import SAGEConv
+
+        _TORCH_AVAILABLE = True
+    except ImportError:  # pragma: no cover
+        _TORCH_AVAILABLE = False
+        torch = None
+        nn = None
+        F = None
+        Data = None
+        SAGEConv = None
 
 # ---------------------------------------------------------------------------
 # Node feature dimensionality
@@ -93,7 +100,7 @@ if _TORCH_AVAILABLE:
             self.conv1 = SAGEConv(in_channels, hidden_channels, aggr="mean")
             self.conv2 = SAGEConv(hidden_channels, out_channels, aggr="mean")
 
-        def forward(self, x: "torch.Tensor", edge_index: "torch.Tensor") -> "torch.Tensor":
+        def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
             x = self.conv1(x, edge_index)
             x = F.relu(x)
             x = self.conv2(x, edge_index)
@@ -112,7 +119,7 @@ def _nx_to_pyg(
     graph: nx.DiGraph,
     node_order: list[str],
     wallet_metadata: dict[str, dict] | None = None,
-) -> "Data":
+) -> Data:
     """Convert *graph* (nx.DiGraph) to a ``torch_geometric.data.Data`` object.
 
     Parameters
@@ -187,7 +194,9 @@ class GNNEncoder:
         model_dir: str | None = None,
         random_state: int = 42,
     ) -> None:
-        self.embedding_dim = embedding_dim if embedding_dim is not None else config.GNN_EMBEDDING_DIM
+        self.embedding_dim = (
+            embedding_dim if embedding_dim is not None else config.GNN_EMBEDDING_DIM
+        )
         self.hidden_dim = hidden_dim if hidden_dim is not None else config.GNN_HIDDEN_DIM
         self.model_dir = model_dir or config.MODEL_DIR
         self.random_state = random_state
@@ -195,7 +204,7 @@ class GNNEncoder:
         # Cached full-graph embedding: wallet → np.ndarray
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._last_node_order: list[str] = []
-        self._model: Optional["_GraphSAGEModel"] = None  # type: ignore[name-defined]
+        self._model: _GraphSAGEModel | None = None  # type: ignore[name-defined]
 
         if _TORCH_AVAILABLE:
             torch.manual_seed(random_state)
@@ -286,9 +295,7 @@ class GNNEncoder:
         entry = metrics.get("gnn_encoder", {})
         expected_sha = entry.get("artifact_sha256")
         if not expected_sha:
-            raise ModelIntegrityError(
-                "No gnn_encoder.artifact_sha256 entry found in metrics.json"
-            )
+            raise ModelIntegrityError("No gnn_encoder.artifact_sha256 entry found in metrics.json")
 
         actual_sha = self._sha256_file(artifact_path)
         if actual_sha != expected_sha:
@@ -317,7 +324,7 @@ class GNNEncoder:
 
         data = _nx_to_pyg(graph, node_order, wallet_metadata)
         with torch.no_grad():
-            out: "torch.Tensor" = self._model(data.x, data.edge_index)
+            out: torch.Tensor = self._model(data.x, data.edge_index)
         return out.cpu().numpy().astype(np.float32)
 
     def encode(
@@ -430,7 +437,7 @@ class GNNEncoder:
         if wallet not in node_idx:
             return np.zeros(self.embedding_dim, dtype=np.float32)
 
-        result = embeddings[node_idx[wallet]].copy()
+        result: np.ndarray = embeddings[node_idx[wallet]].copy()
 
         # Update the cache for all re-computed nodes
         for i, w in enumerate(node_order):
@@ -507,9 +514,9 @@ def pretrain_gnn_contrastive(
     loss_curve: list[float] = []
     all_indices = list(range(len(node_order)))
 
-    for epoch in range(n_epochs):
+    for _epoch in range(n_epochs):
         optimizer.zero_grad()
-        embeddings: "torch.Tensor" = encoder._model(data.x, data.edge_index)
+        embeddings: torch.Tensor = encoder._model(data.x, data.edge_index)
 
         # Positive loss: cosine similarity → 1
         pos_loss = torch.tensor(0.0, requires_grad=True)

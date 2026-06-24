@@ -1,4 +1,5 @@
 """Integration tests for detection.batch_scorer."""
+
 import time
 from unittest.mock import patch
 

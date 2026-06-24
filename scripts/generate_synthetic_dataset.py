@@ -48,7 +48,9 @@ def generate_synthetic_dataset(
     computes features with ``build_feature_matrix``.
     """
     if profile == "NaiveAttacker":
-        return _generate_feature_level(n_wallets=n_wallets, seed=seed, wash_offset=wash_offset, wash_noise=wash_noise)
+        return _generate_feature_level(
+            n_wallets=n_wallets, seed=seed, wash_offset=wash_offset, wash_noise=wash_noise
+        )
     return _generate_from_simulator(
         profile=profile,
         n_wallets=n_wallets,
@@ -57,7 +59,9 @@ def generate_synthetic_dataset(
     )
 
 
-def _generate_feature_level(n_wallets: int, seed: int, wash_offset: float = 0.0, wash_noise: float = 1.0) -> pd.DataFrame:
+def _generate_feature_level(
+    n_wallets: int, seed: int, wash_offset: float = 0.0, wash_noise: float = 1.0
+) -> pd.DataFrame:
     """Original feature-level generation (backward-compatible path)."""
     rng = np.random.default_rng(seed)
     n_legit = n_wallets // 2
@@ -65,13 +69,19 @@ def _generate_feature_level(n_wallets: int, seed: int, wash_offset: float = 0.0,
     rows = []
     for i in range(n_wallets):
         is_wash = i >= n_legit
-        row = {"wallet": f"GSYNTH{i:06d}"}
+        row: dict[str, object] = {"wallet": f"GSYNTH{i:06d}"}
 
         for hours in config.BENFORD_WINDOWS_HOURS:
             if is_wash:
-                row[f"benford_chi_square_{hours}h"] = rng.uniform(20, 100) * wash_noise + wash_offset
-                row[f"benford_mad_{hours}h"] = rng.uniform(0.02, 0.08) * wash_noise + (wash_offset / 1000)
-                row[f"benford_z_max_{hours}h"] = rng.uniform(3, 10) * wash_noise + (wash_offset / 10)
+                row[f"benford_chi_square_{hours}h"] = (
+                    rng.uniform(20, 100) * wash_noise + wash_offset
+                )
+                row[f"benford_mad_{hours}h"] = rng.uniform(0.02, 0.08) * wash_noise + (
+                    wash_offset / 1000
+                )
+                row[f"benford_z_max_{hours}h"] = rng.uniform(3, 10) * wash_noise + (
+                    wash_offset / 10
+                )
             else:
                 row[f"benford_chi_square_{hours}h"] = rng.uniform(0, 10)
                 row[f"benford_mad_{hours}h"] = rng.uniform(0.0, 0.014)
@@ -79,8 +89,12 @@ def _generate_feature_level(n_wallets: int, seed: int, wash_offset: float = 0.0,
 
         for hours in config.BENFORD_WINDOWS_HOURS:
             if is_wash:
-                row[f"benford_residual_chi_square_{hours}h"] = rng.uniform(15, 80) * wash_noise + wash_offset
-                row[f"benford_residual_mad_{hours}h"] = rng.uniform(0.018, 0.07) * wash_noise + (wash_offset / 1000)
+                row[f"benford_residual_chi_square_{hours}h"] = (
+                    rng.uniform(15, 80) * wash_noise + wash_offset
+                )
+                row[f"benford_residual_mad_{hours}h"] = rng.uniform(0.018, 0.07) * wash_noise + (
+                    wash_offset / 1000
+                )
             else:
                 row[f"benford_residual_chi_square_{hours}h"] = rng.uniform(0, 8)
                 row[f"benford_residual_mad_{hours}h"] = rng.uniform(0.0, 0.012)
@@ -130,6 +144,9 @@ def _generate_feature_level(n_wallets: int, seed: int, wash_offset: float = 0.0,
             row["entropy_of_amounts"] = rng.uniform(3.0, 6.0)
             row["cross_wallet_volume_corr"] = rng.uniform(-0.3, 0.3)
 
+        for gnn_idx in range(config.GNN_EMBEDDING_DIM):
+            row[f"gnn_{gnn_idx}"] = 0.0
+
         row["label"] = int(is_wash)
         rows.append(row)
 
@@ -146,10 +163,12 @@ def _generate_from_simulator(
     """Generate a feature matrix via the Wash Trade Simulation Engine."""
     from scripts.wash_trade_simulator import (
         AdaptiveAttacker,
+        BaseAttackerProfile,
         create_profile,
         trades_to_feature_matrix,
     )
 
+    attacker: BaseAttackerProfile
     if profile == "AdaptiveAttacker" and model_path:
         attacker = AdaptiveAttacker(
             n_wallets=n_wallets,
@@ -249,11 +268,8 @@ def parse_args() -> argparse.Namespace:
         help="Run N rounds of adversarial training loop (0 = skip). "
         "Requires --profile AdaptiveAttacker.",
     )
-    parser.add_argument("--model-path", default=None, help="Path to trained model for AdaptiveAttacker")
     parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress the label-distribution summary printed to stderr after generation",
+        "--model-path", default=None, help="Path to trained model for AdaptiveAttacker"
     )
     return parser.parse_args()
 

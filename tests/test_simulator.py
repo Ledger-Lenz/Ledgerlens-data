@@ -15,15 +15,12 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.ensemble import RandomForestClassifier
 
-from detection.benford_engine import chi_square_statistic, mad_score
-from detection.feature_engineering import build_feature_matrix
-from detection.model_training import FEATURE_COLUMNS_EXCLUDE, split_features_labels, train_models
+from detection.benford_engine import chi_square_statistic
+from detection.model_training import train_models
 from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 from scripts.wash_trade_simulator import (
     RANDOM_SEED,
-    TRADE_COLUMNS,
     AdaptiveAttacker,
     AmountConformanceAttacker,
     CrossPairAttacker,
@@ -44,15 +41,17 @@ def _check_schema(df: pd.DataFrame) -> None:
     """Verify the DataFrame matches the expected schema."""
     expected_cols = {"trade_id", "ledger_close_time", "base_account", "counter_account", "amount"}
     assert not df.empty, "DataFrame must not be empty"
-    assert expected_cols.issubset(df.columns), (
-        f"Missing columns. Expected at least {expected_cols}, got {set(df.columns)}"
-    )
-    assert df["amount"].dtype in (np.float64, np.float32, float), (
-        f"amount column must be float, got {df['amount'].dtype}"
-    )
-    assert pd.api.types.is_datetime64_any_dtype(df["ledger_close_time"]), (
-        "ledger_close_time must be datetime"
-    )
+    assert expected_cols.issubset(
+        df.columns
+    ), f"Missing columns. Expected at least {expected_cols}, got {set(df.columns)}"
+    assert df["amount"].dtype in (
+        np.float64,
+        np.float32,
+        float,
+    ), f"amount column must be float, got {df['amount'].dtype}"
+    assert pd.api.types.is_datetime64_any_dtype(
+        df["ledger_close_time"]
+    ), "ledger_close_time must be datetime"
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +105,7 @@ def test_naive_attacker_fixed_amounts():
 def test_amount_conformance_benford():
     """AmountConformanceAttacker produces amounts with Benford chi-square < 5.0
     on a 1000-trade sample."""
-    profile = AmountConformanceAttacker(
-        n_wallets=10, trades_per_wallet=100, seed=RANDOM_SEED
-    )
+    profile = AmountConformanceAttacker(n_wallets=10, trades_per_wallet=100, seed=RANDOM_SEED)
     df = profile.generate_trades()
 
     chi_sq = chi_square_statistic(df["amount"])
@@ -130,9 +127,9 @@ def test_ring_attacker_unique_accounts():
     df = profile.generate_trades()
 
     n_unique = df["base_account"].nunique()
-    assert n_unique == 3, (
-        f"RingAttacker with 3 wallets produced {n_unique} unique base_accounts, expected 3"
-    )
+    assert (
+        n_unique == 3
+    ), f"RingAttacker with 3 wallets produced {n_unique} unique base_accounts, expected 3"
 
     # Verify the ring structure: each wallet trades with the next
     for wi in range(3):
@@ -189,7 +186,7 @@ def test_adaptive_attacker_reduces_top_feature(trained_model_path):
     """AdaptiveAttacker reduces the highest-importance feature's mean absolute
     value by ≥ 10% vs. NaiveAttacker."""
     model = joblib.load(trained_model_path)
-    importances = dict(zip(model.feature_names_in_, model.feature_importances_))
+    importances = dict(zip(model.feature_names_in_, model.feature_importances_, strict=False))
     top_feature = max(importances, key=importances.get)
 
     naive = NaiveAttacker(n_wallets=10, trades_per_wallet=20, seed=RANDOM_SEED)
@@ -264,9 +261,9 @@ def test_timing_jitter_variable_intervals():
     wallet_trades = df[df["base_account"] == wallet].sort_values("ledger_close_time")
 
     intervals = wallet_trades["ledger_close_time"].diff().dt.total_seconds().dropna()
-    assert intervals.std() > 0.1, (
-        f"TimingJitter intervals have std={intervals.std():.2f}s, expected jitter > 0.1s"
-    )
+    assert (
+        intervals.std() > 0.1
+    ), f"TimingJitter intervals have std={intervals.std():.2f}s, expected jitter > 0.1s"
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +282,7 @@ def test_cross_pair_attacker_multiple_assets():
     df = profile.generate_trades()
 
     n_assets = df["base_asset"].nunique()
-    assert n_assets >= 2, (
-        f"CrossPairAttacker produced only {n_assets} base_assets, expected ≥ 2"
-    )
+    assert n_assets >= 2, f"CrossPairAttacker produced only {n_assets} base_assets, expected ≥ 2"
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +299,7 @@ def test_trades_to_feature_matrix():
     assert not features.empty, "Feature matrix should not be empty"
     assert "wallet" in features.columns, "Feature matrix must contain wallet column"
     assert "label" in features.columns, "Feature matrix must contain label column"
-    assert len(features) >= 5, (
-        f"Expected at least 5 feature rows, got {len(features)}"
-    )
+    assert len(features) >= 5, f"Expected at least 5 feature rows, got {len(features)}"
 
 
 # ---------------------------------------------------------------------------

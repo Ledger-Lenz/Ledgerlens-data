@@ -1,35 +1,40 @@
-
 import argparse
 import os
+
 import joblib
-import json
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
-import pandas as pd
-import numpy as np
-from typing import List, Tuple
+
 from config import config
-from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 from detection.meta_learner import LeafEmbeddingExtractor, MAMLAdapter, PrototypicalClassifier
 from detection.model_training import split_features_labels
+from scripts.generate_synthetic_dataset import generate_synthetic_dataset
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-def generate_tasks(n_tasks: int, n_support: int = 10, n_query: int = 90) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+
+def generate_tasks(
+    n_tasks: int, n_support: int = 10, n_query: int = 90
+) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
     tasks = []
     for i in range(n_tasks):
         # Vary the wash trading pattern for each task
         offset = np.random.uniform(-5, 5)
         noise = np.random.uniform(0.8, 1.2)
-        df = generate_synthetic_dataset(n_wallets=n_support + n_query, seed=42+i, wash_offset=offset, wash_noise=noise)
+        df = generate_synthetic_dataset(
+            n_wallets=n_support + n_query, seed=42 + i, wash_offset=offset, wash_noise=noise
+        )
 
         # Split into support and query sets
         # Assuming generate_synthetic_dataset returns balanced classes
         support_set = df.iloc[:n_support]
-        query_set = df.iloc[n_support:n_support+n_query]
+        query_set = df.iloc[n_support : n_support + n_query]
         tasks.append((support_set, query_set))
     return tasks
+
 
 def meta_train(
     n_epochs: int = 20,
@@ -37,7 +42,7 @@ def meta_train(
     n_inner_steps: int = 5,
     inner_lr: float = 0.01,
     outer_lr: float = 0.001,
-    model_dir: str = None,
+    model_dir: str | None = None,
     use_dp: bool = False,
 ):
     model_dir = model_dir or config.MODEL_DIR
@@ -64,12 +69,12 @@ def meta_train(
     input_dim = dummy_embeddings.shape[1]
 
     maml = MAMLAdapter(input_dim=input_dim)
-    proto = PrototypicalClassifier()
+    PrototypicalClassifier()
 
     meta_optimizer = torch.optim.Adam(maml.parameters(), lr=outer_lr)
 
     for epoch in range(n_epochs):
-        epoch_loss = 0
+        epoch_loss = 0.0
         tasks = generate_tasks(n_tasks_per_epoch)
 
         meta_optimizer.zero_grad()
@@ -110,7 +115,7 @@ def meta_train(
             loss_q.backward()
 
             # Copy gradients from adapted_maml to maml
-            for p, ap in zip(maml.parameters(), adapted_maml.parameters()):
+            for p, ap in zip(maml.parameters(), adapted_maml.parameters(), strict=False):
                 if ap.grad is not None:
                     if p.grad is None:
                         p.grad = ap.grad.clone()
@@ -171,6 +176,7 @@ def meta_train(
             dp_report.achieved_epsilon or 0.0,
             dp_report.membership_inference_success_rate * 100,
         )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

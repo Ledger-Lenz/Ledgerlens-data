@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -42,6 +43,7 @@ FED_WEIGHT_DIM: int = int(os.getenv("FED_WEIGHT_DIM", "0"))  # 0 = inferred at r
 # ---------------------------------------------------------------------------
 # In-memory state (one coordinator per process; reset on restart)
 # ---------------------------------------------------------------------------
+
 
 class _RoundState:
     def __init__(self) -> None:
@@ -90,8 +92,9 @@ _state = _RoundState()
 # App
 # ---------------------------------------------------------------------------
 
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _state
     _state = _RoundState()
     # If a known dimension is configured, initialise to zeros so participants
@@ -107,6 +110,7 @@ app = FastAPI(title="LedgerLens Federated Coordinator", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+
 
 class RegisterRequest(BaseModel):
     participant_id: str
@@ -126,6 +130,7 @@ class GlobalWeightsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.post("/register")
 def register(req: RegisterRequest) -> dict[str, Any]:
@@ -199,6 +204,7 @@ def advance_round() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Programmatic reset helper (used by tests)
 # ---------------------------------------------------------------------------
+
 
 def reset_state(weight_dim: int = 0) -> None:
     """Reset coordinator state; optionally pre-seed global weights to zeros."""

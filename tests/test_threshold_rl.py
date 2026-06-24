@@ -9,9 +9,7 @@ Acceptance criteria covered:
 
 from __future__ import annotations
 
-import json
 import os
-import tempfile
 
 import numpy as np
 import pytest
@@ -20,10 +18,8 @@ from detection.threshold_rl import (
     THRESHOLDS,
     ThresholdAgent,
     _encode_context,
-    _get_pinned,
     compute_f1,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -111,7 +107,7 @@ def test_single_update_per_batch(tmp_path_agent):
     after = list(agent.q_values)
     # Only the chosen arm's Q-value changed
     arm = THRESHOLDS.index(t)
-    diffs = [abs(a - b) for a, b in zip(before, after)]
+    diffs = [abs(a - b) for a, b in zip(before, after, strict=False)]
     for i, d in enumerate(diffs):
         if i == arm:
             assert d > 0

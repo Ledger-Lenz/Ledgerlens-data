@@ -6,7 +6,7 @@ sub (subject/client_id), and scope (must contain "scores:read").
 """
 
 import os
-from typing import Any
+from typing import Any, cast
 
 from jose import JWTError, jwt
 from jose.exceptions import JWTClaimsError
@@ -81,7 +81,7 @@ class JWTAuthenticator:
                 return None
 
             logger.debug("JWT verified successfully (client_id=%s)", claims.get("sub"))
-            return claims
+            return cast(dict[str, Any], claims)
 
         except JWTClaimsError as exc:
             logger.warning("JWT verification failed: invalid claims (%s)", str(exc))

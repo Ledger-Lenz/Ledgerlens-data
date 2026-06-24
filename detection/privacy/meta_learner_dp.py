@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import torch
@@ -110,13 +111,16 @@ def train_meta_learner_dp(
     )
 
     baseline = MAMLAdapter(embeddings.shape[1], hidden_dim=hidden_dim)
-    baseline, _ = train_without_dp(
-        baseline,
-        train_loader,
-        _maml_loss,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        device=device,
+    baseline = cast(
+        MAMLAdapter,
+        train_without_dp(
+            baseline,
+            train_loader,
+            _maml_loss,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            device=device,
+        )[0],
     )
     baseline_auc = _auc_roc(baseline, test_loader, device)
 
@@ -134,16 +138,19 @@ def train_meta_learner_dp(
             learning_rate=learning_rate,
             device=device,
         )
-        model = dp_result.model  # type: ignore[assignment]
+        model = cast(MAMLAdapter, dp_result.model)
         achieved_epsilon = dp_result.achieved_epsilon
     else:
-        model, _ = train_without_dp(
-            model,
-            train_loader,
-            _maml_loss,
-            epochs=epochs,
-            learning_rate=learning_rate,
-            device=device,
+        model = cast(
+            MAMLAdapter,
+            train_without_dp(
+                model,
+                train_loader,
+                _maml_loss,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                device=device,
+            )[0],
         )
 
     auc = _auc_roc(model, test_loader, device)

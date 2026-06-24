@@ -19,26 +19,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
+from scipy.linalg import sqrtm
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import cross_val_score, train_test_split
 
-from config import config
 from scripts.wash_trade_simulator import RANDOM_SEED
 
-FEATURE_COLUMNS_EXCLUDE = {"wallet", "label", "profile", "labelling_signal",
-                           "review_notes", "data_window_start", "data_window_end",
-                           "n_trades", "is_wash"}
+FEATURE_COLUMNS_EXCLUDE = {
+    "wallet",
+    "label",
+    "profile",
+    "labelling_signal",
+    "review_notes",
+    "data_window_start",
+    "data_window_end",
+    "n_trades",
+    "is_wash",
+}
 
 
 def _get_feature_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in FEATURE_COLUMNS_EXCLUDE and
-            not c.startswith("benford_residual_")]
+    return [
+        c
+        for c in df.columns
+        if c not in FEATURE_COLUMNS_EXCLUDE and not c.startswith("benford_residual_")
+    ]
 
 
 def compute_frechet_feature_distance(
@@ -70,7 +80,7 @@ def compute_frechet_feature_distance(
     sigma_sum = sigma_real + sigma_sim
     sigma_prod = sigma_real @ sigma_sim
     try:
-        sqrt_sigma_prod = np.real(np.linalg.sqrtm(sigma_prod))
+        sqrt_sigma_prod = np.real(sqrtm(sigma_prod))
         trace_term = np.trace(sigma_sum - 2 * sqrt_sigma_prod)
     except (np.linalg.LinAlgError, ValueError):
         trace_term = 0.0
@@ -109,9 +119,7 @@ def compute_discriminator_accuracy(
         X, y, test_size=0.3, random_state=seed, stratify=y
     )
 
-    clf = RandomForestClassifier(
-        n_estimators=100, max_depth=5, random_state=seed, n_jobs=1
-    )
+    clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=seed, n_jobs=1)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
@@ -120,9 +128,7 @@ def compute_discriminator_accuracy(
     accuracy = accuracy_score(y_test, y_pred)
     auc_roc = roc_auc_score(y_test, y_prob)
 
-    cv_scores = cross_val_score(
-        clf, X, y, cv=min(5, len(np.unique(y))), scoring="accuracy"
-    )
+    cv_scores = cross_val_score(clf, X, y, cv=min(5, len(np.unique(y))), scoring="accuracy")
 
     return {
         "accuracy": round(float(accuracy), 4),

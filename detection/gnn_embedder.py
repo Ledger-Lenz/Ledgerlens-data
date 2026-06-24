@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import torch
@@ -120,7 +121,7 @@ def _mask(data: Data, name: str) -> torch.Tensor:
     mask = getattr(data, name, None)
     if mask is None:
         return torch.ones(data.num_nodes, dtype=torch.bool, device=data.x.device)
-    return mask.bool()
+    return cast(torch.Tensor, mask.bool())
 
 
 def evaluate_graphsage(

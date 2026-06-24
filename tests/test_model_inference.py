@@ -153,6 +153,45 @@ def test_bft_prometheus_counter_incremented_on_divergence(trained_models, monkey
     assert len(counter_calls) == 1
 
 
+def test_risk_scorer_default_weights_none_preserves_bft_behavior(trained_models):
+    _, model_dir, df = trained_models
+    scorer = RiskScorer(model_dir=model_dir)
+    assert scorer.weights is None
+
+    row = df.drop(columns=["label"]).iloc[0]
+    result = scorer.score(row)
+    assert "calibrated" not in result
+
+
+def test_risk_scorer_weighted_mode_returns_calibrated_score(trained_models):
+    _, model_dir, df = trained_models
+    scorer = RiskScorer(
+        model_dir=model_dir,
+        weights={"random_forest": 0.5, "xgboost": 0.3, "lightgbm": 0.2},
+    )
+    row = df.drop(columns=["label"]).iloc[0]
+    result = scorer.score(row)
+
+    assert result["calibrated"] is True
+    assert 0 <= result["score"] <= 100
+    assert "consensus_failure" not in result
+
+
+def test_risk_scorer_weights_must_sum_to_one(trained_models):
+    with pytest.raises(ValueError):
+        RiskScorer(weights={"random_forest": 0.5, "xgboost": 0.5, "lightgbm": 0.5})
+
+
+def test_risk_scorer_weighted_mode_rejects_unknown_model_names(trained_models):
+    _, model_dir, df = trained_models
+    scorer = RiskScorer(model_dir=model_dir, weights={"random_forest": 1.0})
+    scorer.weights = {"not_a_real_model": 1.0}
+
+    row = df.drop(columns=["label"]).iloc[0]
+    with pytest.raises(ValueError):
+        scorer.score(row)
+
+
 def test_consensus_failure_score(trained_models, monkeypatch):
     """When no two models agree, score must be 100 and consensus_failure=True."""
     _, model_dir, df = trained_models

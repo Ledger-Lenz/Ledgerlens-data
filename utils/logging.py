@@ -9,6 +9,9 @@ Usage:
 
 import logging
 import os
+import sys
+
+from config import config
 
 _CONFIGURED = False
 
@@ -19,11 +22,27 @@ def _configure() -> None:
         return
 
     level = os.getenv("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    handler = logging.StreamHandler(sys.stdout)
+    
+    if config.LOG_FORMAT == "json":
+        try:
+            from pythonjsonlogger import jsonlogger
+            formatter = jsonlogger.JsonFormatter('%(asctime)s %(name)s %(levelname)s %(message)s')
+        except ImportError:
+            formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z")
+    else:
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z")
+
+    handler.setFormatter(formatter)
+    
+    # Remove existing handlers to avoid duplicates
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+        
+    root_logger.addHandler(handler)
     _CONFIGURED = True
 
 

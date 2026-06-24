@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cryptographically committed forensic audit trail (`detection/audit_trail.py`):
+  signed NDJSON append-only log for report scores, feature/SHAP hashes, and model
+  version; `scripts/verify_audit_trail.py` for regulator verification.
+  Config: `AUDIT_LOG_PATH`, `AUDIT_VERIFY_PUBLIC_KEY_PATH`.
+
 ## [0.2.0] - 2026-06-13
 
 ### Added

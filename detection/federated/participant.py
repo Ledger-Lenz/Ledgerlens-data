@@ -37,9 +37,7 @@ class FederatedParticipant:
     # ------------------------------------------------------------------ #
 
     def _get_weights(self) -> np.ndarray:
-        return np.concatenate(
-            [self.model.coef_.ravel(), self.model.intercept_.ravel()]
-        )
+        return np.concatenate([self.model.coef_.ravel(), self.model.intercept_.ravel()])
 
     def _set_weights(self, w: np.ndarray) -> None:
         n_coef = self.model.coef_.size
@@ -62,7 +60,8 @@ class FederatedParticipant:
 
     def compute_delta(self, global_weights: np.ndarray) -> np.ndarray:
         """Weight delta = local weights - global weights."""
-        return self._get_weights() - global_weights
+        delta: np.ndarray = self._get_weights() - global_weights
+        return delta
 
     # ------------------------------------------------------------------ #
     # Protocol                                                            #

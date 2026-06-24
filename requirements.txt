@@ -26,6 +26,9 @@ gymnasium>=0.29.0
 torch>=2.2.0
 torch_geometric>=2.5.0
 
+# Multi-objective ensemble weight calibration (NSGA-II Pareto search)
+pymoo>=0.6.1
+
 # Persistence / config
 python-dotenv>=1.0.0
 sqlalchemy>=2.0.0
@@ -57,6 +60,9 @@ fastavro>=1.9.0
 # Cryptography (model artifact signing/verification)
 cryptography>=42.0.0
 
+# Static type checking
+mypy>=1.10.0
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
@@ -67,3 +73,4 @@ hypothesis>=6.100.0
 jinja2>=3.1.0
 tqdm>=4.66.0
 weasyprint>=62.0
+python-json-logger==2.0.7

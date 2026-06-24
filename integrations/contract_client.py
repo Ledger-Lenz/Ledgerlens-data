@@ -15,10 +15,18 @@ documented in the README's "Shared Contracts" section:
 `CODE:ISSUER/CODE:ISSUER` string from `ingestion.data_models.Asset.pair_id`.
 """
 
+from typing import Any, Protocol, cast
+
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.contract import ContractClient
 
 from config import config
+
+
+class AnchorableReport(Protocol):
+    report_id: str
+    report_sha256: str
+    soroban_anchor_tx: str | None
 
 _NETWORK_PASSPHRASES = {
     "PUBLIC": Network.PUBLIC_NETWORK_PASSPHRASE,
@@ -132,9 +140,9 @@ class LedgerLensContractClient:
         """Read the on-chain `RiskScore` for `(wallet, asset_pair)`."""
         params = [scval.to_address(wallet), scval.to_string(asset_pair)]
         tx = self._client.invoke("get_score", params, simulate=True)
-        return scval.to_native(tx.result())
+        return cast(dict[Any, Any], scval.to_native(tx.result()))
 
-    def anchor_report(self, report: object) -> str:
+    def anchor_report(self, report: AnchorableReport) -> str:
         """Submit a forensic report's SHA-256 fingerprint to Soroban.
 
         Calls the contract's `anchor_report(report_id, sha256)` function and

@@ -121,6 +121,18 @@ Benford signals alone aren't definitive — legitimate high-frequency market mak
 
 Models are trained with **SMOTE** to handle class imbalance and evaluated using **AUC-ROC**, **Precision-Recall AUC**, and **F1-score**. SHAP values provide interpretable explanations for every risk score.
 
+### Adversarial robustness
+
+A sophisticated operator who reverse-engineers the scoring system could perturb
+their on-chain footprint just enough to stay below the alert threshold. The
+`detection/adversarial/` package quantifies that attack surface: it runs
+**FGSM** and **PGD** (Madry et al., 2018) evasion attacks — estimating feature
+gradients by finite differences against the tree ensemble's continuous score —
+and reports the evasion success rate, the minimum L-inf perturbation per
+feature, and the most vulnerable features. **Adversarial-training augmentation**
+then retrains on PGD-perturbed wash examples and measures the AUC-ROC gain on a
+perturbed test set. See `scripts/run_adversarial_eval.py`.
+
 ## Repository Structure
 
 ```
@@ -148,6 +160,7 @@ ledgerlens-data/
 │   ├── model_inference.py            ← Real-time risk scoring
 │   ├── drift_monitor.py              ← PSI-based feature drift detection
 │   ├── shap_explainer.py             ← SHAP interpretability layer
+│   ├── adversarial/                  ← FGSM/PGD evasion attacks + robustness eval
 │   ├── persistence.py                ← SQLAlchemy RiskScore model + engine
 │   └── risk_score_store.py           ← RiskScore upsert/read repository
 │
@@ -161,30 +174,23 @@ ledgerlens-data/
 │   └── pipeline.py                   ← StreamingPipeline orchestrator
 │
 ├── scripts/
-│   ├── stream.py                     ← Real-time pipeline CLI (python -m scripts.stream)
 │   ├── generate_synthetic_dataset.py ← Synthetic labelled dataset for local training/demo
-│   ├── retrain_if_drifted.py         ← Automated drift detection + retraining trigger
-│   └── list_model_versions.py        ← List archived model versions with metrics
-│
-├── docs/
-│   ├── streaming_architecture.md     ← Real-time pipeline diagram and component docs
-│   └── drift_detection.md           ← PSI drift detection methodology and retraining docs
+│   └── run_adversarial_eval.py       ← Adversarial robustness report (FGSM/PGD)
 │
 ├── utils/
 │   ├── logging.py                    ← Shared logger setup
 │   └── retry.py                      ← Retry/backoff decorator for Horizon calls
 │
-├── tests/
-│   ├── test_benford.py
-│   ├── test_features.py
-│   ├── test_orderbook.py
-│   ├── test_wallet_graph.py
-│   ├── test_persistence.py
-│   ├── test_contract_client.py
-│   ├── test_model_training.py
-│   ├── test_inference_shap.py
-│   ├── test_drift_monitor.py
-│   └── test_retrain_trigger.py
+└── tests/
+    ├── test_benford.py
+    ├── test_features.py
+    ├── test_orderbook.py
+    ├── test_wallet_graph.py
+    ├── test_persistence.py
+    ├── test_contract_client.py
+    ├── test_model_training.py
+    ├── test_inference_shap.py
+    └── test_adversarial.py
 ```
 
 ## Quick Start
@@ -542,14 +548,17 @@ ledgerlens-data/
 │   ├── wallet_graph.py          ← funding-graph similarity/centrality
 │   ├── model_training.py        ← ensemble training CLI
 │   ├── model_inference.py       ← RiskScorer ensemble scoring
+│   ├── ensemble_calibrator.py   ← NSGA-II Pareto search over ensemble weights
 │   ├── shap_explainer.py        ← per-wallet + ensemble SHAP attributions
+│   ├── adversarial/             ← FGSM/PGD evasion attacks + robustness eval
 │   ├── persistence.py           ← SQLAlchemy RiskScore model + engine
 │   └── risk_score_store.py      ← RiskScore upsert/read repository
 ├── integrations/
 │   └── contract_client.py      ← ledgerlens-score Soroban contract client
 ├── scripts/
-│   └── generate_synthetic_dataset.py ← synthetic labelled dataset generator
-└── tests/ (8 modules, see Repository Structure above)
+│   ├── generate_synthetic_dataset.py ← synthetic labelled dataset generator
+│   └── run_adversarial_eval.py  ← adversarial robustness report (FGSM/PGD)
+└── tests/ (9 modules, see Repository Structure above)
 ```
 
 #### Known gaps / TODOs
@@ -602,6 +611,10 @@ Every trained model artifact is verified through a four-step chain before loadin
 ### Byzantine-Fault-Tolerant Ensemble Voting
 
 The three models (RF, XGBoost, LightGBM) vote using a **trimmed mean / median** scheme. If the spread across model scores exceeds `BFT_SCORE_DIVERGENCE_THRESHOLD` (default 30 points), the outlier scores are trimmed and the median is used — ensuring a single compromised model cannot shift the final score by more than ~17 points. Divergence events are logged, counted in a Prometheus counter (`bft_divergence_detected_total`), and surfaced in the score response as `bft_divergence: true`.
+
+### Multi-Objective Ensemble Calibration
+
+`detection/ensemble_calibrator.py` runs NSGA-II (via `pymoo`) over the ensemble's per-model combination weights to find the Pareto front of non-dominated tradeoffs between **precision**, **recall**, and **SHAP stability** (mean cosine similarity between SHAP vectors under small input perturbations — high values mean explanations don't flip under noise). Run it with `python -m detection.model_training --calibrate-ensemble ...`, which writes `models/pareto_front.json`. Operators then call `EnsembleCalibrator.select_operating_point(min_precision=..., min_recall=...)` to pick the most explanation-stable point that still satisfies their precision/recall floor, and pass the resulting weights to `RiskScorer(weights=...)` to score with that calibrated point instead of the default BFT trimmed-mean voting.
 
 ### Label Poisoning Detection
 

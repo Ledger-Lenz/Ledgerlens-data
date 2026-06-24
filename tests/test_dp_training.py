@@ -15,8 +15,8 @@ from config import config
 from detection.dann_encoder import DANNEncoder, train_dann_encoder
 from detection.privacy.dp_training import opacus_available, train_with_dp, train_without_dp
 from detection.privacy.membership_inference import membership_inference_success_rate
-from detection.privacy.metrics import record_dp_metrics
 from detection.privacy.meta_learner_dp import train_meta_learner_dp
+from detection.privacy.metrics import record_dp_metrics
 
 
 class _TinyClassifier(nn.Module):

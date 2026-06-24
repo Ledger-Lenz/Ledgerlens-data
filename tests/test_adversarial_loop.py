@@ -3,19 +3,16 @@
 Run with: pytest tests/test_adversarial_loop.py -v
 """
 
-import json
 import os
 
 import pytest
 
-from config import config
 from scripts.adversarial_training_loop import (
     compute_feature_importances,
     generate_dataset_from_profile,
     run_adversarial_loop,
 )
 from scripts.wash_trade_simulator import RANDOM_SEED
-
 
 # ---------------------------------------------------------------------------
 # Test 1: Loop terminates after GAN_ROUNDS iterations
@@ -32,9 +29,7 @@ def test_loop_terminates_after_gan_rounds():
         seed=RANDOM_SEED,
     )
 
-    assert len(result["rounds"]) == 3, (
-        f"Expected {3} rounds, got {len(result['rounds'])}"
-    )
+    assert len(result["rounds"]) == 3, f"Expected {3} rounds, got {len(result['rounds'])}"
     assert os.path.exists(
         f"reports/adversarial_loop_{result['timestamp']}.json"
     ), "Output JSON file must exist"
@@ -60,10 +55,7 @@ def test_auc_roc_monotonic_non_decreasing():
         assert result["plateau_exit"], "Loop exited early due to plateau"
         return
 
-    auc_rocs = [
-        r.get("random_forest_auc_roc", 0.0)
-        for r in result["rounds"]
-    ]
+    auc_rocs = [r.get("random_forest_auc_roc", 0.0) for r in result["rounds"]]
     for i in range(1, len(auc_rocs)):
         assert auc_rocs[i] >= auc_rocs[i - 1] - 0.01, (
             f"AUC-ROC dropped from round {i-1} ({auc_rocs[i-1]:.4f}) "
@@ -87,9 +79,9 @@ def test_output_json_structure():
     )
 
     required_top_keys = {"timestamp", "gan_rounds", "rounds", "final_auc_roc"}
-    assert required_top_keys.issubset(result.keys()), (
-        f"Missing top-level keys. Expected {required_top_keys}, got {set(result.keys())}"
-    )
+    assert required_top_keys.issubset(
+        result.keys()
+    ), f"Missing top-level keys. Expected {required_top_keys}, got {set(result.keys())}"
 
     for round_data in result["rounds"]:
         required_round_keys = {"round", "profile", "dataset_size"}
@@ -123,9 +115,7 @@ def test_generate_dataset_all_profiles(profile_name):
     assert not df.empty, f"Generated DataFrame for {profile_name} is empty"
     assert "wallet" in df.columns, f"DataFrame for {profile_name} missing wallet column"
     if "label" in df.columns:
-        assert df["label"].isin([0, 1]).all(), (
-            f"Labels in {profile_name} must be 0 or 1"
-        )
+        assert df["label"].isin([0, 1]).all(), f"Labels in {profile_name} must be 0 or 1"
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +125,7 @@ def test_generate_dataset_all_profiles(profile_name):
 
 def test_compute_feature_importances():
     """compute_feature_importances returns a non-empty dict when models exist."""
-    result = run_adversarial_loop(
+    run_adversarial_loop(
         gan_rounds=1,
         n_wallets=15,
         trades_per_wallet=15,

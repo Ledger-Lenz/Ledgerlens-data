@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 
 import websockets
 from prometheus_client import Counter, Gauge
@@ -39,7 +39,7 @@ logger = get_logger(__name__)
 class ScoreUpdateMessage(BaseModel):
     """Message schema for score updates."""
 
-    type: str = Field(default="score_update", const=True)
+    type: Literal["score_update"] = "score_update"
     seq: int
     channel: str
     wallet: str
@@ -55,21 +55,21 @@ class ScoreUpdateMessage(BaseModel):
 class SubscribeMessage(BaseModel):
     """Client message to subscribe to channels."""
 
-    type: str = Field(default="subscribe", const=True)
+    type: Literal["subscribe"] = "subscribe"
     channels: list[str]
 
 
 class UnsubscribeMessage(BaseModel):
     """Client message to unsubscribe from channels."""
 
-    type: str = Field(default="unsubscribe", const=True)
+    type: Literal["unsubscribe"] = "unsubscribe"
     channels: list[str]
 
 
 class ReplayMessage(BaseModel):
     """Client message to request message replay."""
 
-    type: str = Field(default="replay", const=True)
+    type: Literal["replay"] = "replay"
     channel: str
     since_seq: int
 
@@ -77,7 +77,7 @@ class ReplayMessage(BaseModel):
 class ErrorMessage(BaseModel):
     """Server error message."""
 
-    type: str = Field(default="error", const=True)
+    type: Literal["error"] = "error"
     code: str
     message: str = ""
     retry_after_ms: int | None = None
@@ -86,7 +86,7 @@ class ErrorMessage(BaseModel):
 class DroppedMessage(BaseModel):
     """Notification of dropped messages due to backpressure."""
 
-    type: str = Field(default="dropped", const=True)
+    type: Literal["dropped"] = "dropped"
     count: int
 
 
@@ -143,8 +143,8 @@ class TokenBucket:
 class SequenceCounter:
     """Thread-safe monotonically increasing sequence numbers."""
 
-    def __init__(self):
-        self._seq = 0
+    def __init__(self) -> None:
+        self._seq: int = 0
         self._lock = threading.Lock()
 
     def next(self) -> int:
@@ -237,8 +237,16 @@ _clients_lock = threading.Lock()
 _seq_counter = SequenceCounter()
 _replay_buffer = ReplayBuffer(config.WS_REPLAY_BUFFER_SIZE)
 _router = PubSubRouter()
-_auth = JWTAuthenticator(config.JWT_PUBLIC_KEY_PATH)
+_auth: JWTAuthenticator | None = None
 _loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_auth() -> JWTAuthenticator:
+    """Return the JWT authenticator, creating it on first use."""
+    global _auth
+    if _auth is None:
+        _auth = JWTAuthenticator(config.JWT_PUBLIC_KEY_PATH)
+    return _auth
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -305,15 +313,17 @@ async def _handler(websocket) -> None:
             logger.warning("WebSocket connection rejected: no token provided")
             return
 
-        claims = _auth.verify(token)
+        claims = _get_auth().verify(token)
         if not claims:
             ws_auth_failures_total.inc()
             await websocket.close(code=1008, reason="Unauthorized: invalid token")
-            logger.warning("WebSocket connection rejected: invalid token (%s)", _redact_token(token))
+            logger.warning(
+                "WebSocket connection rejected: invalid token (%s)", _redact_token(token)
+            )
             return
 
         client_id = claims.get("sub", "unknown")
-        permissions = _auth.extract_permissions(claims)
+        permissions = _get_auth().extract_permissions(claims)
 
         # ─────────────────────────────────────────────────────────────────
         # 2. CONNECTION LIMITS: Check max clients
@@ -333,7 +343,9 @@ async def _handler(websocket) -> None:
         # 3. REGISTER CLIENT: Create queue and rate limiter
         # ─────────────────────────────────────────────────────────────────
 
-        client_queue = asyncio.Queue(maxlen=config.WS_CLIENT_QUEUE_DEPTH)
+        client_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=config.WS_CLIENT_QUEUE_DEPTH
+        )
         rate_limiter = TokenBucket(config.WS_RATE_LIMIT_MSGS_PER_SECOND)
 
         with _clients_lock:
@@ -386,7 +398,9 @@ async def _handler(websocket) -> None:
             with _clients_lock:
                 _clients.pop(client_id, None)
                 ws_connected_clients.set(len(_clients))
-            logger.info("WebSocket client disconnected (client_id=%s, total=%d)", client_id, len(_clients))
+            logger.info(
+                "WebSocket client disconnected (client_id=%s, total=%d)", client_id, len(_clients)
+            )
 
 
 async def _extract_token(websocket) -> str | None:
@@ -405,7 +419,7 @@ async def _extract_token(websocket) -> str | None:
     # Try Authorization header
     auth_header = websocket.request_headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        return auth_header[7:]
+        return str(auth_header[7:])
 
     # Try query parameter
     if websocket.request_headers.get("Path"):
@@ -441,7 +455,9 @@ async def _process_inbound(websocket, client_id: str, permissions: set[str]) -> 
                 elif msg_type == "replay":
                     await _handle_replay(websocket, client_id, permissions, payload)
                 else:
-                    error = ErrorMessage(code="unknown_type", message=f"Unknown message type: {msg_type}")
+                    error = ErrorMessage(
+                        code="unknown_type", message=f"Unknown message type: {msg_type}"
+                    )
                     await websocket.send(error.model_dump_json())
 
             except json.JSONDecodeError:
@@ -461,7 +477,9 @@ async def _process_inbound(websocket, client_id: str, permissions: set[str]) -> 
         logger.error("Unexpected error in _process_inbound: %s", str(exc))
 
 
-async def _handle_subscribe(websocket, client_id: str, permissions: set[str], payload: dict) -> None:
+async def _handle_subscribe(
+    websocket, client_id: str, permissions: set[str], payload: dict
+) -> None:
     """Handle subscribe message from client.
 
     Args:
@@ -486,7 +504,7 @@ async def _handle_subscribe(websocket, client_id: str, permissions: set[str], pa
 
         # Check permissions
         forbidden_channels = [
-            ch for ch in channels if not _auth.is_permitted_channel(permissions, ch)
+            ch for ch in channels if not _get_auth().is_permitted_channel(permissions, ch)
         ]
         if forbidden_channels:
             error = ErrorMessage(
@@ -561,15 +579,19 @@ async def _handle_replay(websocket, client_id: str, permissions: set[str], paylo
             return
 
         # Check permission
-        if not _auth.is_permitted_channel(permissions, channel):
+        if not _get_auth().is_permitted_channel(permissions, channel):
             error = ErrorMessage(code="forbidden", message=f"Not permitted to replay: {channel}")
             await websocket.send(error.model_dump_json())
-            logger.warning("Client %s attempted to replay forbidden channel: %s", client_id, channel)
+            logger.warning(
+                "Client %s attempted to replay forbidden channel: %s", client_id, channel
+            )
             return
 
         # Get messages from replay buffer
         messages = _replay_buffer.get_since(channel, since_seq)
-        logger.debug("Client %s replayed %d messages from seq %d", client_id, len(messages), since_seq)
+        logger.debug(
+            "Client %s replayed %d messages from seq %d", client_id, len(messages), since_seq
+        )
 
         # Send replayed messages
         for msg_dict in messages:
@@ -580,7 +602,9 @@ async def _handle_replay(websocket, client_id: str, permissions: set[str], paylo
         await websocket.send(error.model_dump_json())
 
 
-async def _process_outbound(websocket, queue: asyncio.Queue, client_id: str, rate_limiter: TokenBucket) -> None:
+async def _process_outbound(
+    websocket, queue: asyncio.Queue, client_id: str, rate_limiter: TokenBucket
+) -> None:
     """Process outbound messages from router queue to client.
 
     Handles rate limiting and backpressure notifications.
@@ -653,8 +677,14 @@ async def publish_score_update(score_event: dict) -> None:
         wallet_id = score_event.get("wallet")
         asset_pair = score_event.get("asset_pair")
         if not wallet_id or not asset_pair:
-            logger.warning("Score event missing wallet or asset_pair: %s", score_event)
+            logger.warning("Score event missing wallet or asset_pair", extra={"event": score_event})
             return
+
+        logger.info("Score event published", extra={
+            "wallet": wallet_id,
+            "asset_pair": asset_pair,
+            "score": score_event.get("score")
+        })
 
         # Get next sequence number
         seq = _seq_counter.next()

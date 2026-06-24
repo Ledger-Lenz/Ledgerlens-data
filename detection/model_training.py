@@ -12,12 +12,17 @@ artifacts to `config.MODEL_DIR`, and writes `metrics.json` alongside them.
 
 After every training run, `metrics.json` is signed with the Ed25519 private
 key at `MODEL_SIGNING_PRIVATE_KEY_PATH` (if configured).
+
+Pass `--calibrate-ensemble` to additionally run NSGA-II Pareto front search
+over ensemble combination weights (see `detection/ensemble_calibrator.py`)
+and write `models/pareto_front.json`.
 """
 
 import argparse
 import hashlib
 import json
 import os
+import sys
 from datetime import UTC, datetime
 
 import joblib
@@ -41,7 +46,7 @@ MODEL_REGISTRY = {
     "lightgbm": LGBMClassifier,
 }
 
-FEATURE_COLUMNS_EXCLUDE = {"wallet", "label"}
+FEATURE_COLUMNS_EXCLUDE = {"wallet", "label", "profile"}
 PSI_N_BINS = 10
 PSI_EPSILON = 1e-4
 
@@ -98,15 +103,6 @@ def compute_feature_schema_hash(feature_columns: list[str]) -> str:
     schema_str = "\n".join(sorted_cols)
     return f"sha256:{hashlib.sha256(schema_str.encode()).hexdigest()}"
 
-LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
-    config.MODEL_DIR, "label_distribution_baseline.json"
-)
-
-
-LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
-    config.MODEL_DIR, "label_distribution_baseline.json"
-)
-
 
 def load_training_data(path: str) -> pd.DataFrame:
     """Load a labelled feature matrix (output of `build_feature_matrix` plus
@@ -154,7 +150,7 @@ def detect_label_poisoning(
         baseline = json.load(f)
 
     baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
-    return abs(current_ratio - baseline_ratio) > threshold
+    return bool(abs(current_ratio - baseline_ratio) > threshold)
 
 
 def _adversarial_augment(
@@ -203,35 +199,13 @@ def train_models(
           "feature_distributions": {...},
           "n_train": int,
           "n_test": int,
+          "X_test": pd.DataFrame,
+          "y_test": pd.Series,
         }
 
     If ``adversarial_augmentation`` is True, ``auc_roc_adversarial`` is also
     included in each model's metrics dict.
     """
-    baseline_path = baseline_path or LABEL_DISTRIBUTION_BASELINE_PATH
-    threshold = threshold if threshold is not None else config.POISON_LABEL_RATIO_THRESHOLD
-
-    total = sum(label_distribution.values())
-    if total == 0:
-        return False
-    current_ratio = label_distribution.get(1, 0) / total
-
-    if not os.path.exists(baseline_path):
-        os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
-        with open(baseline_path, "w") as f:
-            json.dump({"wash_trade_ratio": current_ratio}, f)
-        return False
-
-    with open(baseline_path) as f:
-        baseline = json.load(f)
-
-    baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
-    return abs(current_ratio - baseline_ratio) > threshold
-
-
-def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42) -> dict:
-    """Train all models in `MODEL_REGISTRY` and return fitted estimators
-    plus evaluation metrics."""
     X, y = split_features_labels(df)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
@@ -284,27 +258,78 @@ def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 4
         "feature_distributions": compute_feature_distributions(X),
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "X_test": X_test,
+        "y_test": y_test,
     }
 
 
 def save_models(results: dict, model_dir: str | None = None) -> None:
     model_dir = model_dir or config.MODEL_DIR
     os.makedirs(model_dir, exist_ok=True)
-    # results can be the full training_output dict or just the "results" inner dict
     to_save = results.get("results", results) if isinstance(results, dict) else results
     for name, result in to_save.items():
         joblib.dump(result["model"], os.path.join(model_dir, f"{name}.joblib"))
 
 
-def save_metrics_report(
-    results: dict,
+def save_training_artifacts(
+    training_output: dict,
+    data_path: str,
     model_dir: str | None = None,
-    extra: dict | None = None,
-) -> str:
-    """Write metrics (plus optional *extra* provenance fields) to metrics.json."""
+) -> None:
+    """Write metrics.json and model_metadata.json to the model directory."""
     model_dir = model_dir or config.MODEL_DIR
     os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, "metrics.json")
+
+    results = training_output["results"]
+    feature_columns = training_output["feature_columns"]
+    feature_distributions = training_output.get("feature_distributions")
+
+    # Save metrics.json
+    metrics_path = os.path.join(model_dir, "metrics.json")
+    metrics_payload = {name: result["metrics"] for name, result in results.items()}
+    for name in results:
+        artifact_path = os.path.join(model_dir, f"{name}.joblib")
+        if os.path.exists(artifact_path):
+            sha = hashlib.sha256()
+            with open(artifact_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha.update(chunk)
+            metrics_payload[name]["artifact_sha256"] = sha.hexdigest()
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_payload, f, indent=2)
+
+    # Save model_metadata.json
+    metadata_path = os.path.join(model_dir, "model_metadata.json")
+    metadata = {
+        "trained_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "data_path": data_path,
+        "n_training_rows": training_output["n_train"],
+        "n_test_rows": training_output["n_test"],
+        "feature_columns": feature_columns,
+        "feature_schema_hash": compute_feature_schema_hash(feature_columns),
+        "model_names": list(results.keys()),
+        "python_version": sys.version.split()[0],
+        "ledgerlens_version": "0.2.0",
+        "feature_distributions": feature_distributions,
+    }
+
+    metadata_path = os.path.join(model_dir, "model_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("Saved metrics to %s", metrics_path)
+    logger.info("Saved model metadata to %s", metadata_path)
+
+
+def save_training_artifacts(
+    training_output: dict,
+    data_path: str,
+    model_dir: str | None = None,
+) -> None:
+    """Write metrics.json and model_metadata.json to the model directory."""
+    model_dir = model_dir or config.MODEL_DIR
+    os.makedirs(model_dir, exist_ok=True)
 
     results = training_output["results"]
     feature_columns = training_output["feature_columns"]
@@ -327,51 +352,9 @@ def save_metrics_report(
         "feature_distributions": feature_distributions,
     }
 
-    # Embed artifact SHA-256 for each saved model
-    for name in results:
-        artifact_path = os.path.join(model_dir, f"{name}.joblib")
-        if os.path.exists(artifact_path):
-            sha = hashlib.sha256()
-            with open(artifact_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha.update(chunk)
-            payload[name]["artifact_sha256"] = sha.hexdigest()
-
-    if extra:
-        payload.update(extra)
-
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    return path
-
-
-def save_metrics_report(
-    results: dict,
-    model_dir: str | None = None,
-    extra: dict | None = None,
-) -> str:
-    """Write metrics (plus optional *extra* provenance fields) to metrics.json."""
-    model_dir = model_dir or config.MODEL_DIR
-    os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, "metrics.json")
-
-    payload: dict = {name: result["metrics"] for name, result in results.items()}
-
-    for name in results:
-        artifact_path = os.path.join(model_dir, f"{name}.joblib")
-        if os.path.exists(artifact_path):
-            sha = hashlib.sha256()
-            with open(artifact_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha.update(chunk)
-            payload[name]["artifact_sha256"] = sha.hexdigest()
-
-    if extra:
-        payload.update(extra)
-
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    return path
+    metadata_path = os.path.join(model_dir, "model_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
 
 
 def parse_args() -> argparse.Namespace:
@@ -438,12 +421,11 @@ def main() -> None:
         return
 
     # --with-gnn: pre-train GNN encoder and append embedding features
-    gnn_encoder = None
     if args.with_gnn:
         try:
-            from detection.gnn_encoder import GNNEncoder, pretrain_gnn_contrastive
-
             import networkx as nx
+
+            from detection.gnn_encoder import GNNEncoder, pretrain_gnn_contrastive
 
             logger.info("Building wallet graph for GNN pre-training…")
             # Build a simple co-occurrence graph from wallet column for pre-training
@@ -491,8 +473,6 @@ def main() -> None:
                 json.dump({"loss_curve": loss_curve}, f, indent=2)
             logger.info("GNN pre-training loss curve written to %s", loss_report_path)
 
-            gnn_encoder = encoder
-
             # Append GNN embedding features to the training DataFrame
             logger.info("Appending GNN embedding features to training data…")
             gnn_features: list[dict] = []
@@ -501,17 +481,13 @@ def main() -> None:
                     emb = encoder.encode(graph, wallet)
                     gnn_features.append({f"gnn_{i}": float(emb[i]) for i in range(len(emb))})
                 except Exception:
-                    gnn_features.append(
-                        {f"gnn_{i}": 0.0 for i in range(config.GNN_EMBEDDING_DIM)}
-                    )
+                    gnn_features.append({f"gnn_{i}": 0.0 for i in range(config.GNN_EMBEDDING_DIM)})
             gnn_df = pd.DataFrame(gnn_features, index=df.index)
             df = pd.concat([df, gnn_df], axis=1)
             logger.info("GNN embedding columns added: gnn_0 … gnn_%d", config.GNN_EMBEDDING_DIM - 1)
 
         except ImportError as exc:
-            logger.error(
-                "--with-gnn requested but torch/torch_geometric not available: %s", exc
-            )
+            logger.error("--with-gnn requested but torch/torch_geometric not available: %s", exc)
             logger.error("Install torch and torch_geometric to enable GNN training.")
 
     training_output = train_models(
@@ -526,6 +502,16 @@ def main() -> None:
 
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
+
+    if args.calibrate_ensemble:
+        from detection.ensemble_calibrator import EnsembleCalibrator, summarize_pareto_front
+
+        trained_models = {name: result["model"] for name, result in results.items()}
+        calibrator = EnsembleCalibrator(model_dir)
+        pareto_front = calibrator.run_search(
+            trained_models, training_output["X_test"], training_output["y_test"]
+        )
+        logger.info(summarize_pareto_front(pareto_front))
 
     if config.MODEL_SIGNING_PRIVATE_KEY_PATH:
         from detection.persistence import sign_metrics

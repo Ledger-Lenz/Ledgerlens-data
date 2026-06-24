@@ -26,11 +26,17 @@ import pandas as pd
 
 from config import config
 from detection.feature_engineering import build_feature_vector
-from detection.forensic_report import ForensicReportGenerator, write_report_secure
+from detection.forensic_report import (
+    ForensicReportGenerator,
+    write_csv_report,
+    write_report_secure,
+)
 from detection.model_inference import RiskScorer
-from detection.shap_explainer import ShapExplainer
 from ingestion.historical_loader import load_trades, trades_to_dataframe
 from ingestion.orderbook_loader import load_orderbook_events, orderbook_events_to_dataframe
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _score_wallet(
@@ -41,8 +47,17 @@ def _score_wallet(
     generator: ForensicReportGenerator,
     output_dir: Path,
     anchor: bool,
+    output_format: str = "json",
+    output_file: str | None = None,
 ) -> str:
-    """Score one wallet and write its forensic report. Returns the output path."""
+    """Score one wallet and write its forensic report. Returns the output path.
+
+    Args:
+        output_format: ``"json"`` or ``"csv"``.
+        output_file:   Explicit destination path, or ``"-"`` for stdout.
+                       When *None* an auto-generated filename in *output_dir*
+                       is used.
+    """
     # Ingest
     try:
         base_code, _, base_issuer = pair.split("/")[0].partition(":")
@@ -76,34 +91,23 @@ def _score_wallet(
     feature_vector = build_feature_vector(wallet, trades_df, orderbook_events=orderbook_df)
     feature_row = pd.Series(feature_vector)
 
-    # Score
-    result = scorer.score(feature_row)
-
-    # SHAP
-    try:
-        explainer = ShapExplainer()
-        shap_values = explainer.explain_ensemble(feature_row, scorer.models, top_n=10)
-    except Exception:
-        shap_values = []
-
-    # Model metadata
-    model_metadata = {}
-    if scorer.metadata:
-        model_metadata = {
-            "name": "LedgerLens Ensemble",
-            "version": scorer.metadata.get("model_version", "unknown"),
-            "training_dataset_sha256": scorer.metadata.get("training_dataset_sha256", "unknown"),
-            "feature_schema_version": scorer.metadata.get("feature_schema_hash", "unknown"),
-        }
-
     report = generator.generate(
         wallet=wallet,
-        wallet_trades=trades_df,
-        risk_score_dict=result,
-        shap_values=shap_values,
         asset_pair=pair,
-        model_metadata=model_metadata or None,
+        feature_row=feature_row,
+        wallet_trades=trades_df,
+        orderbook_events=orderbook_df,
     )
+
+    model_version = (
+        scorer.metadata.get("model_version", "unknown") if scorer.metadata else "unknown"
+    )
+    try:
+        from detection.audit_trail import commit_forensic_report
+
+        commit_forensic_report(report, feature_vector, model_version)
+    except Exception as exc:
+        logger.warning("Audit trail commit skipped: %s", exc)
 
     # Optional on-chain anchor
     if anchor:
@@ -117,8 +121,33 @@ def _score_wallet(
 
     # Write report
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    out_path = output_dir / f"{wallet[:12]}_{ts}.json"
-    write_report_secure(str(out_path), json.dumps(report.to_dict(), indent=2))
+    ext = "csv" if output_format == "csv" else "json"
+
+    if output_file == "-":
+        # --- stdout ---
+        if output_format == "csv":
+            import csv
+            import io
+            from detection.forensic_report import CSV_COLUMNS
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(report.to_csv_rows())
+            sys.stdout.write(buf.getvalue())
+        else:
+            sys.stdout.write(json.dumps(report.to_dict(), indent=2) + "\n")
+        return "<stdout>"
+
+    if output_file:
+        out_path = Path(output_file)
+    else:
+        out_path = output_dir / f"{wallet[:12]}_{ts}.{ext}"
+
+    if output_format == "csv":
+        write_csv_report(str(out_path), report)
+    else:
+        write_report_secure(str(out_path), json.dumps(report.to_dict(), indent=2))
     return str(out_path)
 
 
@@ -137,6 +166,22 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default="reports/forensic",
         help="Output directory (default: reports/forensic)",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["json", "csv"],
+        default="json",
+        help="Export format for forensic reports: json (default) or csv",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=None,
+        help=(
+            "Write output to this file path instead of the auto-generated path. "
+            "Use '-' to write to stdout. "
+            "When processing multiple wallets this path is used as a prefix "
+            "(<path>_<wallet>_<ts>.<ext>)."
+        ),
     )
     return parser.parse_args()
 
@@ -189,6 +234,8 @@ def main() -> None:
                 generator,
                 output_dir,
                 args.anchor,
+                args.output_format,
+                args.output_file,
             ): wallet
             for wallet, pair in wallets
         }

@@ -13,13 +13,16 @@ SHAP feature attributions, and prints the result to stdout.
 
 import argparse
 import json
+import re
 import sys
+import time
 from datetime import UTC, datetime
 
 import pandas as pd
 from stellar_sdk import Asset as SdkAsset
 
 from config import config
+from utils.logging import get_logger
 from detection.causal_attribution import CounterfactualAttributor
 from detection.feature_engineering import build_feature_vector
 from detection.forensic_report import ForensicReportGenerator, write_report_secure
@@ -32,11 +35,17 @@ from ingestion.orderbook_loader import (
 )
 
 
+logger = get_logger(__name__)
+
+
 def validate_wallet_id(wallet_id: str) -> None:
     """Validate that wallet_id looks like a Stellar public key (56 chars, starts with G)."""
     if len(wallet_id) != 56 or not wallet_id.startswith("G"):
-        print(f"Error: Invalid wallet ID format '{wallet_id}'.")
-        print("Must be a 56-character Stellar public key starting with 'G'.")
+        logger.error("Invalid wallet ID format", extra={
+            "wallet": wallet_id,
+            "error_type": "ValueError",
+            "error_message": f"Invalid wallet ID format '{wallet_id}'. Must be a 56-character Stellar public key starting with 'G'."
+        })
         sys.exit(1)
 
 
@@ -61,7 +70,11 @@ def parse_asset_pair(pair_str: str) -> tuple[SdkAsset, SdkAsset]:
 
         return _to_sdk_asset(base_str), _to_sdk_asset(counter_str)
     except Exception as e:
-        print(f"Error: Invalid asset pair format '{pair_str}': {e}")
+        logger.error("Invalid asset pair format", exc_info=True, extra={
+            "wallet": "unknown",
+            "error_type": type(e).__name__,
+            "error_message": f"Invalid asset pair format '{pair_str}': {e}"
+        })
         sys.exit(1)
 
 
@@ -122,24 +135,24 @@ def _parse_remove_trade_ids(
 def main() -> None:
     args = parse_args()
 
-    validate_wallet_id(args.wallet)
+    validate_wallet_address(args.wallet)
     base_asset, counter_asset = parse_asset_pair(args.pair)
 
     # 1. Load models
     try:
         scorer = RiskScorer()
     except RuntimeError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        logger.error("Model load error", exc_info=True, extra={
+            "wallet": args.wallet,
+            "error_type": type(e).__name__,
+            "error_message": str(e)
+        })
         if "No trained models" in str(e):
-            print(
-                "Suggestion: train models first by running model_training.py:"
-                " python -m detection.model_training",
-                file=sys.stderr,
-            )
+            logger.info("Suggestion: train models first by running model_training.py: python -m detection.model_training", extra={"wallet": args.wallet})
         sys.exit(1)
 
     override_val = scorer.list_override.check(args.wallet)
-    if override_val is not None:
+    if override_val in (0, 100):
         result = {
             "score": override_val,
             "benford_flag": False,
@@ -169,7 +182,11 @@ def main() -> None:
                 orderbook_events_df = orderbook_events_to_dataframe(events)
 
         except Exception as e:
-            print(f"Error fetching data from Horizon: {e}", file=sys.stderr)
+            logger.error("Error fetching data from Horizon", exc_info=True, extra={
+                "wallet": args.wallet,
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
             sys.exit(1)
 
         # 3. Feature Engineering
@@ -180,18 +197,38 @@ def main() -> None:
 
         # 4. Score
         try:
+            t0 = time.time()
             result = scorer.score(feature_row)
+            latency_ms = (time.time() - t0) * 1000
+            model_version = scorer.metadata.get("model_version", "unknown") if scorer.metadata else "unknown"
+            logger.info("Wallet scored", extra={
+                "wallet": args.wallet,
+                "score": result["score"],
+                "latency_ms": latency_ms,
+                "model_version": model_version,
+                "asset_pair": args.pair
+            })
         except Exception as e:
-            print(f"Error during scoring: {e}", file=sys.stderr)
+            logger.error("Error during scoring", exc_info=True, extra={
+                "wallet": args.wallet,
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
             sys.exit(1)
 
         remove_trade_ids = []
         causal_result = None
         if args.what_if_remove or args.causal:
             try:
-                remove_trade_ids = _parse_remove_trade_ids(args.what_if_remove, trades_df, args.wallet)
+                remove_trade_ids = _parse_remove_trade_ids(
+                    args.what_if_remove, trades_df, args.wallet
+                )
             except ValueError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
+                logger.error("Error parsing what_if", exc_info=True, extra={
+                    "wallet": args.wallet,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)
+                })
                 raise
 
             attributor = CounterfactualAttributor(scorer)
@@ -291,9 +328,13 @@ def _generate_report(args, result, shap_explanations, trades_df, feature_row, sc
 
             client = LedgerLensContractClient()
             tx_hash = client.anchor_report(report)
-            print(f"Anchored to Soroban: {tx_hash}", file=sys.stderr)
+            logger.info("Anchored to Soroban", extra={"tx_hash": tx_hash})
         except Exception as e:
-            print(f"Warning: on-chain anchoring failed: {e}", file=sys.stderr)
+            logger.warning("on-chain anchoring failed", exc_info=True, extra={
+                "wallet": args.wallet,
+                "error_type": type(e).__name__,
+                "error_message": str(e)
+            })
 
     # Determine output path and format
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -312,4 +353,4 @@ def _generate_report(args, result, shap_explanations, trades_df, feature_row, sc
         out_path = out_dir / f"{safe_wallet}_{ts}.pdf"
         report.to_pdf(str(out_path))
 
-    print(f"Forensic report written to: {out_path}", file=sys.stderr)
+    logger.info("Forensic report written", extra={"out_path": str(out_path)})

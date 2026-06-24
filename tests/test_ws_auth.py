@@ -15,6 +15,7 @@ def auth(tmp_path):
 # extract_permissions()
 # ---------------------------------------------------------------------------
 
+
 def test_extract_permissions_unrestricted_scope(auth):
     """scope = 'scores:read' returns unrestricted set ({scores:read:all})"""
     claims = {"scope": "scores:read"}
@@ -71,6 +72,7 @@ def test_is_permitted_channel_wallet_isolation(auth):
 # verify()
 # ---------------------------------------------------------------------------
 
+
 def test_verify_returns_none_for_empty_string(auth):
     """verify() returns None when token is an empty string"""
     assert auth.verify("") is None
@@ -96,6 +98,7 @@ def test_verify_returns_none_for_bad_segments(auth):
 # _has_scores_read_scope()
 # ---------------------------------------------------------------------------
 
+
 def test_has_scores_read_scope_returns_true():
     """_has_scores_read_scope returns True for valid scope strings"""
     assert JWTAuthenticator._has_scores_read_scope("scores:read") is True
@@ -113,6 +116,7 @@ def test_has_scores_read_scope_returns_false():
 # ---------------------------------------------------------------------------
 # is_permitted_channel()
 # ---------------------------------------------------------------------------
+
 
 def test_is_permitted_channel_empty_permissions():
     """is_permitted_channel returns False when permissions set is empty"""
@@ -141,6 +145,7 @@ def test_is_permitted_channel_no_match_returns_false():
 # ---------------------------------------------------------------------------
 # FileNotFoundError on missing public key
 # ---------------------------------------------------------------------------
+
 
 def test_load_public_key_raises_when_file_missing():
     """JWTAuthenticator raises FileNotFoundError if key file does not exist"""

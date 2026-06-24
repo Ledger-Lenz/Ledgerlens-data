@@ -11,8 +11,8 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-from config import Config
 import run_pipeline
+from config import Config
 
 
 def _run_dry_run(argv: list[str]) -> MagicMock:
@@ -41,10 +41,13 @@ def _run_dry_run(argv: list[str]) -> MagicMock:
         stack.enter_context(patch("sys.argv", ["run_pipeline.py", *argv]))
         stack.enter_context(
             patch.object(
-                run_pipeline,
-                "load_watched_pairs_to_dataframe",
-                return_value=trades,
+                Config,
+                "WATCHED_ASSET_PAIRS",
+                [("USDC", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")],
             )
+        )
+        stack.enter_context(
+            patch.object(run_pipeline, "load_pair_to_dataframe", return_value=trades)
         )
         stack.enter_context(
             patch.object(run_pipeline, "build_feature_matrix", return_value=feature_matrix)

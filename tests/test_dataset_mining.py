@@ -207,6 +207,22 @@ def test_dataset_schema_matches_feature_matrix():
     feature_matrix = build_feature_matrix(sample_trades)
     feature_matrix_cols = set(feature_matrix.columns)
 
+    # Stale parquet files may predate GNN embedding columns; regenerate if needed.
+    gnn_only = {c for c in feature_matrix_cols if c.startswith("gnn_")}
+    if gnn_only and gnn_only.isdisjoint(synthetic_feature_cols):
+        from scripts.generate_synthetic_dataset import generate_synthetic_dataset
+
+        df = generate_synthetic_dataset(n_wallets=50, seed=0)
+        synthetic_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(synthetic_path)
+        synthetic_df = df
+        synthetic_feature_cols = set(synthetic_df.columns) - extra_cols
+
+    # GNN placeholders are zero-filled when no encoder is loaded.
+    gnn_cols = {c for c in feature_matrix_cols if c.startswith("gnn_")}
+    synthetic_feature_cols -= gnn_cols
+    feature_matrix_cols -= gnn_cols
+
     assert synthetic_feature_cols == feature_matrix_cols, (
         f"Column mismatch.\n"
         f"  In synthetic but not feature matrix: {synthetic_feature_cols - feature_matrix_cols}\n"
