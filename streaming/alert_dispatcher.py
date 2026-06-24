@@ -121,7 +121,7 @@ class AlertDispatcher:
         payload = {**risk_score, "wallet": wallet, "pair_id": pair_id}
         for attempt in range(self._max_retries + 1):
             try:
-                resp = requests.post(self._webhook_url, json=payload, timeout=5)
+                resp = requests.post(self._webhook_url or "", json=payload, timeout=5)
                 resp.raise_for_status()
                 return
             except requests.HTTPError as exc:

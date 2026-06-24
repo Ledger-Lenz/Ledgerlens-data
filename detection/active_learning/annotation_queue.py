@@ -74,7 +74,8 @@ def _load_queue(path: str) -> list[dict]:
     if not os.path.exists(path):
         return []
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    return data if isinstance(data, list) else []
 
 
 # ---------------------------------------------------------------------------

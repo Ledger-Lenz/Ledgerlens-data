@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ class _GradientReversalFn(torch.autograd.Function):
 
 
 def gradient_reversal(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
-    return _GradientReversalFn.apply(x, lambda_)
+    return cast(torch.Tensor, _GradientReversalFn.apply(x, lambda_))
 
 
 class DANNEncoder(nn.Module):
@@ -55,7 +56,7 @@ class DANNEncoder(nn.Module):
         self.domain_classifier = nn.Linear(embedding_dim, 1)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.feature_extractor(x)
+        return cast(torch.Tensor, self.feature_extractor(x))
 
     def forward(
         self,
@@ -189,13 +190,16 @@ def train_dann_encoder(
     )
 
     baseline_model = DANNEncoder(x.shape[1], hidden_dim=hidden_dim, embedding_dim=embedding_dim)
-    baseline_model, _ = train_without_dp(
-        baseline_model,
-        train_loader,
-        _dann_loss,
-        epochs=epochs,
-        learning_rate=learning_rate,
-        device=device,
+    baseline_model = cast(
+        DANNEncoder,
+        train_without_dp(
+            baseline_model,
+            train_loader,
+            _dann_loss,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            device=device,
+        )[0],
     )
     baseline_auc = _auc_roc(baseline_model, test_loader, device)
 
@@ -213,17 +217,20 @@ def train_dann_encoder(
             learning_rate=learning_rate,
             device=device,
         )
-        dp_model = dp_result.model  # type: ignore[assignment]
+        dp_model = cast(DANNEncoder, dp_result.model)
         achieved_epsilon = dp_result.achieved_epsilon
         trained_model = dp_model
     else:
-        trained_model, _ = train_without_dp(
-            dp_model,
-            train_loader,
-            _dann_loss,
-            epochs=epochs,
-            learning_rate=learning_rate,
-            device=device,
+        trained_model = cast(
+            DANNEncoder,
+            train_without_dp(
+                dp_model,
+                train_loader,
+                _dann_loss,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                device=device,
+            )[0],
         )
 
     auc = _auc_roc(trained_model, test_loader, device)
@@ -247,7 +254,7 @@ def train_dann_encoder(
     )
 
     return DANNTrainingReport(
-        model=trained_model,  # type: ignore[arg-type]
+        model=trained_model,
         auc_roc=auc,
         baseline_auc_roc=baseline_auc,
         auc_roc_degradation=degradation,

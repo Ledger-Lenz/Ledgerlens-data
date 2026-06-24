@@ -37,7 +37,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import networkx as nx
 import numpy as np
@@ -51,7 +51,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Optional torch / torch_geometric imports — graceful absence supported
 # ---------------------------------------------------------------------------
-try:
+if TYPE_CHECKING:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -59,13 +59,22 @@ try:
     from torch_geometric.nn import SAGEConv
 
     _TORCH_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _TORCH_AVAILABLE = False
-    torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    F = None  # type: ignore[assignment]
-    Data = None  # type: ignore[assignment]
-    SAGEConv = None  # type: ignore[assignment]
+else:
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch_geometric.data import Data
+        from torch_geometric.nn import SAGEConv
+
+        _TORCH_AVAILABLE = True
+    except ImportError:  # pragma: no cover
+        _TORCH_AVAILABLE = False
+        torch = None
+        nn = None
+        F = None
+        Data = None
+        SAGEConv = None
 
 # ---------------------------------------------------------------------------
 # Node feature dimensionality
@@ -195,7 +204,7 @@ class GNNEncoder:
         # Cached full-graph embedding: wallet → np.ndarray
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._last_node_order: list[str] = []
-        self._model: Optional["_GraphSAGEModel"] = None  # type: ignore[name-defined]
+        self._model: Optional["_GraphSAGEModel"] = None
 
         if _TORCH_AVAILABLE:
             torch.manual_seed(random_state)
@@ -430,7 +439,7 @@ class GNNEncoder:
         if wallet not in node_idx:
             return np.zeros(self.embedding_dim, dtype=np.float32)
 
-        result = embeddings[node_idx[wallet]].copy()
+        result: np.ndarray = embeddings[node_idx[wallet]].copy()
 
         # Update the cache for all re-computed nodes
         for i, w in enumerate(node_order):

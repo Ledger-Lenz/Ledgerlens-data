@@ -12,6 +12,8 @@ Usage:
 """
 
 import argparse
+from typing import Any, cast
+
 import json
 import os
 import shutil
@@ -70,7 +72,7 @@ def load_model_metadata(model_dir: str) -> dict | None:
         logger.error("model_metadata.json not found in %s", model_dir)
         return None
     with open(path) as f:
-        return json.load(f)
+        return cast(dict[Any, Any], json.load(f))
 
 
 def load_metrics(model_dir: str) -> dict | None:
@@ -79,7 +81,7 @@ def load_metrics(model_dir: str) -> dict | None:
         logger.error("metrics.json not found in %s", model_dir)
         return None
     with open(path) as f:
-        return json.load(f)
+        return cast(dict[Any, Any], json.load(f))
 
 
 def archive_current_models(model_dir: str) -> str:

@@ -5,7 +5,7 @@ import pytest
 
 from detection.causal_attribution import CounterfactualAttributor
 from detection.feature_engineering import build_feature_vector
-from detection.forensic_report import ForensicReportGenerator
+from detection.causal_forensic_report import CausalForensicReportGenerator
 from detection.wallet_graph import build_funding_graph
 from ingestion.data_models import AccountActivity
 from scripts.score_wallet import _parse_remove_trade_ids
@@ -254,7 +254,7 @@ def test_forensic_report_generator_populates_causal_attribution():
     trades = _wallet_trades()
     activities, graph = _funding_graph()
     feature_row = pd.Series(build_feature_vector(WALLET_A, trades))
-    generator = ForensicReportGenerator(scorer=FakeScorer())
+    generator = CausalForensicReportGenerator(scorer=FakeScorer())
 
     report = generator.generate(
         WALLET_A,

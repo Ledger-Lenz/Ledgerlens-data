@@ -37,7 +37,7 @@ def meta_train(
     n_inner_steps: int = 5,
     inner_lr: float = 0.01,
     outer_lr: float = 0.001,
-    model_dir: str = None,
+    model_dir: str | None = None,
     use_dp: bool = False,
 ):
     model_dir = model_dir or config.MODEL_DIR
@@ -69,7 +69,7 @@ def meta_train(
     meta_optimizer = torch.optim.Adam(maml.parameters(), lr=outer_lr)
 
     for epoch in range(n_epochs):
-        epoch_loss = 0
+        epoch_loss = 0.0
         tasks = generate_tasks(n_tasks_per_epoch)
 
         meta_optimizer.zero_grad()

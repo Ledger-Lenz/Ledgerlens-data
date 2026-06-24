@@ -58,7 +58,7 @@ def _generate_feature_level(n_wallets: int, seed: int, wash_offset: float = 0.0,
     rows = []
     for i in range(n_wallets):
         is_wash = i >= n_legit
-        row = {"wallet": f"GSYNTH{i:06d}"}
+        row: dict[str, object] = {"wallet": f"GSYNTH{i:06d}"}
 
         for hours in config.BENFORD_WINDOWS_HOURS:
             if is_wash:
@@ -139,10 +139,12 @@ def _generate_from_simulator(
     """Generate a feature matrix via the Wash Trade Simulation Engine."""
     from scripts.wash_trade_simulator import (
         AdaptiveAttacker,
+        BaseAttackerProfile,
         create_profile,
         trades_to_feature_matrix,
     )
 
+    attacker: BaseAttackerProfile
     if profile == "AdaptiveAttacker" and model_path:
         attacker = AdaptiveAttacker(
             n_wallets=n_wallets,

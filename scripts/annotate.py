@@ -90,7 +90,7 @@ def run_annotation_loop(
         elif answer == "s":
             queue.skip(wallet)
             print(f"  Skipped {wallet}")
-        else:
+        elif answer in ("w", "c"):
             label = _label_map_get(answer)
             notes = input("  Notes (optional): ").strip()
             queue.annotate(wallet, label=label, annotator_id=annotator_id, notes=notes)
@@ -106,7 +106,8 @@ def _load_all(path: str) -> list[dict]:
     if not os.path.exists(path):
         return []
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    return data if isinstance(data, list) else []
 
 
 def _label_map_get(answer: str) -> int:

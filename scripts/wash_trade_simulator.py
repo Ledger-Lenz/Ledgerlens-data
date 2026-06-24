@@ -407,7 +407,7 @@ class AdaptiveAttacker(BaseAttackerProfile):
         rows = []
 
         top_features = (
-            sorted(importances, key=importances.get, reverse=True)[: self.top_k]
+            sorted(importances, key=lambda k: importances[k], reverse=True)[: self.top_k]
             if importances
             else []
         )
@@ -427,7 +427,7 @@ class AdaptiveAttacker(BaseAttackerProfile):
                 elif uses_concentration:
                     amount = float(rng.uniform(amount * 0.5, amount * 1.5))
 
-                interval = self.interval_seconds
+                interval: float = float(self.interval_seconds)
                 if uses_timing:
                     interval = float(rng.uniform(interval * 0.5, interval * 2.0))
 

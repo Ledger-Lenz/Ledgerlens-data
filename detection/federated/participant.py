@@ -62,7 +62,8 @@ class FederatedParticipant:
 
     def compute_delta(self, global_weights: np.ndarray) -> np.ndarray:
         """Weight delta = local weights - global weights."""
-        return self._get_weights() - global_weights
+        delta: np.ndarray = self._get_weights() - global_weights
+        return delta
 
     # ------------------------------------------------------------------ #
     # Protocol                                                            #

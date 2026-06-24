@@ -3,10 +3,11 @@ import hmac
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
-def load_queue(path: Path, secret: str) -> list:
+def load_queue(path: Path, secret: str) -> list[Any]:
     """
     Loads and validates the annotation queue JSON file.
     
@@ -27,7 +28,8 @@ def load_queue(path: Path, secret: str) -> list:
             f"ANNOTATION_HMAC_SECRET is empty. Skipping signature verification for {path}. "
             "This is insecure and should only be used in local development."
         )
-        return data.get('annotations', [])
+        annotations = data.get("annotations", [])
+        return annotations if isinstance(annotations, list) else []
         
     # Serialize with sort_keys=True for deterministic signature matching
     serialized_data = json.dumps(data, sort_keys=True).encode('utf-8')
@@ -40,14 +42,15 @@ def load_queue(path: Path, secret: str) -> list:
     if not hmac.compare_digest(expected_mac or '', computed_mac):
         raise ValueError(f"Annotation queue HMAC mismatch: {path}")
         
-    return data.get('annotations', [])
+    annotations = data.get("annotations", [])
+    return annotations if isinstance(annotations, list) else []
 
 
 def save_queue(path: Path, annotations: list, secret: str) -> None:
     """
     Saves the annotation queue to a JSON file and appends a valid HMAC-SHA256.
     """
-    payload = {"annotations": annotations}
+    payload: dict[str, Any] = {"annotations": annotations}
     
     if not secret:
         logger.warning(f"Saving queue without HMAC signature to {path} (Secret is empty).")

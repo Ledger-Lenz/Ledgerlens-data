@@ -1,9 +1,12 @@
-.PHONY: install lint format test run
+.PHONY: install lint format test run typecheck
 
 install:
 	pip install -r requirements.txt
 
-lint:
+typecheck:
+	python -m mypy detection/ streaming/ scripts/ --ignore-missing-imports --strict-optional
+
+lint: typecheck
 	ruff check .
 	black --check .
 

@@ -93,7 +93,7 @@ class HorizonKafkaProducer:
 
     def flush(self, timeout: float = 10.0) -> int:
         """Block until all queued messages are delivered; returns # still in queue."""
-        return self._producer.flush(timeout)
+        return int(self._producer.flush(timeout))
 
     # ------------------------------------------------------------------
     # Internal

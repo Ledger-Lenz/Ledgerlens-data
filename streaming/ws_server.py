@@ -18,7 +18,7 @@ import re
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Literal
 
 import websockets
 from prometheus_client import Counter, Gauge
@@ -39,7 +39,7 @@ logger = get_logger(__name__)
 class ScoreUpdateMessage(BaseModel):
     """Message schema for score updates."""
 
-    type: str = Field(default="score_update", const=True)
+    type: Literal["score_update"] = "score_update"
     seq: int
     channel: str
     wallet: str
@@ -55,21 +55,21 @@ class ScoreUpdateMessage(BaseModel):
 class SubscribeMessage(BaseModel):
     """Client message to subscribe to channels."""
 
-    type: str = Field(default="subscribe", const=True)
+    type: Literal["subscribe"] = "subscribe"
     channels: list[str]
 
 
 class UnsubscribeMessage(BaseModel):
     """Client message to unsubscribe from channels."""
 
-    type: str = Field(default="unsubscribe", const=True)
+    type: Literal["unsubscribe"] = "unsubscribe"
     channels: list[str]
 
 
 class ReplayMessage(BaseModel):
     """Client message to request message replay."""
 
-    type: str = Field(default="replay", const=True)
+    type: Literal["replay"] = "replay"
     channel: str
     since_seq: int
 
@@ -77,7 +77,7 @@ class ReplayMessage(BaseModel):
 class ErrorMessage(BaseModel):
     """Server error message."""
 
-    type: str = Field(default="error", const=True)
+    type: Literal["error"] = "error"
     code: str
     message: str = ""
     retry_after_ms: int | None = None
@@ -86,7 +86,7 @@ class ErrorMessage(BaseModel):
 class DroppedMessage(BaseModel):
     """Notification of dropped messages due to backpressure."""
 
-    type: str = Field(default="dropped", const=True)
+    type: Literal["dropped"] = "dropped"
     count: int
 
 
@@ -143,8 +143,8 @@ class TokenBucket:
 class SequenceCounter:
     """Thread-safe monotonically increasing sequence numbers."""
 
-    def __init__(self):
-        self._seq = 0
+    def __init__(self) -> None:
+        self._seq: int = 0
         self._lock = threading.Lock()
 
     def next(self) -> int:
@@ -333,7 +333,9 @@ async def _handler(websocket) -> None:
         # 3. REGISTER CLIENT: Create queue and rate limiter
         # ─────────────────────────────────────────────────────────────────
 
-        client_queue = asyncio.Queue(maxlen=config.WS_CLIENT_QUEUE_DEPTH)
+        client_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=config.WS_CLIENT_QUEUE_DEPTH
+        )
         rate_limiter = TokenBucket(config.WS_RATE_LIMIT_MSGS_PER_SECOND)
 
         with _clients_lock:
@@ -405,7 +407,7 @@ async def _extract_token(websocket) -> str | None:
     # Try Authorization header
     auth_header = websocket.request_headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        return auth_header[7:]
+        return str(auth_header[7:])
 
     # Try query parameter
     if websocket.request_headers.get("Path"):

@@ -73,7 +73,7 @@ def deploy_contract(
         signer=keypair,
         salt=salt.encode() if salt else None,
     )
-    return client.contract_id
+    return str(client.contract_id)
 
 
 def write_env_file(contract_id: str, submitter_secret: str, path: str = ".env.testnet") -> None:

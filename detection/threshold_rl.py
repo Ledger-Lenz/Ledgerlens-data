@@ -165,11 +165,11 @@ class ThresholdAgent:
 
     @property
     def q_values(self) -> list[float]:
-        return self._q.tolist()
+        return [float(v) for v in self._q.tolist()]
 
     @property
     def counts(self) -> list[int]:
-        return self._counts.tolist()
+        return [int(v) for v in self._counts.tolist()]
 
 
 def _get_pinned() -> int | None:

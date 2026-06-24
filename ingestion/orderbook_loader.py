@@ -14,7 +14,7 @@ them to `OrderBookEvent` records, which `feature_engineering.py` uses to
 compute `order_cancellation_rate`.
 """
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pandas as pd
 from stellar_sdk import Server
@@ -109,7 +109,7 @@ def load_orderbook_events(account_id: str, limit_per_page: int = 200) -> Iterato
         call_builder = call_builder.cursor(records[-1]["paging_token"])
 
 
-def orderbook_events_to_dataframe(events: Iterator[OrderBookEvent]) -> pd.DataFrame:
+def orderbook_events_to_dataframe(events: Iterable[OrderBookEvent]) -> pd.DataFrame:
     """Flatten `OrderBookEvent` records into a DataFrame keyed by `account`."""
     rows = []
     for e in events:

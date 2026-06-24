@@ -1,6 +1,6 @@
 """Bulk historical trade ingestion via Horizon's paginated trades endpoint."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 
 import pandas as pd
@@ -56,7 +56,7 @@ def load_trades(
         call_builder = call_builder.cursor(records[-1]["paging_token"])
 
 
-def trades_to_dataframe(trades: Iterator[Trade]) -> pd.DataFrame:
+def trades_to_dataframe(trades: Iterable[Trade]) -> pd.DataFrame:
     """Flatten an iterable of `Trade` objects into a DataFrame for feature
     engineering and the Benford engine."""
     rows = []

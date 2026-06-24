@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from datetime import UTC, datetime
 
 import joblib
@@ -103,11 +104,6 @@ LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
 )
 
 
-LABEL_DISTRIBUTION_BASELINE_PATH = os.path.join(
-    config.MODEL_DIR, "label_distribution_baseline.json"
-)
-
-
 def load_training_data(path: str) -> pd.DataFrame:
     """Load a labelled feature matrix (output of `build_feature_matrix` plus
     a `label` column: 1 = wash trading, 0 = legitimate)."""
@@ -154,7 +150,7 @@ def detect_label_poisoning(
         baseline = json.load(f)
 
     baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
-    return abs(current_ratio - baseline_ratio) > threshold
+    return bool(abs(current_ratio - baseline_ratio) > threshold)
 
 
 def _adversarial_augment(
@@ -191,47 +187,7 @@ def train_models(
     aug_ratio: float | None = None,
 ) -> dict:
     """Train all models in `MODEL_REGISTRY` and return fitted estimators
-    plus evaluation metrics and split info.
-
-    Returns:
-        {
-          "results": {
-            "random_forest": {"model": ..., "metrics": {...}},
-            ...
-          },
-          "feature_columns": [...],
-          "feature_distributions": {...},
-          "n_train": int,
-          "n_test": int,
-        }
-
-    If ``adversarial_augmentation`` is True, ``auc_roc_adversarial`` is also
-    included in each model's metrics dict.
-    """
-    baseline_path = baseline_path or LABEL_DISTRIBUTION_BASELINE_PATH
-    threshold = threshold if threshold is not None else config.POISON_LABEL_RATIO_THRESHOLD
-
-    total = sum(label_distribution.values())
-    if total == 0:
-        return False
-    current_ratio = label_distribution.get(1, 0) / total
-
-    if not os.path.exists(baseline_path):
-        os.makedirs(os.path.dirname(baseline_path), exist_ok=True)
-        with open(baseline_path, "w") as f:
-            json.dump({"wash_trade_ratio": current_ratio}, f)
-        return False
-
-    with open(baseline_path) as f:
-        baseline = json.load(f)
-
-    baseline_ratio = baseline.get("wash_trade_ratio", current_ratio)
-    return abs(current_ratio - baseline_ratio) > threshold
-
-
-def train_models(df: pd.DataFrame, test_size: float = 0.2, random_state: int = 42) -> dict:
-    """Train all models in `MODEL_REGISTRY` and return fitted estimators
-    plus evaluation metrics."""
+    plus evaluation metrics and split info."""
     X, y = split_features_labels(df)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
@@ -306,6 +262,34 @@ def save_metrics_report(
     os.makedirs(model_dir, exist_ok=True)
     path = os.path.join(model_dir, "metrics.json")
 
+    payload: dict = {name: result["metrics"] for name, result in results.items()}
+
+    for name in results:
+        artifact_path = os.path.join(model_dir, f"{name}.joblib")
+        if os.path.exists(artifact_path):
+            sha = hashlib.sha256()
+            with open(artifact_path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha.update(chunk)
+            payload[name]["artifact_sha256"] = sha.hexdigest()
+
+    if extra:
+        payload.update(extra)
+
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
+def save_training_artifacts(
+    training_output: dict,
+    data_path: str,
+    model_dir: str | None = None,
+) -> None:
+    """Write metrics.json and model_metadata.json to the model directory."""
+    model_dir = model_dir or config.MODEL_DIR
+    os.makedirs(model_dir, exist_ok=True)
+
     results = training_output["results"]
     feature_columns = training_output["feature_columns"]
     feature_distributions = training_output.get("feature_distributions")
@@ -327,51 +311,9 @@ def save_metrics_report(
         "feature_distributions": feature_distributions,
     }
 
-    # Embed artifact SHA-256 for each saved model
-    for name in results:
-        artifact_path = os.path.join(model_dir, f"{name}.joblib")
-        if os.path.exists(artifact_path):
-            sha = hashlib.sha256()
-            with open(artifact_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha.update(chunk)
-            payload[name]["artifact_sha256"] = sha.hexdigest()
-
-    if extra:
-        payload.update(extra)
-
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    return path
-
-
-def save_metrics_report(
-    results: dict,
-    model_dir: str | None = None,
-    extra: dict | None = None,
-) -> str:
-    """Write metrics (plus optional *extra* provenance fields) to metrics.json."""
-    model_dir = model_dir or config.MODEL_DIR
-    os.makedirs(model_dir, exist_ok=True)
-    path = os.path.join(model_dir, "metrics.json")
-
-    payload: dict = {name: result["metrics"] for name, result in results.items()}
-
-    for name in results:
-        artifact_path = os.path.join(model_dir, f"{name}.joblib")
-        if os.path.exists(artifact_path):
-            sha = hashlib.sha256()
-            with open(artifact_path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    sha.update(chunk)
-            payload[name]["artifact_sha256"] = sha.hexdigest()
-
-    if extra:
-        payload.update(extra)
-
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-    return path
+    metadata_path = os.path.join(model_dir, "model_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
 
 
 def parse_args() -> argparse.Namespace:

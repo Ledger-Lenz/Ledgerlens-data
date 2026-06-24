@@ -86,7 +86,7 @@ def _bucket_to_amount(bucket: int) -> float:
 def _hash64(value: bytes) -> int:
     """Deterministic 64-bit integer hash of *value* via MD5."""
     digest = hashlib.md5(value, usedforsecurity=False).digest()
-    return struct.unpack_from("<Q", digest)[0]
+    return int(struct.unpack_from("<Q", digest)[0])
 
 
 def _rho(w: int, max_bits: int) -> int:

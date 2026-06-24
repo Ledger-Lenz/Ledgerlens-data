@@ -9,6 +9,8 @@ from collections.abc import Generator
 from datetime import datetime
 
 import pandas as pd
+from typing import Any, cast
+
 import requests
 from stellar_sdk import Server
 
@@ -65,7 +67,7 @@ def _fetch_page(session: requests.Session, url: str, params: dict) -> dict:
     if resp.status_code == 404:
         raise PoolNotFoundError(f"Liquidity pool not found: {url}")
     resp.raise_for_status()
-    return resp.json()
+    return cast(dict[Any, Any], resp.json())
 
 
 def load_amm_pool_trades(
