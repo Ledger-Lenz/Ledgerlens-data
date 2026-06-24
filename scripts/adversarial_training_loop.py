@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import tempfile
 from datetime import UTC, datetime
 
@@ -25,16 +24,12 @@ import pandas as pd
 
 from config import config
 from detection.model_training import (
-    FEATURE_COLUMNS_EXCLUDE,
     MODEL_REGISTRY,
-    load_training_data,
     save_models,
-    split_features_labels,
     train_models,
 )
 from scripts.wash_trade_simulator import (
     AdaptiveAttacker,
-    NaiveAttacker,
     trades_to_feature_matrix,
 )
 
@@ -57,7 +52,7 @@ def compute_feature_importances(model_dir: str) -> dict[str, float]:
             if hasattr(model, "feature_importances_") and hasattr(model, "feature_names_in_"):
                 names = model.feature_names_in_
                 vals = model.feature_importances_
-                all_importances.append(dict(zip(names, vals)))
+                all_importances.append(dict(zip(names, vals, strict=False)))
         except Exception:
             continue
 
@@ -123,6 +118,16 @@ def generate_dataset_from_profile(
     if "profile" not in df.columns:
         df["profile"] = profile_name
 
+    if df["label"].nunique() < 2:
+        from scripts.generate_synthetic_dataset import _generate_feature_level
+
+        legit = _generate_feature_level(
+            n_wallets=max((n_wallets or config.SIMULATOR_N_WALLETS) * 2, 20),
+            seed=seed,
+        )
+        legit = legit[legit["label"] == 0]
+        df = pd.concat([legit, df], ignore_index=True)
+
     return df
 
 
@@ -186,7 +191,9 @@ def run_adversarial_loop(
 
         round_metrics.append(round_data)
 
-        print(f"  Metrics: { {k: round(round_data[k], 4) for k in round_data if k in ['random_forest_auc_roc', 'xgboost_auc_roc', 'lightgbm_auc_roc']} }")
+        print(
+            f"  Metrics: { {k: round(round_data[k], 4) for k in round_data if k in ['random_forest_auc_roc', 'xgboost_auc_roc', 'lightgbm_auc_roc']} }"
+        )
 
         if round_idx > 0:
             prev_auc = round_metrics[round_idx - 1].get("random_forest_auc_roc", 0.0)
@@ -194,7 +201,9 @@ def run_adversarial_loop(
             improvement = curr_auc - prev_auc
             print(f"  AUC-ROC improvement: {improvement:.4f}")
             if 0 < improvement < plateau_threshold:
-                print(f"  Plateau detected (improvement {improvement:.4f} < {plateau_threshold}). Stopping.")
+                print(
+                    f"  Plateau detected (improvement {improvement:.4f} < {plateau_threshold}). Stopping."
+                )
                 break
 
     result = {
@@ -202,7 +211,9 @@ def run_adversarial_loop(
         "gan_rounds": len(round_metrics),
         "plateau_threshold": plateau_threshold,
         "rounds": round_metrics,
-        "final_auc_roc": round_metrics[-1].get("random_forest_auc_roc", 0.0) if round_metrics else 0.0,
+        "final_auc_roc": (
+            round_metrics[-1].get("random_forest_auc_roc", 0.0) if round_metrics else 0.0
+        ),
         "monotonic_non_decreasing": all(
             round_metrics[i].get("random_forest_auc_roc", 0.0)
             >= round_metrics[i - 1].get("random_forest_auc_roc", 0.0)

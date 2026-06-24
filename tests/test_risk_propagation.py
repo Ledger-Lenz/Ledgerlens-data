@@ -17,7 +17,9 @@ from __future__ import annotations
 import time
 
 import networkx as nx
+import numpy as np
 import pytest
+from scipy.sparse import csr_matrix
 
 from detection.risk_propagation import (
     _build_combined_graph,
@@ -25,9 +27,6 @@ from detection.risk_propagation import (
     propagate_risk_scores,
     propagation_attribution,
 )
-from scipy.sparse import csr_matrix
-import numpy as np
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,9 +71,9 @@ class TestThreeNodePropagation:
         assert scores["A"] > 0.0, "seed node A must have non-zero propagated score"
         assert scores["B"] > 0.0, "direct successor B must inherit risk from A"
         assert scores["C"] > 0.0, "two-hop successor C must inherit some risk from A"
-        assert scores["B"] > scores["C"], (
-            "B is one hop from A, C is two hops — B should score higher"
-        )
+        assert (
+            scores["B"] > scores["C"]
+        ), "B is one hop from A, C is two hops — B should score higher"
 
     def test_ring_all_nodes_receive_propagated_risk(self):
         """A → B → C → A: all three nodes should receive risk when only A is seeded."""
@@ -267,7 +266,9 @@ class TestPersonalisedPageRank:
         A_norm = adj / row_sums
         A_csr = csr_matrix(A_norm)
 
-        ppr = _personalised_pagerank(A_csr, seed_idx=0, alpha=0.15, max_iterations=50, convergence_tol=1e-9)
+        ppr = _personalised_pagerank(
+            A_csr, seed_idx=0, alpha=0.15, max_iterations=50, convergence_tol=1e-9
+        )
 
         assert ppr.sum() == pytest.approx(1.0, abs=1e-5)
 
@@ -285,9 +286,12 @@ class TestPersonalisedPageRank:
         row_sums = np.asarray(adj_raw.sum(axis=1)).ravel()
         row_sums[row_sums == 0] = 1.0
         from scipy.sparse import diags
+
         A_csr = (diags(1.0 / row_sums) @ adj_raw).tocsr()
 
-        ppr = _personalised_pagerank(A_csr, seed_idx=0, alpha=0.85, max_iterations=50, convergence_tol=1e-9)
+        ppr = _personalised_pagerank(
+            A_csr, seed_idx=0, alpha=0.85, max_iterations=50, convergence_tol=1e-9
+        )
 
         assert ppr[0] == max(ppr), "seed node should have highest PPR mass with high teleport prob"
 

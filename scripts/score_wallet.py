@@ -139,7 +139,7 @@ def main() -> None:
         sys.exit(1)
 
     override_val = scorer.list_override.check(args.wallet)
-    if override_val is not None:
+    if override_val in (0, 100):
         result = {
             "score": override_val,
             "benford_flag": False,
@@ -189,7 +189,9 @@ def main() -> None:
         causal_result = None
         if args.what_if_remove or args.causal:
             try:
-                remove_trade_ids = _parse_remove_trade_ids(args.what_if_remove, trades_df, args.wallet)
+                remove_trade_ids = _parse_remove_trade_ids(
+                    args.what_if_remove, trades_df, args.wallet
+                )
             except ValueError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 raise

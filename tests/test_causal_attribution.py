@@ -257,10 +257,10 @@ def test_forensic_report_generator_populates_causal_attribution():
     generator = ForensicReportGenerator(scorer=FakeScorer())
 
     report = generator.generate(
-        WALLET_A,
-        "USDC:issuer/XLM:native",
-        feature_row,
-        trades,
+        wallet=WALLET_A,
+        asset_pair="USDC:issuer/XLM:native",
+        feature_row=feature_row,
+        wallet_trades=trades,
         activity=activities[1],
         funding_graph=graph,
         causal=True,

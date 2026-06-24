@@ -57,7 +57,9 @@ class ZKAttestor:
             records.append(normalized)
 
         records.sort(
-            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            key=lambda row: json.dumps(
+                row, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
         )
         return records
 

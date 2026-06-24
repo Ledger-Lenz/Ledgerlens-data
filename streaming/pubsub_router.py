@@ -82,7 +82,9 @@ class PubSubRouter:
                 if not self._channel_subscribers[channel]:
                     del self._channel_subscribers[channel]
             del self._subscriptions[client_id]
-            logger.debug("Client %s disconnected (was subscribed to %d channel(s))", client_id, len(channels))
+            logger.debug(
+                "Client %s disconnected (was subscribed to %d channel(s))", client_id, len(channels)
+            )
 
     def get_subscribers(self, channel: str) -> set[str]:
         """Get set of client IDs subscribed to a channel.
@@ -153,7 +155,6 @@ class PubSubRouter:
                     client_id: len(channels) for client_id, channels in self._subscriptions.items()
                 },
                 "subscribers_per_channel": {
-                    channel: len(clients)
-                    for channel, clients in self._channel_subscribers.items()
+                    channel: len(clients) for channel, clients in self._channel_subscribers.items()
                 },
             }

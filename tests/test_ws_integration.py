@@ -15,11 +15,9 @@ Test Cases:
 
 import asyncio
 import json
-import tempfile
 import threading
 import time
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import websockets
@@ -28,8 +26,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
 
-from streaming.ws_server import run_ws_server, publish_score_update, _loop, _router
-
+from streaming.ws_server import publish_score_update, run_ws_server
 
 # ─────────────────────────────────────────────────────────────────────────
 # Test Key Pair Generation (In-Memory)
@@ -44,24 +41,21 @@ def generate_test_keypair() -> tuple[str, str]:
     """
     # Generate RSA key pair
     private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
+        public_exponent=65537, key_size=2048, backend=default_backend()
     )
 
     # Export private key
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode('utf-8')
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
 
     # Export public key
     public_key = private_key.public_key()
     public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode('utf-8')
+        encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo
+    ).decode("utf-8")
 
     return private_pem, public_pem
 
@@ -71,7 +65,7 @@ def create_test_jwt(
     client_id: str = "test-client",
     scope: str = "scores:read:all",
     issuer: str = "ledgerlens-api",
-    expires_in_seconds: int = 3600
+    expires_in_seconds: int = 3600,
 ) -> str:
     """Create a test JWT token.
 
@@ -85,13 +79,13 @@ def create_test_jwt(
     Returns:
         JWT token string
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     claims = {
         "sub": client_id,
         "iss": issuer,
         "scope": scope,
         "iat": now,
-        "exp": now + timedelta(seconds=expires_in_seconds)
+        "exp": now + timedelta(seconds=expires_in_seconds),
     }
     return jwt.encode(claims, private_key, algorithm="RS256")
 
@@ -123,17 +117,20 @@ def ws_server(test_keypair, tmp_path_factory):
 
     # Monkey-patch config to use test key
     from config import config
+
     original_key_path = config.JWT_PUBLIC_KEY_PATH
     config.JWT_PUBLIC_KEY_PATH = str(public_key_path)
 
     # Reload authenticator with test key
     from streaming import ws_auth, ws_server
+
     ws_server._auth = ws_auth.JWTAuthenticator(str(public_key_path))
 
     # Find a free port by binding to port 0
     import socket
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 0))
+    sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
 
@@ -259,10 +256,7 @@ async def test_subscribe_to_wallet_channel_successfully(ws_server):
 
     async with websockets.connect(uri, extra_headers=headers) as websocket:
         # Send subscribe message
-        subscribe_msg = {
-            "type": "subscribe",
-            "channels": [channel]
-        }
+        subscribe_msg = {"type": "subscribe", "channels": [channel]}
         await websocket.send(json.dumps(subscribe_msg))
 
         # Wait a bit for subscription to be processed
@@ -270,6 +264,7 @@ async def test_subscribe_to_wallet_channel_successfully(ws_server):
 
         # Publish a score update to that channel
         from streaming import ws_server as ws_module
+
         if ws_module._loop and ws_module._loop.is_running():
             score_event = {
                 "wallet": wallet_id,
@@ -279,12 +274,9 @@ async def test_subscribe_to_wallet_channel_successfully(ws_server):
                 "score_upper": 80,
                 "bft_divergence": False,
                 "top_features": [],
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(UTC).isoformat(),
             }
-            asyncio.run_coroutine_threadsafe(
-                publish_score_update(score_event),
-                ws_module._loop
-            )
+            asyncio.run_coroutine_threadsafe(publish_score_update(score_event), ws_module._loop)
 
         # Receive the published message
         try:
@@ -293,7 +285,7 @@ async def test_subscribe_to_wallet_channel_successfully(ws_server):
             assert message["type"] == "score_update"
             assert message["channel"] == channel
             assert message["wallet"] == wallet_id
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("Did not receive score update message")
 
 
@@ -304,9 +296,7 @@ async def test_wallet_scoped_jwt_rejected_for_all_channel(ws_server):
     # Create token scoped to a specific wallet
     wallet_id = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
     token = create_test_jwt(
-        private_key,
-        client_id="wallet-scoped-client",
-        scope=f"scores:read:wallet/{wallet_id}"
+        private_key, client_id="wallet-scoped-client", scope=f"scores:read:wallet/{wallet_id}"
     )
 
     uri = f"ws://127.0.0.1:{port}"
@@ -314,10 +304,7 @@ async def test_wallet_scoped_jwt_rejected_for_all_channel(ws_server):
 
     async with websockets.connect(uri, extra_headers=headers) as websocket:
         # Try to subscribe to 'all' channel (should be rejected)
-        subscribe_msg = {
-            "type": "subscribe",
-            "channels": ["all"]
-        }
+        subscribe_msg = {"type": "subscribe", "channels": ["all"]}
         await websocket.send(json.dumps(subscribe_msg))
 
         # Should receive an error message
@@ -327,7 +314,7 @@ async def test_wallet_scoped_jwt_rejected_for_all_channel(ws_server):
             assert message["type"] == "error"
             assert message["code"] == "forbidden"
             assert "all" in message["message"]
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("Did not receive forbidden error message")
 
 
@@ -345,16 +332,14 @@ async def test_rate_limit_error_after_threshold(ws_server):
 
     # Temporarily reduce rate limit for testing
     from streaming import ws_server as ws_module
+
     original_rate_limit = ws_module.config.WS_RATE_LIMIT_MSGS_PER_SECOND
     ws_module.config.WS_RATE_LIMIT_MSGS_PER_SECOND = 5  # 5 messages per second
 
     try:
         async with websockets.connect(uri, extra_headers=headers) as websocket:
             # Subscribe to channel
-            subscribe_msg = {
-                "type": "subscribe",
-                "channels": [channel]
-            }
+            subscribe_msg = {"type": "subscribe", "channels": [channel]}
             await websocket.send(json.dumps(subscribe_msg))
             await asyncio.sleep(0.2)
 
@@ -369,11 +354,10 @@ async def test_rate_limit_error_after_threshold(ws_server):
                         "score_upper": 55 + i,
                         "bft_divergence": False,
                         "top_features": [],
-                        "timestamp": datetime.now(timezone.utc).isoformat()
+                        "timestamp": datetime.now(UTC).isoformat(),
                     }
                     asyncio.run_coroutine_threadsafe(
-                        publish_score_update(score_event),
-                        ws_module._loop
+                        publish_score_update(score_event), ws_module._loop
                     )
 
             # Receive messages and look for rate_limit error
@@ -388,7 +372,7 @@ async def test_rate_limit_error_after_threshold(ws_server):
                         assert isinstance(message["retry_after_ms"], int)
                         assert message["retry_after_ms"] > 0
                         break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
 
             assert rate_limit_error_found, "Rate limit error was not received"
@@ -427,10 +411,7 @@ async def test_invalid_channel_format_rejected(ws_server):
 
     async with websockets.connect(uri, extra_headers=headers) as websocket:
         # Try to subscribe to invalid channel
-        subscribe_msg = {
-            "type": "subscribe",
-            "channels": ["invalid-channel-format"]
-        }
+        subscribe_msg = {"type": "subscribe", "channels": ["invalid-channel-format"]}
         await websocket.send(json.dumps(subscribe_msg))
 
         # Should receive an error message
@@ -439,5 +420,5 @@ async def test_invalid_channel_format_rejected(ws_server):
             message = json.loads(message_str)
             assert message["type"] == "error"
             assert message["code"] == "invalid_channel"
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pytest.fail("Did not receive invalid_channel error message")

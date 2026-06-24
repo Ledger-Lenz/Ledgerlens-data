@@ -33,7 +33,6 @@ from detection.wallet_graph import build_funding_graph
 from ingestion.account_activity_loader import load_accounts_activity
 from ingestion.historical_loader import (
     load_pair_to_dataframe,
-    load_watched_pairs_to_dataframe,
 )
 from ingestion.orderbook_loader import load_accounts_orderbook_events
 from utils.logging import get_logger

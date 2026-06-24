@@ -17,15 +17,16 @@ import os
 import statistics
 
 import joblib
+import numpy as np
 import pandas as pd
 
 from config import config
+from detection.list_override import ListOverride
 from detection.model_training import (
     FEATURE_COLUMNS_EXCLUDE,
     MODEL_REGISTRY,
     compute_feature_schema_hash,
 )
-from detection.list_override import ListOverride
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -109,6 +110,7 @@ class RiskScorer:
         self.metadata = self._load_metadata()
         self.models = self._load_models()
         from detection.meta_learner import LeafEmbeddingExtractor
+
         self.extractor = LeafEmbeddingExtractor(self.models)
         self.maml_adapter, self.proto_classifier = self._load_meta_learners()
 
@@ -123,8 +125,12 @@ class RiskScorer:
 
         if os.path.exists(maml_path) and self.models:
             try:
-                from detection.meta_learner import LeafEmbeddingExtractor, MAMLAdapter, PrototypicalClassifier
                 import torch
+
+                from detection.meta_learner import (
+                    MAMLAdapter,
+                    PrototypicalClassifier,
+                )
 
                 # We need to know input_dim. It depends on the leaf indices from base models.
                 # Use metadata if we have it or a dummy row
@@ -143,8 +149,17 @@ class RiskScorer:
                     # Prototypical classifier
                     proto_path = os.path.join(self.model_dir, "prototypes.joblib")
                     if os.path.exists(proto_path):
+                        from detection.persistence import ModelArtifact, ModelIntegrityError
+
                         proto = PrototypicalClassifier()
                         proto.prototypes = joblib.load(proto_path)
+                        try:
+                            ModelArtifact(self.model_dir).verify_chain("prototypes")
+                        except ModelIntegrityError as exc:
+                            logger.warning(
+                                "Artifact integrity check skipped or failed for prototypes: %s",
+                                exc,
+                            )
             except Exception as e:
                 logger.warning("Failed to load meta-learners: %s", e)
 
@@ -191,7 +206,7 @@ class RiskScorer:
             wallet = feature_row.get("wallet")
             if wallet is not None:
                 override_val = self.list_override.check(wallet)
-                if override_val is not None:
+                if override_val in (0, 100):
                     return {
                         "score": override_val,
                         "benford_flag": False,
@@ -234,6 +249,7 @@ class RiskScorer:
         if self.maml_adapter:
             try:
                 import torch
+
                 emb = torch.from_numpy(self.extractor.transform(X)).float()
                 maml_prob = self.maml_adapter.predict_proba(emb)[0]
                 probs.append(float(maml_prob))
@@ -313,9 +329,7 @@ def _score_one(wallet: str) -> dict:
     """
     import requests
 
-    resp = requests.get(
-        f"https://horizon.stellar.org/accounts/{wallet}", timeout=10
-    )
+    resp = requests.get(f"https://horizon.stellar.org/accounts/{wallet}", timeout=10)
     resp.raise_for_status()
     data = resp.json()
 

@@ -3,7 +3,7 @@
 import json
 import os
 import time
-from typing import Optional, Set
+
 from config import config
 from utils.logging import get_logger
 
@@ -20,8 +20,8 @@ class ListOverride:
     ):
         self.allowlist_path = allowlist_path
         self.denylist_path = denylist_path
-        self._allowlist: Set[str] = set()
-        self._denylist: Set[str] = set()
+        self._allowlist: set[str] = set()
+        self._denylist: set[str] = set()
         self._last_loaded: float = 0.0
         self._reload()
 
@@ -30,7 +30,7 @@ class ListOverride:
         # Allowlist
         if os.path.exists(self.allowlist_path):
             try:
-                with open(self.allowlist_path, "r") as f:
+                with open(self.allowlist_path) as f:
                     data = json.load(f)
                     if isinstance(data, list):
                         self._allowlist = set(data)
@@ -41,9 +41,7 @@ class ListOverride:
                         )
                         self._allowlist = set()
             except Exception as e:
-                logger.warning(
-                    "Failed to load allowlist from %s: %s", self.allowlist_path, e
-                )
+                logger.warning("Failed to load allowlist from %s: %s", self.allowlist_path, e)
                 self._allowlist = set()
         else:
             self._allowlist = set()
@@ -51,7 +49,7 @@ class ListOverride:
         # Denylist
         if os.path.exists(self.denylist_path):
             try:
-                with open(self.denylist_path, "r") as f:
+                with open(self.denylist_path) as f:
                     data = json.load(f)
                     if isinstance(data, list):
                         self._denylist = set(data)
@@ -62,16 +60,14 @@ class ListOverride:
                         )
                         self._denylist = set()
             except Exception as e:
-                logger.warning(
-                    "Failed to load denylist from %s: %s", self.denylist_path, e
-                )
+                logger.warning("Failed to load denylist from %s: %s", self.denylist_path, e)
                 self._denylist = set()
         else:
             self._denylist = set()
 
         self._last_loaded = time.time()
 
-    def check(self, wallet: str) -> Optional[int]:
+    def check(self, wallet: str) -> int | None:
         """Returns 0 (allowlist), 100 (denylist), or None (not listed)."""
         now = time.time()
         interval = getattr(config, "LIST_RELOAD_INTERVAL_SECONDS", 60)

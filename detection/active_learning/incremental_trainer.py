@@ -126,12 +126,13 @@ def _warm_start_update(
     maml_path = os.path.join(model_dir, "maml_adapter.pt")
     if os.path.exists(maml_path):
         try:
-            from detection.meta_learner import LeafEmbeddingExtractor, MAMLAdapter
             import torch
+
+            from detection.meta_learner import LeafEmbeddingExtractor, MAMLAdapter
 
             extractor = LeafEmbeddingExtractor(updated)
             X_new, y_new = split_features_labels(new_df)
-            extractor.fit(X_new) # Use new data to fit extractor if needed
+            extractor.fit(X_new)  # Use new data to fit extractor if needed
             embeddings = extractor.transform(X_new)
 
             # Use dummy df to get dimension if needed, or just from embeddings
@@ -151,6 +152,7 @@ def _warm_start_update(
 
             # Fit PrototypicalClassifier
             from detection.meta_learner import PrototypicalClassifier
+
             proto = PrototypicalClassifier()
             proto.fit_prototype(embeddings, y_new.values)
             proto_path = os.path.join(model_dir, "prototypes.joblib")

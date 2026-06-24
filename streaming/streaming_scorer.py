@@ -18,8 +18,6 @@ with up to 10,000 nodes.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import networkx as nx
 
 from config import config
@@ -53,13 +51,15 @@ class StreamingScorer:
     def __init__(
         self,
         model_dir: str | None = None,
-        gnn_encoder: Optional["GNNEncoder"] = None,  # type: ignore[name-defined]  # noqa: F821
+        gnn_encoder: GNNEncoder | None = None,  # type: ignore[name-defined]  # noqa: F821
         funding_graph: nx.DiGraph | None = None,
     ) -> None:
         self._risk_scorer = RiskScorer(model_dir=model_dir)
         self.min_trades: int = config.MIN_TRADES_FOR_SCORING
         self._gnn_encoder = gnn_encoder
-        self._funding_graph: nx.DiGraph = funding_graph if funding_graph is not None else nx.DiGraph()
+        self._funding_graph: nx.DiGraph = (
+            funding_graph if funding_graph is not None else nx.DiGraph()
+        )
 
     # ------------------------------------------------------------------
     # Incremental GNN update
@@ -69,7 +69,7 @@ class StreamingScorer:
         self,
         wallet: str,
         new_edges: list[tuple[str, str]],
-    ) -> Optional["np.ndarray"]:  # type: ignore[name-defined]  # noqa: F821
+    ) -> np.ndarray | None:  # type: ignore[name-defined]  # noqa: F821
         """Notify the GNN encoder of new edges and return the updated embedding.
 
         Re-computes only the 1-hop neighbourhood of *wallet* (not the full
@@ -116,7 +116,7 @@ class StreamingScorer:
         or ``None`` if the wallet has fewer than ``min_trades`` buffered trades.
         """
         override_val = self._risk_scorer.list_override.check(wallet)
-        if override_val is not None:
+        if override_val in (0, 100):
             return {
                 "score": override_val,
                 "benford_flag": False,

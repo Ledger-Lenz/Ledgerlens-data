@@ -37,9 +37,7 @@ class FederatedParticipant:
     # ------------------------------------------------------------------ #
 
     def _get_weights(self) -> np.ndarray:
-        return np.concatenate(
-            [self.model.coef_.ravel(), self.model.intercept_.ravel()]
-        )
+        return np.concatenate([self.model.coef_.ravel(), self.model.intercept_.ravel()])
 
     def _set_weights(self, w: np.ndarray) -> None:
         n_coef = self.model.coef_.size

@@ -147,7 +147,7 @@ class AlertDispatcher:
                 )
 
             if attempt < self._max_retries:
-                delay = self._base_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                delay = self._base_delay * (2**attempt) + random.uniform(0, 0.5)
                 time.sleep(delay)
             else:
                 logger.error("Webhook delivery failed after %d retries", self._max_retries)

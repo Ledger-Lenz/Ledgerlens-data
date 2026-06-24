@@ -28,9 +28,11 @@ from config import config
 from detection.feature_engineering import build_feature_vector
 from detection.forensic_report import ForensicReportGenerator, write_report_secure
 from detection.model_inference import RiskScorer
-from detection.shap_explainer import ShapExplainer
 from ingestion.historical_loader import load_trades, trades_to_dataframe
 from ingestion.orderbook_loader import load_orderbook_events, orderbook_events_to_dataframe
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _score_wallet(
@@ -76,34 +78,23 @@ def _score_wallet(
     feature_vector = build_feature_vector(wallet, trades_df, orderbook_events=orderbook_df)
     feature_row = pd.Series(feature_vector)
 
-    # Score
-    result = scorer.score(feature_row)
-
-    # SHAP
-    try:
-        explainer = ShapExplainer()
-        shap_values = explainer.explain_ensemble(feature_row, scorer.models, top_n=10)
-    except Exception:
-        shap_values = []
-
-    # Model metadata
-    model_metadata = {}
-    if scorer.metadata:
-        model_metadata = {
-            "name": "LedgerLens Ensemble",
-            "version": scorer.metadata.get("model_version", "unknown"),
-            "training_dataset_sha256": scorer.metadata.get("training_dataset_sha256", "unknown"),
-            "feature_schema_version": scorer.metadata.get("feature_schema_hash", "unknown"),
-        }
-
     report = generator.generate(
         wallet=wallet,
-        wallet_trades=trades_df,
-        risk_score_dict=result,
-        shap_values=shap_values,
         asset_pair=pair,
-        model_metadata=model_metadata or None,
+        feature_row=feature_row,
+        wallet_trades=trades_df,
+        orderbook_events=orderbook_df,
     )
+
+    model_version = (
+        scorer.metadata.get("model_version", "unknown") if scorer.metadata else "unknown"
+    )
+    try:
+        from detection.audit_trail import commit_forensic_report
+
+        commit_forensic_report(report, feature_vector, model_version)
+    except Exception as exc:
+        logger.warning("Audit trail commit skipped: %s", exc)
 
     # Optional on-chain anchor
     if anchor:

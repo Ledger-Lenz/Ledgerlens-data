@@ -23,13 +23,11 @@ import re
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import combinations
-import re
 from typing import Literal
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-import re
 
 from ingestion.data_models import AccountActivity
 
@@ -67,6 +65,8 @@ def build_funding_graph(
             continue
         graph.add_node(activity.account_id)
         if activity.funding_account:
+            if validate_account_ids and not _validate_account_id(activity.funding_account):
+                continue
             graph.add_edge(activity.funding_account, activity.account_id, edge_type="funding")
 
     if trades is not None and not trades.empty:
@@ -170,8 +170,72 @@ def to_pyg_data(
     return data
 
 
+def build_co_trade_graph(
+    trades_df: pd.DataFrame,
+    window_hours: int,
+) -> nx.DiGraph:
+    """Build a directed co-trade graph from a trades DataFrame."""
+    graph: nx.DiGraph = nx.DiGraph()
+    if trades_df.empty:
+        return graph
+
+    required_cols = {
+        "base_account",
+        "counter_account",
+        "base_asset",
+        "counter_asset",
+        "ledger_close_time",
+        "amount",
+    }
+    if not required_cols.issubset(trades_df.columns):
+        return graph
+
+    df = trades_df.copy()
+    df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["ledger_close_time"])
+
+    if "pair_id" not in df.columns:
+        df["pair_id"] = df.apply(
+            lambda row: "/".join(sorted([str(row["base_asset"]), str(row["counter_asset"])])),
+            axis=1,
+        )
+
+    window_td = pd.Timedelta(hours=window_hours)
+    for _, pair_df in df.groupby("pair_id"):
+        pair_df = pair_df.sort_values("ledger_close_time")
+        events: list[tuple[str, pd.Timestamp]] = []
+        for _, row in pair_df.iterrows():
+            for account in (row["base_account"], row["counter_account"]):
+                if _validate_account_id(str(account)):
+                    events.append((str(account), row["ledger_close_time"]))
+
+        if len(events) < 2:
+            continue
+
+        events.sort(key=lambda item: item[1])
+        for index, (wallet_a, time_a) in enumerate(events):
+            for wallet_b, time_b in events[index + 1 :]:
+                if time_b - time_a > window_td:
+                    break
+                if wallet_a == wallet_b:
+                    continue
+                for source, target in ((wallet_a, wallet_b), (wallet_b, wallet_a)):
+                    if graph.has_edge(source, target):
+                        graph[source][target]["weight"] += 1
+                    else:
+                        graph.add_edge(
+                            source,
+                            target,
+                            edge_type="co_trade",
+                            weight=1,
+                            timestamp=time_a.isoformat(),
+                        )
+
+    return graph
+
+
 def funding_source_similarity(wallet: str, graph: nx.DiGraph) -> float:
-    """Highest Jaccard similarity between ``wallet``'s funding ancestors and
+    r"""Highest Jaccard similarity between ``wallet`` funding ancestors and
     any other node's funding ancestors in ``graph``.
 
     Returns ``0.0`` if ``wallet`` isn't in the graph or has no funding
