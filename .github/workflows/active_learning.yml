@@ -1,0 +1,57 @@
+name: Active Learning Pipeline
+
+on:
+  schedule:
+    # Run every Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "Query strategy"
+        default: "committee_disagreement"
+        required: false
+      batch_size:
+        description: "Number of wallets to select"
+        default: "20"
+        required: false
+      pool_path:
+        description: "Path to unscored wallet parquet"
+        default: "data/unscored_wallets.parquet"
+        required: false
+
+jobs:
+  active-learning:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run active learning loop
+        env:
+          AL_QUERY_STRATEGY: ${{ github.event.inputs.strategy || 'committee_disagreement' }}
+          AL_BATCH_SIZE: ${{ github.event.inputs.batch_size || '20' }}
+          AL_QUEUE_PATH: data/annotation_queue.json
+          ANNOTATION_HMAC_SECRET: ${{ secrets.ANNOTATION_HMAC_SECRET }}
+          MODEL_DIR: ${{ vars.MODEL_DIR || './models' }}
+        run: |
+          python -m scripts.run_active_learning \
+            --pool "${{ github.event.inputs.pool_path || 'data/unscored_wallets.parquet' }}" \
+            --strategy "$AL_QUERY_STRATEGY" \
+            --batch-size "$AL_BATCH_SIZE" \
+            --queue "$AL_QUEUE_PATH"
+
+      - name: Upload annotation queue artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: annotation-queue-${{ github.run_id }}
+          path: data/annotation_queue.json
+          retention-days: 30

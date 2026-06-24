@@ -27,3 +27,7 @@ no_implicit_optional = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "integration: marks tests as live Testnet integration tests (deselect with '-m not integration')",
+    "slow: marks tests that run PPO training (deselect with '-m not slow')",
+]

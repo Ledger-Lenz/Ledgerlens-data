@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   caching.
 - Test coverage for persistence, order-book ingestion, wallet graph features,
   the contract client, the training CLI, and ensemble inference/SHAP.
+- Comprehensive unit tests for `JWTAuthenticator.extract_permissions()` and token verification in `tests/test_ws_auth.py`.
 
 ### Changed
 - `run_pipeline.py` now loads order-book events, persists scored wallets,
@@ -66,3 +67,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RiskScorer.score` and `ShapExplainer` now coerce feature rows to numeric
   dtypes before calling models/explainers, fixing failures with XGBoost and
   newer SHAP versions.
+- `extract_permissions` logic to correctly return `{"scores:read:all"}` when given the unrestricted `"scores:read"` scope.

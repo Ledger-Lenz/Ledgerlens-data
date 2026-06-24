@@ -11,9 +11,28 @@ group consumed by `feature_engineering.py`.
 """
 
 import math
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
+
+@dataclass
+class BenfordMetrics:
+    """Standardized Benford anomaly metrics."""
+
+    chi_square: float
+    mad: float
+    mad_nonconforming: bool
+    z_scores: dict[int, float]
+    sample_size: int
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
 
 # Benford's Law expected frequency for leading digits 1-9
 BENFORD_EXPECTED = {d: math.log10(1 + 1 / d) for d in range(1, 10)}
@@ -102,19 +121,19 @@ def mad_score(amounts: pd.Series) -> float:
     return float(sum(deviations) / len(deviations))
 
 
-def compute_benford_metrics(amounts: pd.Series) -> dict:
+def compute_benford_metrics(amounts: pd.Series) -> BenfordMetrics:
     """Compute the full set of Benford metrics for a series of amounts.
 
-    Returns a dict with `chi_square`, `mad`, `mad_nonconforming`, and
-    `z_scores` (per-digit dict), suitable for use as a feature row.
+    Returns a BenfordMetrics dataclass (backward compatible with dict access).
     """
-    return {
-        "chi_square": chi_square_statistic(amounts),
-        "mad": mad_score(amounts),
-        "mad_nonconforming": mad_score(amounts) > MAD_NONCONFORMITY_THRESHOLD,
-        "z_scores": z_scores(amounts),
-        "sample_size": int((amounts > 0).sum()),
-    }
+    mad = mad_score(amounts)
+    return BenfordMetrics(
+        chi_square=chi_square_statistic(amounts),
+        mad=mad,
+        mad_nonconforming=mad > MAD_NONCONFORMITY_THRESHOLD,
+        z_scores=z_scores(amounts),
+        sample_size=int((amounts > 0).sum()),
+    )
 
 
 def compute_benford_metrics_for_windows(
@@ -123,7 +142,7 @@ def compute_benford_metrics_for_windows(
     time_col: str = "ledger_close_time",
     windows_hours: list[int] | None = None,
     reference_time: pd.Timestamp | None = None,
-) -> dict[int, dict]:
+) -> dict[int, BenfordMetrics]:
     """Compute Benford metrics over multiple trailing windows ending at
     `reference_time` (defaults to the max timestamp in `df`).
 
@@ -147,3 +166,111 @@ def compute_benford_metrics_for_windows(
         results[hours] = compute_benford_metrics(window_df[amount_col])
 
     return results
+
+
+def cross_pair_benford_consistency(per_pair_metrics: dict[str, BenfordMetrics]) -> float:
+    """Compute cross-pair Benford MAD consistency.
+
+    `per_pair_metrics` maps pair_id -> BenfordMetrics.
+    Returns the standard deviation of MAD scores across pairs. Low values indicate
+    all pairs have similar Benford conformity (consistent wash trading pattern).
+    High values indicate mixed conformity (concentrated on specific pairs).
+    """
+    if not per_pair_metrics or len(per_pair_metrics) < 2:
+        return 0.0
+
+    mad_scores = [metrics.get("mad", 0.0) for metrics in per_pair_metrics.values() if metrics]
+    if not mad_scores or len(mad_scores) < 2:
+        return 0.0
+
+    return float(np.std(mad_scores))
+
+
+# ---------------------------------------------------------------------------
+# Hardening measures
+# ---------------------------------------------------------------------------
+
+
+def leading_digits_log(amounts: pd.Series) -> pd.Series:
+    """Extract leading digits after applying a log10 transform.
+
+    Applying log10 before digit extraction defeats the AmountRounding attack:
+    rounding to N significant figures collapses log10 values to a narrow
+    range, which still reveals the deviation from Benford's Law.
+    """
+    amounts = amounts[amounts > 0]
+    if amounts.empty:
+        return amounts
+    log_amounts = np.log10(amounts)
+    # Shift so all values are > 1, preserving leading-digit semantics
+    shift = math.floor(log_amounts.min()) - 1
+    shifted = log_amounts - shift
+    magnitudes = np.floor(np.log10(shifted)).astype(int)
+    normalized = shifted / (10.0**magnitudes)
+    return np.floor(normalized).astype(int).clip(1, 9)
+
+
+def second_digits(amounts: pd.Series) -> pd.Series:
+    """Extract the second significant digit of each amount (0–9).
+
+    The Newcomb–Benford generalisation extends to second digits.  The
+    expected distribution of the second digit is flatter but still
+    non-uniform, and adversarial rounding typically produces a very
+    different second-digit pattern.
+    """
+    amounts = amounts[amounts > 0]
+    if amounts.empty:
+        return amounts
+    magnitudes = np.floor(np.log10(amounts)).astype(int)
+    normalized = amounts / (10.0**magnitudes)  # first digit is floor(normalized)
+    # Remove first digit contribution, scale up and take floor
+    second = np.floor((normalized - np.floor(normalized)) * 10).astype(int).clip(0, 9)
+    return second
+
+
+def chi_square_log(amounts: pd.Series) -> float:
+    """Chi-square statistic computed on log-transformed leading digits.
+
+    Hardened against AmountRounding by working in log space.
+    """
+    digits = leading_digits_log(amounts)
+    n = len(digits)
+    if n == 0:
+        return 0.0
+    observed_counts = digits.value_counts()
+    chi_sq = 0.0
+    for d in range(1, 10):
+        expected_count = BENFORD_EXPECTED[d] * n
+        observed_count = observed_counts.get(d, 0)
+        if expected_count > 0:
+            chi_sq += (observed_count - expected_count) ** 2 / expected_count
+    return float(chi_sq)
+
+
+def bootstrap_chi_square_ci(
+    amounts: pd.Series,
+    n_bootstrap: int = 500,
+    ci: float = 0.95,
+    rng: np.random.Generator | None = None,
+) -> tuple[float, float]:
+    """Bootstrap confidence interval for the Benford chi-square statistic.
+
+    Returns ``(lower, upper)`` bounds.  A suspiciously *low* chi-square
+    (upper bound near zero) can signal manufactured conformance — an
+    adversary who over-tunes their distribution to match Benford's Law too
+    precisely.
+    """
+    rng = rng or np.random.default_rng(0)
+    amounts = amounts[amounts > 0].reset_index(drop=True)
+    n = len(amounts)
+    if n == 0:
+        return (0.0, 0.0)
+
+    samples = [
+        chi_square_statistic(amounts.iloc[rng.choice(n, size=n, replace=True)])
+        for _ in range(n_bootstrap)
+    ]
+    alpha = 1.0 - ci
+    lower = float(np.percentile(samples, alpha / 2 * 100))
+    upper = float(np.percentile(samples, (1 - alpha / 2) * 100))
+    return (lower, upper)

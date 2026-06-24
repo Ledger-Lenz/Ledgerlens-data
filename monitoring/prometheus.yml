@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Scrape every scorer replica's /metrics endpoint. docker-compose service DNS
+  # resolves "ledgerlens-scorer" to all replica IPs via dns_sd.
+  - job_name: ledgerlens-scorer
+    dns_sd_configs:
+      - names:
+          - ledgerlens-scorer
+        type: A
+        port: 9100
