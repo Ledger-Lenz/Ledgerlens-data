@@ -279,8 +279,29 @@ def compute_graph_embedding_features(
     funding_graph: nx.DiGraph,
     gnn_encoder: object,
 ) -> dict[str, float]:
-    """Return GNN embedding features for *wallet*, with zero-fallback on failure."""
+    """Return GNN embedding features for a wallet.
+
+    This function attempts to compute an embedding for ``wallet`` using the
+    provided ``gnn_encoder`` and ``funding_graph``. If embedding computation
+    fails (e.g., missing wallet node, encoder error), it returns a zero vector
+    of length ``config.GNN_EMBEDDING_DIM``.
+
+    Args:
+        wallet: Stellar account id to compute embeddings for.
+        funding_graph: Directed funding graph used as input to the encoder.
+        gnn_encoder: Encoder instance that provides an ``encode(graph, wallet)``
+            method returning an indexable embedding vector.
+
+    Returns:
+        A dictionary mapping feature names ``gnn_0``..``gnn_{N-1}`` to floats,
+        where ``N`` is ``config.GNN_EMBEDDING_DIM``.
+
+    Raises:
+        Any exceptions raised by the encoder are caught and will not be
+        propagated.
+    """
     try:
+
         emb = gnn_encoder.encode(funding_graph, wallet)  # type: ignore[attr-defined]
         return {f"gnn_{i}": float(emb[i]) for i in range(len(emb))}
     except Exception:
@@ -509,19 +530,56 @@ def compute_cross_asset_features(
     all_pairs_df: pd.DataFrame,
     pair_benford_sketches: dict[str, dict[int, StreamingBenfordSketch]] | None = None,
 ) -> dict:
-    """Cross-asset coordination features computed from multi-pair trade data.
+    """Compute cross-asset coordination features for a wallet.
 
-    `all_pairs_df` should contain trades across all pairs for the wallet, with
-    a `pair_id` column identifying which pair each trade belongs to.
+    ``all_pairs_df`` should contain trades across multiple asset pairs for the
+    same wallet. Each trade must relate to ``wallet`` either as ``base_account``
+    or as ``counter_account``.
 
-    Returns a dict with 6 cross-asset features:
-    - cross_pair_trade_synchrony: fraction of trades with simultaneous activity on other pairs
-    - net_asset_flow_deviation: max absolute net flow normalized by volume (close to 0 = closed cycle)
-    - cross_pair_counterparty_overlap: Jaccard similarity of counterparty sets across pairs
-    - cross_pair_volume_correlation: Pearson correlation of volumes across pairs (by minute)
-    - pair_diversity_score: Shannon entropy of volume distribution across pairs
-    - cross_pair_mad_std: standard deviation of Benford MAD scores across pairs
+    This function returns six features describing coordination across asset
+    pairs (synchrony, net flow closure, counterparty overlap, cross-pair volume
+    correlation, pair diversity, and cross-pair Benford MAD consistency).
+
+    Args:
+        wallet: Stellar account id to score.
+        all_pairs_df: DataFrame containing trades for multiple pairs.
+            Expected columns include:
+
+            - ``ledger_close_time``: trade timestamp.
+            - ``base_account`` / ``counter_account``: wallet-related accounts.
+            - ``amount``: trade amount.
+            - ``pair_id``: identifier for the asset pair.
+
+            If ``pair_id`` is not present, the function will attempt to infer it
+            from ``base_asset`` and ``counter_asset``.
+        pair_benford_sketches: Optional precomputed Benford sketch objects by
+            pair and window hour. When provided, cross-pair MAD std is computed
+            from these sketches instead of recomputing from trades.
+
+    Returns:
+        A dictionary with the following keys:
+
+        - ``cross_pair_trade_synchrony``: fraction of wallet trades where the
+          wallet also trades on another pair within the configured synchrony
+          window (see ``config.CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS``).
+        - ``net_asset_flow_deviation``: maximum absolute net flow (normalized
+          by total volume). Values near 0 indicate a closed cycle.
+        - ``cross_pair_counterparty_overlap``: Jaccard similarity of
+          counterparties between pairs.
+        - ``cross_pair_volume_correlation``: Pearson correlation of per-minute
+          traded volumes across pairs.
+        - ``pair_diversity_score``: normalized Shannon entropy of volume
+          distribution across pairs.
+        - ``cross_pair_mad_std``: standard deviation / consistency score of
+          Benford MAD scores across pairs.
+
+    Raises:
+        KeyError: If required columns are missing (e.g., ``ledger_close_time``,
+            ``base_account``, ``counter_account``, ``amount``), or if ``pair_id``
+            is missing and required asset columns (``base_asset``,
+            ``counter_asset``) are also absent.
     """
+
     # Default values for single pair or empty data
     default_features = {
         "cross_pair_trade_synchrony": 0.0,
@@ -716,14 +774,31 @@ def compute_cross_venue_features(
     sdex_trades: pd.DataFrame,
     amm_trades: pd.DataFrame,
 ) -> dict:
-    """Compute 7 cross-venue coordination features for a wallet.
+    """Compute cross-venue coordination features for a wallet.
 
-    Delegates to ``detection.cross_venue_features`` and returns a dict with
-    keys: venue_trade_ratio, cross_venue_volume_correlation,
-    cross_venue_timing_synchrony, cross_venue_net_flow,
-    counterparty_venue_overlap, simultaneous_order_pair,
-    cross_venue_cluster_score.
+    This function delegates the computation to
+    ``detection.cross_venue_features.compute_cross_venue_features``.
+
+    Args:
+        wallet: Stellar account id to score.
+        sdex_trades: Trades on the SDEX venue.
+        amm_trades: Trades on the AMM venue.
+
+    Returns:
+        A dictionary containing 7 cross-venue feature values:
+
+        - ``venue_trade_ratio``
+        - ``cross_venue_volume_correlation``
+        - ``cross_venue_timing_synchrony``
+        - ``cross_venue_net_flow``
+        - ``counterparty_venue_overlap``
+        - ``simultaneous_order_pair``
+        - ``cross_venue_cluster_score``
+
+    Raises:
+        Any exceptions raised by the delegated implementation.
     """
+
     from detection.cross_venue_features import compute_cross_venue_features as _cvf
 
     return _cvf(wallet, sdex_trades, amm_trades)
@@ -734,7 +809,26 @@ def compute_graph_embedding_features(
     graph: nx.DiGraph,
     encoder,
 ) -> dict:
-    """Return GNN embedding features for *wallet* as a flat dict."""
+    """Return GNN embedding features for a wallet as a flat dict.
+
+    This is a convenience wrapper that returns ``gnn_0``..``gnn_{N-1}``
+    features for ``wallet`` using ``encoder``. If the wallet node is not
+    present in ``graph`` or embedding computation fails, it returns a zero
+    vector.
+
+    Args:
+        wallet: Stellar account id to compute embeddings for.
+        graph: Directed funding graph (or similar) used as encoder input.
+        encoder: Encoder instance that provides an ``encode(graph, wallet)``
+            method.
+
+    Returns:
+        A dictionary mapping ``gnn_{i}`` to float values.
+
+    Raises:
+        Any exceptions from the encoder are caught and not propagated.
+    """
+
     dim = config.GNN_EMBEDDING_DIM
     zero_features = {f"gnn_{i}": 0.0 for i in range(dim)}
 
