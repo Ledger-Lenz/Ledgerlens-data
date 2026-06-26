@@ -75,3 +75,6 @@ jinja2>=3.1.0
 tqdm>=4.66.0
 weasyprint>=62.0
 python-json-logger==2.0.7
+
+# CLI utilities
+tabulate>=0.9.0
