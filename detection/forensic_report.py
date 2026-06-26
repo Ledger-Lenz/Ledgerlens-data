@@ -64,92 +64,6 @@ def write_report_secure(out_path: str, content: str) -> None:
         os.chmod(out_path, mode)
 
 
-@dataclass(slots=True)
-class TradeEvidence:
-    trade_id: str
-    ledger: int
-    base_account: str
-    counter_account: str
-    base_amount: float
-    counter_amount: float
-    asset_pair: str
-    horizon_url: str
-
-    def to_dict(self) -> dict:
-        return {
-            "trade_id": self.trade_id,
-            "ledger": self.ledger,
-            "base_account": self.base_account,
-            "counter_account": self.counter_account,
-            "base_amount": self.base_amount,
-            "counter_amount": self.counter_amount,
-            "asset_pair": self.asset_pair,
-            "horizon_url": self.horizon_url,
-        }
-
-
-
-@dataclass
-class TradeEvidence:
-    trade_id: str
-    ledger: int
-    base_account: str
-    counter_account: str
-    base_amount: float
-    counter_amount: float
-    asset_pair: str
-    horizon_url: str  # always constructed from config.HORIZON_URL
-
-
-@dataclass
-class ForensicReport:
-    report_id: str  # UUID v4
-    generated_at: str  # ISO 8601 UTC
-    wallet: str
-    asset_pair: str
-    risk_score: int
-    score_lower: int
-    score_upper: int
-    verdict: Literal["clean", "suspicious", "wash_trade"]
-    top_shap_features: list[dict]
-    benford_analysis: dict
-    trade_evidence: list[TradeEvidence]
-    model_metadata: dict
-    report_sha256: str = field(default="", init=False)
-    soroban_anchor_tx: str | None = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        self.report_sha256 = self._compute_sha256()
-
-    def _compute_sha256(self) -> str:
-        d = self._to_dict_without_hash()
-        return hashlib.sha256(
-            json.dumps(d, sort_keys=True, default=_json_default).encode()
-        ).hexdigest()
-
-    def _to_dict_without_hash(self) -> dict:
-        d = {
-            "report_id": self.report_id,
-            "generated_at": self.generated_at,
-            "wallet": self.wallet,
-            "asset_pair": self.asset_pair,
-            "risk_score": self.risk_score,
-            "score_lower": self.score_lower,
-            "score_upper": self.score_upper,
-            "verdict": self.verdict,
-            "top_shap_features": self.top_shap_features,
-            "benford_analysis": self.benford_analysis,
-            "trade_evidence": [asdict(t) for t in self.trade_evidence],
-            "model_metadata": self.model_metadata,
-            "soroban_anchor_tx": self.soroban_anchor_tx,
-        }
-        return d
-
-    def to_dict(self) -> dict:
-        d = self._to_dict_without_hash()
-        d["report_sha256"] = self.report_sha256
-        return d
-
 @dataclass
 class TradeEvidence:
     trade_id: str
@@ -276,8 +190,6 @@ class ForensicReportGenerator:
 
     MAX_EVIDENCE_TRADES = 20
 
-    MAX_EVIDENCE_TRADES = 20
-
     def generate(
         self,
         wallet: str,
@@ -297,10 +209,6 @@ class ForensicReportGenerator:
         base_scores: dict[str, float] | None = None,
         co_trade_graph: nx.Graph | None = None,
         propagation_alpha: float = 0.15,
-        # Compatibility arguments for test fixture
-        risk_score_dict: dict | None = None,
-        shap_values: list[dict] | None = None,
-        model_metadata: dict | None = None,
     ) -> ForensicReport:
         if risk_score_dict is None and feature_row is not None:
             risk_score_dict = self._scorer.score(feature_row)
@@ -348,77 +256,6 @@ class ForensicReportGenerator:
                 top_n=top_n,
             )
 
-        # Build trade evidence
-        trade_evidence = []
-        if wallet_trades is not None and not wallet_trades.empty:
-            sort_col = "amount" if "amount" in wallet_trades.columns else ("base_amount" if "base_amount" in wallet_trades.columns else None)
-            if sort_col:
-                sorted_trades = wallet_trades.sort_values(by=sort_col, ascending=False)
-            else:
-                sorted_trades = wallet_trades
-            
-            top_trades = sorted_trades.head(20)
-            for _, row in top_trades.iterrows():
-                trade_id = str(row.get("trade_id", row.get("id", "")))
-                ledger = int(row.get("ledger", 0))
-                base_account = str(row.get("base_account", ""))
-                counter_account = str(row.get("counter_account", ""))
-                base_amount = float(row.get("base_amount", row.get("amount", 0.0)))
-                counter_amount = float(row.get("counter_amount", row.get("amount", 0.0)))
-                horizon_url = f"{config.HORIZON_URL.rstrip('/')}/trades/{trade_id}"
-                
-                trade_evidence.append(
-                    TradeEvidence(
-                        trade_id=trade_id,
-                        ledger=ledger,
-                        base_account=base_account,
-                        counter_account=counter_account,
-                        base_amount=base_amount,
-                        counter_amount=counter_amount,
-                        asset_pair=asset_pair,
-                        horizon_url=horizon_url,
-                    )
-                )
-
-        # Build SHAP features in schema format
-        top_shap_features = []
-        for item in shap_explanations:
-            feature_name = item.get("feature", "")
-            top_shap_features.append({
-                "feature": feature_name,
-                "description": FEATURE_DESCRIPTIONS.get(feature_name, f"Attribution of {feature_name.replace('_', ' ')} feature."),
-                "value": item.get("value", 0.0),
-                "contribution": item.get("contribution", 0.0),
-            })
-
-        # Build Benford Analysis in schema format
-        benford_analysis = {}
-        if feature_row is not None:
-            for w in config.BENFORD_WINDOWS_HOURS:
-                chi = feature_row.get(f"benford_chi_square_{w}h")
-                mad = feature_row.get(f"benford_mad_{w}h")
-                z_max = feature_row.get(f"benford_z_max_{w}h")
-                if chi is not None or mad is not None:
-                    sample_size = len(wallet_trades) if wallet_trades is not None else 100
-                    benford_analysis[str(w)] = {
-                        "chi_square": float(chi) if chi is not None else 0.0,
-                        "mad": float(mad) if mad is not None else 0.0,
-                        "mad_nonconforming": bool(mad > 0.015) if mad is not None else False,
-                        "z_scores": {"max": float(z_max) if z_max is not None else 0.0},
-                        "sample_size": sample_size,
-                    }
-        else:
-            # Test cases or default values
-            benford_flag = risk_score.get("benford_flag", False) if isinstance(risk_score, dict) else False
-            for w in config.BENFORD_WINDOWS_HOURS:
-                benford_analysis[str(w)] = {
-                    "chi_square": 20.0 if benford_flag else 5.0,
-                    "mad": 0.025 if benford_flag else 0.008,
-                    "mad_nonconforming": benford_flag,
-                    "z_scores": {"max": 4.5 if benford_flag else 1.2},
-                    "sample_size": 150,
-                }
-
         return ForensicReport(
             report_id=str(uuid.uuid4()),
             generated_at=datetime.now(UTC).isoformat(),
@@ -434,10 +271,6 @@ class ForensicReportGenerator:
             model_metadata=metadata,
             causal_attribution=causal_attribution,
             propagation_path=propagation_path,
-            top_shap_features=top_shap_features,
-            benford_analysis=benford_analysis,
-            trade_evidence=trade_evidence,
-            model_metadata=model_metadata,
         )
 
 
