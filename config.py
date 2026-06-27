@@ -93,6 +93,8 @@ class Config:
 
     # Forensic reporting
     REPORT_CONCURRENCY: int = int(os.getenv("REPORT_CONCURRENCY", "4"))
+    # SHAP interaction values are O(n * d^2) — disable by default.
+    SHAP_INTERACTIONS_ENABLED: bool = os.getenv("SHAP_INTERACTIONS_ENABLED", "false").lower() == "true"
 
     # Wallet funding graph — multi-hop traversal + wash-trading ring detection
     WALLET_GRAPH_MAX_DEPTH: int = int(os.getenv("WALLET_GRAPH_MAX_DEPTH", "4"))
