@@ -55,5 +55,23 @@ jobs:
               print("verify_chain check passed.")
           EOF
 
+      - name: Test check-env target exits 0 with vars set
+        run: |
+          export WATCHED_ASSET_PAIRS=USDC:GA5Z...
+          export RISK_SCORE_DB_URL=sqlite:///test.db
+          export MODEL_DIR=./models
+          make check-env
+
+      - name: Test check-env target exits non-zero with missing var
+        run: |
+          unset WATCHED_ASSET_PAIRS
+          export RISK_SCORE_DB_URL=sqlite:///test.db
+          export MODEL_DIR=./models
+          if make check-env; then
+            echo "Expected failure but check-env passed"
+            exit 1
+          fi
+          echo "check-env correctly failed with missing WATCHED_ASSET_PAIRS"
+
       - name: Test
         run: pytest -q
