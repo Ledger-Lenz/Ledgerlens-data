@@ -178,3 +178,147 @@ def test_verify_chain_raises_on_mismatched_training_data_sha256(tmp_path):
             public_key=public_key,
             expected_data_sha256="deadbeef" * 8,
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #277 — Supply-chain transparency log + ModelArtifactVerifier
+# ---------------------------------------------------------------------------
+
+
+def _make_transparency_log(tmp_path):
+    from detection.persistence import TransparencyLog, get_engine, get_session_factory
+
+    engine = get_engine("sqlite:///:memory:")
+    sf = get_session_factory(engine)
+    return TransparencyLog(sf), sf
+
+
+def _setup_verifier_artifact(tmp_path):
+    """Full artifact setup: valid file + signed metrics + transparency log entry."""
+    from detection.persistence import TransparencyLog, ModelArtifactVerifier, get_engine, get_session_factory
+
+    model_dir = str(tmp_path / "models")
+    os.makedirs(model_dir)
+
+    artifact_bytes = b"fake-model-data"
+    artifact_path = os.path.join(model_dir, "rf.joblib")
+    with open(artifact_path, "wb") as f:
+        f.write(artifact_bytes)
+
+    sha = hashlib.sha256(artifact_bytes).hexdigest()
+    metrics = {"rf": {"artifact_sha256": sha}}
+    metrics_path = os.path.join(model_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f)
+
+    private_key, public_key = _gen_keypair()
+    key_path = _write_keypair(tmp_path, private_key)
+    sign_metrics(metrics_path, key_path)
+
+    engine = get_engine("sqlite:///:memory:")
+    sf = get_session_factory(engine)
+    log = TransparencyLog(sf)
+    log.append("rf", sha)
+
+    verifier = ModelArtifactVerifier(transparency_log=log, model_dir=model_dir)
+    return verifier, public_key, sha
+
+
+def test_model_artifact_verifier_passes_for_valid_artifact(tmp_path):
+    verifier, public_key, sha = _setup_verifier_artifact(tmp_path)
+    result = verifier.verify("rf", public_key=public_key)
+    assert result == sha
+
+
+def test_model_artifact_verifier_fails_on_tampered_file(tmp_path):
+    from detection.persistence import ModelIntegrityError
+
+    verifier, public_key, _ = _setup_verifier_artifact(tmp_path)
+    # Tamper the artifact (one byte changed)
+    model_dir = verifier._model_dir
+    artifact_path = os.path.join(model_dir, "rf.joblib")
+    with open(artifact_path, "rb") as f:
+        data = bytearray(f.read())
+    data[0] ^= 0xFF
+    with open(artifact_path, "wb") as f:
+        f.write(bytes(data))
+
+    with pytest.raises(ModelIntegrityError):
+        verifier.verify("rf", public_key=public_key)
+
+
+def test_model_artifact_verifier_fails_on_unsigned_artifact(tmp_path):
+    from detection.persistence import ModelIntegrityError, TransparencyLog, ModelArtifactVerifier, get_engine, get_session_factory
+
+    model_dir = str(tmp_path / "models")
+    os.makedirs(model_dir)
+
+    artifact_bytes = b"unsigned-model"
+    artifact_path = os.path.join(model_dir, "rf.joblib")
+    with open(artifact_path, "wb") as f:
+        f.write(artifact_bytes)
+
+    sha = hashlib.sha256(artifact_bytes).hexdigest()
+    metrics = {"rf": {"artifact_sha256": sha}}
+    metrics_path = os.path.join(model_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f)
+    # No metrics.json.sig written — simulates unsigned artifact
+
+    engine = get_engine("sqlite:///:memory:")
+    sf = get_session_factory(engine)
+    log = TransparencyLog(sf)
+    log.append("rf", sha)
+
+    verifier = ModelArtifactVerifier(transparency_log=log, model_dir=model_dir)
+    _, public_key = _gen_keypair()
+
+    with pytest.raises(ModelIntegrityError, match="Signature file not found"):
+        verifier.verify("rf", public_key=public_key)
+
+
+def test_model_artifact_verifier_fails_when_not_in_transparency_log(tmp_path):
+    from detection.persistence import ModelIntegrityError, TransparencyLog, ModelArtifactVerifier, get_engine, get_session_factory
+
+    model_dir = str(tmp_path / "models")
+    os.makedirs(model_dir)
+
+    artifact_bytes = b"valid-but-not-logged"
+    artifact_path = os.path.join(model_dir, "rf.joblib")
+    with open(artifact_path, "wb") as f:
+        f.write(artifact_bytes)
+
+    sha = hashlib.sha256(artifact_bytes).hexdigest()
+    metrics = {"rf": {"artifact_sha256": sha}}
+    metrics_path = os.path.join(model_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f)
+
+    private_key, public_key = _gen_keypair()
+    key_path = _write_keypair(tmp_path, private_key)
+    sign_metrics(metrics_path, key_path)
+
+    # Transparency log is empty — artifact hash not registered
+    engine = get_engine("sqlite:///:memory:")
+    sf = get_session_factory(engine)
+    log = TransparencyLog(sf)
+
+    verifier = ModelArtifactVerifier(transparency_log=log, model_dir=model_dir)
+    with pytest.raises(ModelIntegrityError, match="not in the transparency log"):
+        verifier.verify("rf", public_key=public_key)
+
+
+def test_transparency_log_is_append_only(tmp_path):
+    """Appending the same hash twice must be idempotent (no duplicate rows)."""
+    from detection.persistence import TransparencyLog, get_engine, get_session_factory
+
+    engine = get_engine("sqlite:///:memory:")
+    sf = get_session_factory(engine)
+    log = TransparencyLog(sf)
+
+    sha = "a" * 64
+    log.append("rf", sha)
+    log.append("rf", sha)  # idempotent
+
+    assert log.all_hashes().count(sha) == 1
+    assert log.contains(sha) is True
