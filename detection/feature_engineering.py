@@ -150,6 +150,22 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "Benford non-conformity is equally distributed across all pairs — "
         "consistent with a systematic automated trading pattern."
     ),
+    # Time-series decomposition features
+    "volume_trend_slope": (
+        "Linear regression slope of hourly volume over time, normalized by mean "
+        "volume. Positive values indicate growing volume; negative values indicate "
+        "declining volume. NaN for wallets with fewer than 48 hours of data."
+    ),
+    "volume_seasonality_strength": (
+        "Ratio of seasonal component variance to total variance (seasonal + "
+        "residual) from STL decomposition of hourly volume. Values above 0.8 "
+        "indicate highly mechanical, predictable trading patterns."
+    ),
+    "volume_residual_anomaly": (
+        "Fraction of hourly buckets where the STL residual exceeds 2 standard "
+        "deviations above the mean residual. High values indicate sporadic "
+        "volume spikes inconsistent with the underlying trend and seasonal pattern."
+    ),
 }
 
 
@@ -841,6 +857,18 @@ def compute_graph_embedding_features(
         return zero_features
 
 
+def compute_ts_decomposition_features(wallet_trades: pd.DataFrame) -> dict:
+    """Compute STL-based time-series decomposition features for a wallet.
+
+    Returns volume_trend_slope, volume_seasonality_strength, and
+    volume_residual_anomaly. NaN values are returned for wallets with
+    fewer than 48 hours of trade data.
+    """
+    from detection.ts_decomposition import compute_ts_features
+
+    return compute_ts_features(wallet_trades)
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
@@ -888,6 +916,7 @@ def build_feature_vector(
             )
         )
     features.update(compute_hardening_features(wallet_trades))
+    features.update(compute_ts_decomposition_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
 

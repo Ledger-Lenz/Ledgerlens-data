@@ -126,6 +126,7 @@ class RiskScorer:
         self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+        self.selected_features = self._load_selected_features()
         from detection.meta_learner import LeafEmbeddingExtractor
 
         self.extractor = LeafEmbeddingExtractor(self.models)
@@ -216,6 +217,16 @@ class RiskScorer:
                 models[name] = model
         return models
 
+    def _load_selected_features(self) -> list[str] | None:
+        if not config.FEATURE_SELECTION_ENABLED:
+            return None
+        path = config.FEATURE_SELECTION_PATH
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            return data.get("selected_features")
+        return None
+
     def _ensemble_probabilities(self, feature_row: pd.Series) -> list[float]:
         """Per-model wash-trade probabilities for a single feature row.
 
@@ -229,7 +240,11 @@ class RiskScorer:
 
         feature_cols = [c for c in feature_row.index if c not in FEATURE_COLUMNS_EXCLUDE]
 
-        if self.metadata:
+        # Apply feature selection filter when enabled
+        if self.selected_features is not None:
+            feature_cols = [c for c in feature_cols if c in self.selected_features]
+
+        if self.metadata and self.selected_features is None:
             current_hash = compute_feature_schema_hash(feature_cols)
             expected_hash = self.metadata["feature_schema_hash"]
 
