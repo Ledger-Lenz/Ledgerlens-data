@@ -150,6 +150,12 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "Benford non-conformity is equally distributed across all pairs — "
         "consistent with a systematic automated trading pattern."
     ),
+    # Payment path features
+    "path_payment_round_trip_frequency": (
+        "Fraction of a wallet's effective volume (after path reconstruction) that "
+        "returns to the originating wallet within 24 hours. Multi-hop path payments "
+        "that form closed loops are a hallmark of obfuscated wash trading."
+    ),
 }
 
 
@@ -841,6 +847,40 @@ def compute_graph_embedding_features(
         return zero_features
 
 
+def compute_payment_path_features(
+    wallet: str,
+    path_flows: list | None = None,
+) -> dict:
+    """Compute payment path analysis features for a wallet.
+
+    Analyzes multi-hop payment path flows to detect round-trip wash trading
+    routes where the effective sender and receiver are the same wallet,
+    connected through intermediate hops and asset conversions.
+
+    Args:
+        wallet: Stellar account ID to analyze.
+        path_flows: Optional list of ReconstructedPathFlow dicts from
+            ingestion.payment_path_analyzer. When None or empty, returns
+            zero-valued features.
+
+    Returns:
+        A dictionary with the following key:
+
+        - ``path_payment_round_trip_frequency``: Fraction of the wallet's
+          effective volume (after path reconstruction) that returns to the
+          originating wallet within 24 hours. Values near 1.0 indicate
+          closed-loop wash trading via payment paths.
+    """
+    if not path_flows:
+        return {"path_payment_round_trip_frequency": 0.0}
+
+    # Import here to avoid circular dependency
+    from ingestion.payment_path_analyzer import compute_path_payment_round_trip_frequency
+
+    round_trip_freq = compute_path_payment_round_trip_frequency(wallet, path_flows)
+    return {"path_payment_round_trip_frequency": float(round_trip_freq)}
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
@@ -854,6 +894,7 @@ def build_feature_vector(
     pair_benford_sketches: dict | None = None,
     community_map: dict[str, int] | None = None,
     ring_stats: dict[int, dict] | None = None,
+    path_flows: list | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -864,7 +905,9 @@ def build_feature_vector(
     output of `detection.wallet_graph.build_funding_graph`, used for the
     wallet graph features. `all_pairs_df` (optional) enables cross-asset
     coordination features. `amm_trades` (optional) enables cross-venue
-    coordination features.
+    coordination features. `path_flows` (optional) is a list of
+    ReconstructedPathFlow dicts from `ingestion.payment_path_analyzer`,
+    used to compute payment path analysis features.
     """
     reference_time = (
         pd.to_datetime(wallet_trades["ledger_close_time"], utc=True).max()
@@ -887,6 +930,7 @@ def build_feature_vector(
                 wallet, all_pairs_df, pair_benford_sketches=pair_benford_sketches
             )
         )
+    features.update(compute_payment_path_features(wallet, path_flows))
     features.update(compute_hardening_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
