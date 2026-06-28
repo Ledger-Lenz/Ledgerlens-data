@@ -101,6 +101,11 @@ class Config:
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
 
+    # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
+    HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
+    HORIZON_MAX_RETRIES: int = int(os.getenv("HORIZON_MAX_RETRIES", "5"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
     # Real-time streaming / alerting
     # STREAMING_BACKEND selects the ingestion transport:
     #   "sse"   — existing thread-per-pair Horizon SSE pipeline (default, no Kafka)

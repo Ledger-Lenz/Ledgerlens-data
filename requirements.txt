@@ -43,6 +43,9 @@ fastapi>=0.111.0
 uvicorn>=0.29.0
 httpx>=0.27.0
 
+# Distributed rate limiting (ingestion/rate_limiter.py)
+redis>=5.0.0
+
 prometheus_client>=0.18.0
 torch>=2.0.0
 # WebSocket server (streaming/ws_server.py)
@@ -66,6 +69,7 @@ mypy>=1.10.0
 
 # Testing
 pytest>=8.0.0
+fakeredis>=2.20.0
 pytest-asyncio>=0.23.0
 pytest-timeout>=2.3.0
 hypothesis>=6.100.0
