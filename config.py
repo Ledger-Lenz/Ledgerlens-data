@@ -182,6 +182,11 @@ class Config:
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
     GNN_NUM_LAYERS: int = int(os.getenv("GNN_NUM_LAYERS", "2"))
 
+    # Trade ingestion deduplication (Redis)
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    TRADE_DEDUP_TTL_SECONDS: int = int(os.getenv("TRADE_DEDUP_TTL_SECONDS", "86400"))  # 24 hours
+    TRADE_DEDUP_CACHE_KEY_PREFIX: str = os.getenv("TRADE_DEDUP_CACHE_KEY_PREFIX", "ledgerlens:trades:")
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []
