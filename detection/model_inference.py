@@ -266,6 +266,38 @@ class RiskScorer:
             }
         return None
 
+    def score_cold_start(
+        self,
+        feature_row: pd.Series,
+        context_features: "np.ndarray",
+        context_labels: "list[float]",
+        trade_count: int,
+    ) -> dict:
+        """Score a feature row using NP blending when trade history is sparse.
+
+        When ``trade_count < NP_COLD_START_THRESHOLD`` the Neural Process score
+        is blended linearly with the ensemble score.  The blend weight is 1.0
+        at zero trades and 0.0 at the threshold (pure ensemble).
+        """
+        from detection.neural_process import NP_COLD_START_THRESHOLD, NeuralProcess, blend_scores
+
+        ensemble_result = self.score(feature_row)
+
+        if trade_count >= NP_COLD_START_THRESHOLD or context_features is None or len(context_features) == 0:
+            return ensemble_result
+
+        feature_cols = [c for c in feature_row.index if c not in FEATURE_COLUMNS_EXCLUDE and c != "wallet"]
+        query_vec = feature_row[feature_cols].values.astype(float)
+        np_model = NeuralProcess(feature_dim=len(query_vec))
+        np_score = np_model.predict_score(context_features, context_labels, query_vec)
+
+        blended = blend_scores(np_score, ensemble_result["score"], trade_count, NP_COLD_START_THRESHOLD)
+        result = dict(ensemble_result)
+        result["score"] = int(round(blended))
+        result["np_cold_start"] = True
+        result["np_blend_weight"] = round(1.0 - trade_count / NP_COLD_START_THRESHOLD, 3)
+        return result
+
     def score(self, feature_row: pd.Series) -> dict:
         """Compute the LedgerLens Risk Score for a single feature row.
 
