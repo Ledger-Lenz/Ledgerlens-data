@@ -63,6 +63,11 @@ class Config:
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
     )
 
+    # Silence window for correlated alert deduplication (alerts/deduplicator.py).
+    ALERT_DEDUP_WINDOW_SECONDS: int = min(
+        300, max(5, int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS", "60")))
+    )
+
     RISK_SCORE_FLAG_THRESHOLD: int = int(os.getenv("RISK_SCORE_FLAG_THRESHOLD", "70"))
     # Set to a non-zero integer to pin the alert threshold and disable the RL agent.
     # E.g. THRESHOLD_RL_PINNED=75 → agent is bypassed, threshold is fixed at 75.
