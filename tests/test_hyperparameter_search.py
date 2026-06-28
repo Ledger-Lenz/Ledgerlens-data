@@ -1,17 +1,12 @@
 """Tests for detection/hyperparameter_search.py (Issue #281)."""
 
 import json
-import tempfile
-from pathlib import Path
 
-import numpy as np
-import optuna
 import pandas as pd
 import pytest
 from sklearn.datasets import make_classification
 
 from detection.hyperparameter_search import (
-    HyperparameterSearchError,
     get_search_space,
     load_best_params,
     run_study,
@@ -56,7 +51,7 @@ class TestGetSearchSpace:
     def test_space_format(self):
         """Each space entry is a (type, min, max) tuple."""
         space = get_search_space("xgboost")
-        for param_name, (param_type, min_val, max_val) in space.items():
+        for _, (param_type, min_val, max_val) in space.items():
             assert param_type in ("int", "float")
             assert min_val < max_val
 

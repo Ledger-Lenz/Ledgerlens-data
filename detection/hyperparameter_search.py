@@ -11,9 +11,8 @@ API:
 
 import json
 import logging
-import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import optuna
 import pandas as pd
@@ -162,7 +161,7 @@ def _objective(
 
     except Exception as e:
         logger.warning(f"Trial failed: {e}")
-        raise optuna.TrialPruned()
+        raise optuna.TrialPruned() from e
 
 
 def run_study(
@@ -217,9 +216,8 @@ def run_study(
             load_if_exists=True,
         )
 
-        objective = lambda trial: _objective(
-            trial, model_name, X_train, y_train, X_val, y_val
-        )
+        def objective(trial: optuna.Trial) -> float:
+            return _objective(trial, model_name, X_train, y_train, X_val, y_val)
 
         study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=True)
 
@@ -257,7 +255,7 @@ def load_best_params(model_name: str) -> dict[str, Any] | None:
     if not params_file.exists():
         return None
     try:
-        with open(params_file, "r") as f:
+        with open(params_file) as f:
             return json.load(f)
     except Exception as e:
         logger.warning(f"Failed to load best params for {model_name}: {e}")

@@ -5,7 +5,6 @@ import pandas as pd
 import pytest
 
 from detection.community_detector import (
-    CommunityDetectionError,
     compute_ring_concentration_score,
     detect_communities,
     validate_resolution_parameter,

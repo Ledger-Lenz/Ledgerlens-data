@@ -13,7 +13,6 @@ API:
 
 import time
 from collections import Counter, defaultdict
-from typing import Iterable
 
 import networkx as nx
 import pandas as pd
