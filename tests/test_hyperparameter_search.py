@@ -62,9 +62,7 @@ class TestRunStudy:
     @pytest.fixture
     def synthetic_data(self):
         """Generate synthetic validation data."""
-        X, y = make_classification(
-            n_samples=100, n_features=20, n_informative=10, random_state=42
-        )
+        X, y = make_classification(n_samples=100, n_features=20, n_informative=10, random_state=42)
         X_train, X_val = X[:70], X[70:]
         y_train, y_val = y[:70], y[70:]
         return (
@@ -205,9 +203,7 @@ class TestIntegrationWithTraining:
     @pytest.fixture
     def synthetic_data(self):
         """Generate synthetic validation data."""
-        X, y = make_classification(
-            n_samples=100, n_features=20, n_informative=10, random_state=42
-        )
+        X, y = make_classification(n_samples=100, n_features=20, n_informative=10, random_state=42)
         X_train, X_val = X[:70], X[70:]
         y_train, y_val = y[:70], y[70:]
         return (
@@ -235,6 +231,4 @@ class TestIntegrationWithTraining:
         loaded_params = load_best_params("xgboost")
         assert loaded_params is not None
         assert isinstance(loaded_params, dict)
-        assert all(
-            key in loaded_params for key in ["max_depth", "learning_rate", "subsample"]
-        )
+        assert all(key in loaded_params for key in ["max_depth", "learning_rate", "subsample"])

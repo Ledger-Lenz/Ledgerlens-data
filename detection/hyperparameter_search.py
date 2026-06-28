@@ -70,8 +70,7 @@ def get_search_space(model_name: str) -> dict[str, Any]:
     }
     if model_name not in spaces:
         raise ValueError(
-            f"Unknown model_name: {model_name}. "
-            f"Must be one of {list(spaces.keys())}"
+            f"Unknown model_name: {model_name}. " f"Must be one of {list(spaces.keys())}"
         )
     return spaces[model_name]
 
@@ -111,9 +110,7 @@ def _train_isolation_forest(
     return f1_score(y_train, y_pred_binary, zero_division=0)
 
 
-def _train_xgboost(
-    X_train: pd.DataFrame, y_train: pd.Series, params: dict[str, Any]
-) -> float:
+def _train_xgboost(X_train: pd.DataFrame, y_train: pd.Series, params: dict[str, Any]) -> float:
     """Train XGBoost and return F1 score."""
     model = XGBClassifier(**params, random_state=42, verbosity=0)
     model.fit(X_train, y_train, verbose=False)

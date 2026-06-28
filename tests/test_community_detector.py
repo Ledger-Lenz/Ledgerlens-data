@@ -133,11 +133,13 @@ class TestRingConcentrationScore:
     def test_no_matching_trades(self):
         """Trades with non-matching wallets return 0.0 score."""
         community_map = {"W1": 0, "W2": 0}
-        trades_df = pd.DataFrame({
-            "base_account": ["W3"],
-            "counter_account": ["W4"],
-            "amount": [100.0],
-        })
+        trades_df = pd.DataFrame(
+            {
+                "base_account": ["W3"],
+                "counter_account": ["W4"],
+                "amount": [100.0],
+            }
+        )
         graph = nx.DiGraph()
         result = compute_ring_concentration_score(community_map, graph, trades_df)
         # Community 0 exists but has no trades involving its members, so score is 0.0
@@ -146,11 +148,13 @@ class TestRingConcentrationScore:
     def test_intra_community_trades_high_score(self):
         """All trades within a community yield high concentration score."""
         community_map = {"W1": 0, "W2": 0, "W3": 0}
-        trades_df = pd.DataFrame({
-            "base_account": ["W1", "W2", "W3"],
-            "counter_account": ["W2", "W3", "W1"],
-            "amount": [100.0, 100.0, 100.0],
-        })
+        trades_df = pd.DataFrame(
+            {
+                "base_account": ["W1", "W2", "W3"],
+                "counter_account": ["W2", "W3", "W1"],
+                "amount": [100.0, 100.0, 100.0],
+            }
+        )
         graph = nx.DiGraph()
         result = compute_ring_concentration_score(community_map, graph, trades_df)
         assert 0 in result
@@ -159,11 +163,13 @@ class TestRingConcentrationScore:
     def test_mixed_trades_partial_score(self):
         """Community with both internal and external trades yields 0 < score < 1."""
         community_map = {"W1": 0, "W2": 0, "W3": 1}
-        trades_df = pd.DataFrame({
-            "base_account": ["W1", "W1"],
-            "counter_account": ["W2", "W3"],
-            "amount": [100.0, 100.0],
-        })
+        trades_df = pd.DataFrame(
+            {
+                "base_account": ["W1", "W1"],
+                "counter_account": ["W2", "W3"],
+                "amount": [100.0, 100.0],
+            }
+        )
         graph = nx.DiGraph()
         result = compute_ring_concentration_score(community_map, graph, trades_df)
         assert 0 in result
@@ -172,11 +178,13 @@ class TestRingConcentrationScore:
     def test_non_communities_omitted(self):
         """Communities with id -1 are omitted from result."""
         community_map = {"W1": -1, "W2": -1}
-        trades_df = pd.DataFrame({
-            "base_account": ["W1"],
-            "counter_account": ["W2"],
-            "amount": [100.0],
-        })
+        trades_df = pd.DataFrame(
+            {
+                "base_account": ["W1"],
+                "counter_account": ["W2"],
+                "amount": [100.0],
+            }
+        )
         graph = nx.DiGraph()
         result = compute_ring_concentration_score(community_map, graph, trades_df)
         assert -1 not in result

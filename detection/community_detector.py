@@ -105,8 +105,7 @@ def detect_communities(
 
     sizes = Counter(partition.values())
     return {
-        node: (cid if sizes[cid] >= min_community_size else -1)
-        for node, cid in partition.items()
+        node: (cid if sizes[cid] >= min_community_size else -1) for node, cid in partition.items()
     }
 
 
