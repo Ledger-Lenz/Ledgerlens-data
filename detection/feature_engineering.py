@@ -205,6 +205,16 @@ def compute_benford_features(
             features, wallet_trades, per_window, liquidity_profiler, asset
         )
 
+    # Bootstrap CI width — only computed when BENFORD_CI_ENABLED=True
+    if config.BENFORD_CI_ENABLED and not wallet_trades.empty:
+        from detection.benford_engine import compute_benford_confidence_intervals
+
+        amounts = wallet_trades["amount"] if "amount" in wallet_trades.columns else pd.Series(dtype=float)
+        ci = compute_benford_confidence_intervals(amounts)
+        features["benford_ci_width"] = ci["chi_square_ci_width"]
+    else:
+        features["benford_ci_width"] = np.nan
+
     return features
 
 
@@ -952,6 +962,7 @@ def build_feature_vector(
     features.update(compute_hardening_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
+    features["bridge_round_trip_ratio"] = 0.0  # populated by callers that supply bridge tx data
 
     # GNN embedding features — graceful zero-fallback when encoder is absent
     if gnn_encoder is not None and funding_graph is not None:

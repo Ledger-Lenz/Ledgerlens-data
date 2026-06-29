@@ -17,6 +17,12 @@ Calibrated weighted mode:
   ``detection.ensemble_calibrator.EnsembleCalibrator.select_operating_point``)
   and combines model probabilities as a weighted average instead of BFT
   voting. ``weights=None`` (the default) preserves the BFT behaviour above.
+
+Zero-shot routing (Issue #274):
+- When a wallet's asset pair has fewer than ZERO_SHOT_MIN_LABELLED_EXAMPLES
+  labelled training examples, scoring is routed through ZeroShotPatternDetector
+  instead of the ensemble. The zero-shot confidence is blended with the
+  ensemble score via config.ZERO_SHOT_WEIGHT when both are available.
 """
 
 import hashlib
@@ -115,6 +121,22 @@ def _confidence_from_probs(probs: list[float], avg_prob: float) -> int:
         agreement = 1.0 - (max(probs) - min(probs))
         certainty *= max(agreement, 0.0)
     return int(round(certainty * 100))
+
+
+def _zero_shot_score(feature_row: pd.Series) -> dict | None:
+    """Score via ZeroShotPatternDetector if patterns file exists.
+
+    Returns a partial score dict on success, None if unavailable.
+    """
+    try:
+        from detection.zero_shot import ZeroShotPatternDetector
+
+        feature_names = [c for c in feature_row.index if c not in ("wallet",)]
+        detector = ZeroShotPatternDetector.load(feature_names)
+        return detector.score(feature_row.to_dict())
+    except Exception as exc:
+        logger.debug("Zero-shot scoring unavailable: %s", exc)
+        return None
 
 
 def _benford_flag(feature_row: pd.Series) -> bool:
@@ -310,8 +332,16 @@ class RiskScorer:
             }
         return None
 
-    def score(self, feature_row: pd.Series) -> dict:
+    def score(
+        self,
+        feature_row: pd.Series,
+        labelled_count: int | None = None,
+    ) -> dict:
         """Compute the LedgerLens Risk Score for a single feature row.
+
+        When ``labelled_count`` is provided and is less than
+        ``config.ZERO_SHOT_MIN_LABELLED_EXAMPLES``, scoring is routed through
+        the zero-shot pattern detector instead of the ensemble.
 
         Returns a dict matching the on-chain `RiskScore` shape:
             {score, benford_flag, ml_flag, confidence}
@@ -319,6 +349,23 @@ class RiskScorer:
         override = self._check_override(feature_row)
         if override is not None:
             return override
+
+        # Zero-shot routing for asset pairs with insufficient labelled data
+        if (
+            labelled_count is not None
+            and labelled_count < config.ZERO_SHOT_MIN_LABELLED_EXAMPLES
+        ):
+            zs = _zero_shot_score(feature_row)
+            if zs is not None:
+                zs_score = int(round(zs["confidence"] * 100))
+                return {
+                    "score": zs_score,
+                    "benford_flag": _benford_flag(feature_row),
+                    "ml_flag": bool(zs["prediction"] == 1),
+                    "confidence": int(round(zs["confidence"] * 100)),
+                    "zero_shot": True,
+                    "matched_pattern": zs.get("matched_pattern"),
+                }
 
         probs = self._ensemble_probabilities(feature_row)
 

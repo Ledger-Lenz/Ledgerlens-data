@@ -239,3 +239,65 @@ Integration tests (require live Testnet access):
 ```bash
 LEDGERLENS_INTEGRATION_TESTS=1 pytest tests/test_cross_venue_features.py -k integration
 ```
+
+## Cross-Chain Bridge Transaction Detection
+
+### Overview
+
+Bridge wash trading uses Stellar bridge anchors (e.g. Allbridge, Orbit Bridge) to send
+assets out to another chain and back, creating the *appearance* of external demand while
+the same entity controls both sides. Because the round-trip spans multiple blockchains,
+single-chain detectors miss it entirely.
+
+### Bridge Anchor Address List
+
+Known anchor addresses are maintained in **`data/bridge_anchors.json`**:
+
+```json
+{
+  "anchors": [
+    {
+      "address": "GCEZ...",
+      "name": "Allbridge Stellar Anchor",
+      "protocol": "SEP-6",
+      "chains": ["ethereum", "bsc", "solana"]
+    }
+  ]
+}
+```
+
+**Validation:** Every address is validated as a 56-character Stellar G-address on load.
+Any malformed entry raises `ValueError` immediately so misconfiguration is caught at
+startup. The list is read-only at runtime — the application does not accept API updates
+to this file.
+
+**Adding new anchors:** Edit `data/bridge_anchors.json` and redeploy. No code changes
+required.
+
+### Round-Trip Detection Algorithm
+
+`detect_bridge_wash_trade(wallet_id, transactions, bridge_contracts, window_hours)` in
+`detection/cross_chain/bridge_detector.py`:
+
+1. Partition payments into **outbound** (wallet → anchor) and **inbound** (anchor → wallet).
+2. For each outbound payment, search inbound payments from the **same anchor** within
+   `BRIDGE_ROUNDTRIP_WINDOW_HOURS` (default 72 h).
+3. Compute **bridge_round_trip_ratio** = matched round-trips ÷ total bridge transactions.
+
+| Ratio | Interpretation |
+|-------|---------------|
+| 1.0 | Every bridge transfer is immediately matched — strong wash-trade signal |
+| 0.0 | No round-trips detected (only outbound or no bridge activity) |
+| 0.3–0.7 | Partial recycling — warrants further investigation |
+
+### Feature: `bridge_round_trip_ratio`
+
+Added to the feature matrix by `detection/feature_engineering.py`. Defaults to `0.0`
+when no bridge transaction data is supplied; callers that fetch payment history should
+invoke `detect_bridge_wash_trade()` and merge the result into the feature row.
+
+### Configuration
+
+```env
+BRIDGE_ROUNDTRIP_WINDOW_HOURS=72   # matching window (hours); default 72
+```

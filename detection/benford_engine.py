@@ -10,6 +10,7 @@ These are computed per wallet / asset / pair over rolling time windows
 group consumed by `feature_engineering.py`.
 """
 
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -278,6 +279,111 @@ def chi_square_log(amounts: pd.Series) -> float:
         if expected_count > 0:
             chi_sq += (observed_count - expected_count) ** 2 / expected_count
     return float(chi_sq)
+
+
+def compute_benford_confidence_intervals(
+    amounts: pd.Series,
+    n_bootstrap: int = 1000,
+    alpha: float = 0.05,
+    wallet_id: str = "",
+    window_hours: int = 0,
+) -> dict:
+    """Bootstrap confidence intervals for Benford chi-square, MAD, and z-scores.
+
+    Gated behind ``config.BENFORD_CI_ENABLED`` (default False) because bootstrap
+    resampling is computationally intensive — O(n_bootstrap × n) per call.
+
+    The random seed is derived from (wallet_id, window_hours) so results are
+    reproducible per wallet/window without touching the global random state.
+
+    Args:
+        amounts:      Series of positive trade amounts.
+        n_bootstrap:  Number of bootstrap resamples (default 1000).
+        alpha:        Significance level; 0.05 gives 95% CIs.
+        wallet_id:    Used to derive a per-(wallet, window) RNG seed.
+        window_hours: Used to derive a per-(wallet, window) RNG seed.
+
+    Returns:
+        Dict with keys:
+          chi_square_lower, chi_square_upper, chi_square_ci_width
+          mad_lower, mad_upper, mad_ci_width
+          z_max_lower, z_max_upper, z_max_ci_width
+          insufficient_data  — True when CI width > point estimate (< ~30 trades)
+    """
+    from config import config
+
+    if not config.BENFORD_CI_ENABLED:
+        return {
+            "chi_square_lower": np.nan,
+            "chi_square_upper": np.nan,
+            "chi_square_ci_width": np.nan,
+            "mad_lower": np.nan,
+            "mad_upper": np.nan,
+            "mad_ci_width": np.nan,
+            "z_max_lower": np.nan,
+            "z_max_upper": np.nan,
+            "z_max_ci_width": np.nan,
+            "insufficient_data": False,
+        }
+
+    amounts = amounts[amounts > 0].reset_index(drop=True)
+    n = len(amounts)
+    if n == 0:
+        return {
+            "chi_square_lower": 0.0,
+            "chi_square_upper": 0.0,
+            "chi_square_ci_width": 0.0,
+            "mad_lower": 0.0,
+            "mad_upper": 0.0,
+            "mad_ci_width": 0.0,
+            "z_max_lower": 0.0,
+            "z_max_upper": 0.0,
+            "z_max_ci_width": 0.0,
+            "insufficient_data": True,
+        }
+
+    # Deterministic seed per (wallet_id, window_hours) — no global seed mutation
+    seed = int(hashlib.sha256(f"{wallet_id}:{window_hours}".encode()).hexdigest(), 16) % (2**32)
+    rng = np.random.default_rng(seed)
+
+    chi_samples = []
+    mad_samples = []
+    zmax_samples = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        boot = amounts.iloc[idx]
+        chi_samples.append(chi_square_statistic(boot))
+        mad_samples.append(mad_score(boot))
+        zmax_boot = z_scores(boot)
+        zmax_samples.append(max(zmax_boot.values(), default=0.0))
+
+    lo = alpha / 2 * 100
+    hi = (1 - alpha / 2) * 100
+
+    chi_lo = float(np.percentile(chi_samples, lo))
+    chi_hi = float(np.percentile(chi_samples, hi))
+    mad_lo = float(np.percentile(mad_samples, lo))
+    mad_hi = float(np.percentile(mad_samples, hi))
+    zm_lo = float(np.percentile(zmax_samples, lo))
+    zm_hi = float(np.percentile(zmax_samples, hi))
+
+    chi_point = chi_square_statistic(amounts)
+    chi_width = chi_hi - chi_lo
+    insufficient = (chi_point > 0) and (chi_width > chi_point)
+
+    return {
+        "chi_square_lower": chi_lo,
+        "chi_square_upper": chi_hi,
+        "chi_square_ci_width": chi_width,
+        "mad_lower": mad_lo,
+        "mad_upper": mad_hi,
+        "mad_ci_width": mad_hi - mad_lo,
+        "z_max_lower": zm_lo,
+        "z_max_upper": zm_hi,
+        "z_max_ci_width": zm_hi - zm_lo,
+        "insufficient_data": insufficient,
+    }
 
 
 def bootstrap_chi_square_ci(
