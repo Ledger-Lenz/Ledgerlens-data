@@ -1,0 +1,28 @@
+{
+  "anchors": [
+    {
+      "address": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGYWDEAVJJCSBVALM2XVKXB",
+      "name": "Allbridge Stellar Anchor",
+      "protocol": "SEP-6",
+      "chains": ["ethereum", "bsc", "solana"]
+    },
+    {
+      "address": "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+      "name": "Interstellar Bridge Anchor",
+      "protocol": "SEP-24",
+      "chains": ["ethereum"]
+    },
+    {
+      "address": "GBVAOIACNSB7OVUXJYC5UE2D4YK2F7A24T7EE5YOMN4CE9GCHUTOUQXR",
+      "name": "Orbit Bridge Stellar Anchor",
+      "protocol": "SEP-31",
+      "chains": ["ethereum", "polygon"]
+    },
+    {
+      "address": "GD6WNTESP5CM52ZTDXMCH47MIESVTH22Q4AGXNZQZ7HLCSO5YSQDQMA",
+      "name": "Li.Fi Stellar Anchor",
+      "protocol": "SEP-6",
+      "chains": ["ethereum", "arbitrum", "optimism"]
+    }
+  ]
+}

@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from typing import TYPE_CHECKING
 
 import networkx as nx
 import numpy as np
@@ -49,7 +50,7 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Optional torch / torch_geometric imports — graceful absence supported
 # ---------------------------------------------------------------------------
-if TYPE_CHECKING:
+try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -57,22 +58,13 @@ if TYPE_CHECKING:
     from torch_geometric.nn import SAGEConv
 
     _TORCH_AVAILABLE = True
-else:
-    try:
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        from torch_geometric.data import Data
-        from torch_geometric.nn import SAGEConv
-
-        _TORCH_AVAILABLE = True
-    except ImportError:  # pragma: no cover
-        _TORCH_AVAILABLE = False
-        torch = None
-        nn = None
-        F = None
-        Data = None
-        SAGEConv = None
+except ImportError:  # pragma: no cover
+    _TORCH_AVAILABLE = False
+    torch = None
+    nn = None
+    F = None
+    Data = None
+    SAGEConv = None
 
 # ---------------------------------------------------------------------------
 # Node feature dimensionality
@@ -549,3 +541,165 @@ def pretrain_gnn_contrastive(
     encoder._embedding_cache.clear()
     logger.info("GNN pre-training complete — final loss: %.6f", loss_curve[-1] if loss_curve else 0)
     return loss_curve
+
+
+# ---------------------------------------------------------------------------
+# Graph-level pooling via DiffPool (issue #269)
+# ---------------------------------------------------------------------------
+
+_DIFFPOOL_MAX_NODES = 50  # hard cap for dense adjacency representation
+
+
+if _TORCH_AVAILABLE:
+
+    class _DiffPoolAssignNet(nn.Module):
+        """Produces a soft node-to-cluster assignment matrix S ∈ ℝ^{N×K}."""
+
+        def __init__(self, in_channels: int, hidden_channels: int, n_clusters: int) -> None:
+            super().__init__()
+            self.conv1 = SAGEConv(in_channels, hidden_channels, aggr="mean")
+            self.conv2 = SAGEConv(hidden_channels, n_clusters, aggr="mean")
+
+        def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+            x = F.relu(self.conv1(x, edge_index))
+            return F.softmax(self.conv2(x, edge_index), dim=-1)
+
+else:
+    _DiffPoolAssignNet = None  # type: ignore[assignment,misc]
+
+
+class GraphLevelPooling:
+    """Hierarchical DiffPool graph pooling that coarsens a wallet graph into a
+    graph-level embedding.
+
+    Architecture
+    ------------
+    1. The pretrained ``GNNEncoder`` computes per-node embeddings.
+    2. A shallow ``_DiffPoolAssignNet`` produces soft cluster assignments S.
+    3. Pooled features: ``X_out = S^T · X``  (shape K × D).
+    4. A global mean-readout collapses K nodes → one graph embedding (shape D).
+    5. A single linear head maps D → 1 scalar (unnormalised cluster risk logit).
+
+    The graph-level risk score (0–100) is sigmoid(logit) × 100.
+
+    Parameters
+    ----------
+    embedding_dim:
+        Dimensionality of node embeddings from ``GNNEncoder`` (must match the
+        encoder's ``embedding_dim``).
+    n_clusters:
+        Target cluster count after DiffPool coarsening
+        (``GNN_DIFFPOOL_CLUSTERS``, default 10).
+    hidden_dim:
+        Hidden layer size in the assignment network.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int | None = None,
+        n_clusters: int | None = None,
+        hidden_dim: int | None = None,
+    ) -> None:
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("torch and torch_geometric are required for GraphLevelPooling")
+
+        self.embedding_dim = embedding_dim or config.GNN_EMBEDDING_DIM
+        self.n_clusters = n_clusters or config.GNN_DIFFPOOL_CLUSTERS
+        self.hidden_dim = hidden_dim or config.GNN_HIDDEN_DIM
+
+        self._assign_net = _DiffPoolAssignNet(
+            in_channels=self.embedding_dim,
+            hidden_channels=self.hidden_dim,
+            n_clusters=self.n_clusters,
+        )
+        self._assign_net.eval()
+
+        # Linear readout head: graph embedding → scalar logit
+        self._head = nn.Linear(self.embedding_dim, 1)
+        nn.init.xavier_uniform_(self._head.weight)
+        nn.init.zeros_(self._head.bias)
+
+    def pool_graph(
+        self,
+        node_embeddings: np.ndarray,
+        graph: nx.DiGraph,
+        node_order: list[str],
+    ) -> np.ndarray:
+        """Coarsen the graph using DiffPool and return a graph-level embedding.
+
+        Parameters
+        ----------
+        node_embeddings:
+            Shape ``(N, embedding_dim)`` — output of ``GNNEncoder._run_inference``.
+        graph:
+            The (sub)graph whose adjacency structure is used by the assign net.
+        node_order:
+            Canonical ordering of nodes (must align with ``node_embeddings``).
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(embedding_dim,)`` — graph-level embedding.
+        """
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("torch and torch_geometric are required")
+
+        data = _nx_to_pyg(graph, node_order)
+        x = torch.tensor(node_embeddings, dtype=torch.float32)
+
+        with torch.no_grad():
+            s = self._assign_net(x, data.edge_index)          # (N, K)
+            x_pooled = s.T @ x                                # (K, D)
+            graph_emb = x_pooled.mean(dim=0)                  # (D,)
+
+        return graph_emb.cpu().numpy().astype(np.float32)
+
+    def score_from_embedding(self, graph_embedding: np.ndarray) -> float:
+        """Map a graph-level embedding to a risk score in [0, 100]."""
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("torch is required")
+        emb = torch.tensor(graph_embedding, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            logit = self._head(emb).squeeze()
+        return float(torch.sigmoid(logit).item() * 100.0)
+
+    def compute_cluster_score(
+        self,
+        graph: nx.DiGraph,
+        wallet_ids: list[str],
+        encoder: GNNEncoder,
+        wallet_metadata: dict[str, dict] | None = None,
+    ) -> float:
+        """Compute a graph-level cluster risk score for ``wallet_ids``.
+
+        The returned score is permutation-invariant: reordering ``wallet_ids``
+        produces the same result because the node ordering is canonically sorted.
+
+        Parameters
+        ----------
+        graph:
+            Full wallet graph (superset of the cluster wallets).
+        wallet_ids:
+            Wallet addresses forming the cluster (order-independent).
+        encoder:
+            Pretrained ``GNNEncoder`` instance.
+        wallet_metadata:
+            Optional per-node metadata dict.
+
+        Returns
+        -------
+        float
+            Cluster risk score in [0, 100].
+        """
+        if not wallet_ids:
+            return 0.0
+
+        # Canonical node ordering ensures permutation invariance
+        node_order = sorted(set(wallet_ids) & set(graph.nodes()))
+        if not node_order:
+            return 0.0
+
+        subgraph = graph.subgraph(node_order).copy()
+        node_embs = encoder._run_inference(subgraph, node_order, wallet_metadata)
+        graph_emb = self.pool_graph(node_embs, subgraph, node_order)
+        return self.score_from_embedding(graph_emb)

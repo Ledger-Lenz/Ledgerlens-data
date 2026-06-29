@@ -1,0 +1,60 @@
+groups:
+  - name: ledgerlens_per_pair_health
+    interval: 1m
+    rules:
+      # Fires when a pair's composite health score falls below 0.7 for 30 minutes.
+      # Formula: 40% latency health + 40% Benford MAD health + 20% FP-rate health.
+      # Score = 1.0 means healthy; 0.0 means completely degraded.
+      - alert: PairHealthScoreLow
+        expr: |
+          (
+            (1 - clamp_max(
+              histogram_quantile(0.95,
+                sum(rate(ledgerlens_score_duration_seconds_bucket[5m])) by (le, asset_pair)
+              ) / 0.5,
+            1)) * 0.4
+            +
+            (1 - clamp_max(ledgerlens_benford_mad_gauge / 0.03, 1)) * 0.4
+            +
+            (1 - clamp_max(
+              sum(rate(ledgerlens_benford_computation_total{status="false_positive"}[10m])) by (asset_pair)
+              / (sum(rate(ledgerlens_benford_computation_total{status="alert_confirmed"}[10m])) by (asset_pair) + 0.001),
+            1)) * 0.2
+          ) < 0.7
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Per-pair health score below threshold for {{ $labels.asset_pair }}"
+          description: >
+            The composite health score for asset pair {{ $labels.asset_pair }} has been
+            below 0.7 for more than 30 minutes (current value: {{ $value | printf "%.2f" }}).
+            Check scoring latency, Benford MAD freshness, and false-positive rate for this pair.
+
+      # Fires when scoring latency p95 exceeds 500ms for a pair for 10 minutes.
+      - alert: PairScoringLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ledgerlens_score_duration_seconds_bucket[5m])) by (le, asset_pair)
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High scoring latency for {{ $labels.asset_pair }}"
+          description: >
+            p95 scoring latency for {{ $labels.asset_pair }} has exceeded 500ms for 10 minutes
+            (current p95: {{ $value | printf "%.3f" }}s).
+
+      # Fires when Benford MAD exceeds non-conformity threshold for a pair.
+      - alert: PairBenfordNonConforming
+        expr: ledgerlens_benford_mad_gauge > 0.015
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Benford MAD non-conformity for {{ $labels.asset_pair }}"
+          description: >
+            Benford MAD for {{ $labels.asset_pair }} has been above the 0.015 non-conformity
+            threshold for 15 minutes (current MAD: {{ $value | printf "%.4f" }}).
+            This may indicate sustained wash-trading activity or a data quality issue.

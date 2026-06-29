@@ -38,8 +38,12 @@ def test_train_models_returns_metrics_for_each_model(trained_output):
     results = output["results"]
     assert set(results) == set(MODEL_REGISTRY)
     for result in results.values():
-        assert set(result["metrics"]) == {"auc_roc", "pr_auc", "f1"}
+        base_keys = {"auc_roc", "pr_auc", "f1"}
+        conformal_keys = {"conformal_empirical_coverage", "conformal_q_hat", "calibration_split_size"}
+        assert base_keys.issubset(set(result["metrics"]))
+        assert conformal_keys.issubset(set(result["metrics"]))
         assert 0.0 <= result["metrics"]["auc_roc"] <= 1.0
+        assert 0.0 <= result["metrics"]["conformal_empirical_coverage"] <= 1.0
 
 
 def test_train_models_returns_held_out_split(trained_output):

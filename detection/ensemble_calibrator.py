@@ -30,7 +30,10 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -340,3 +343,271 @@ class EnsembleCalibrator:
                 f"and recall >= {min_recall}"
             )
         return max(feasible, key=lambda s: s.objectives["shap_stability"]).weights
+
+
+# ---------------------------------------------------------------------------
+# Dynamic weight adjustment based on observed per-model false positive rates
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_WEIGHT_MIN = 0.05
+_DYNAMIC_WEIGHT_MAX = 0.80
+_MIN_FP_FEEDBACK = 10
+_PREDICTION_FP_THRESHOLD = 0.5  # model probability above which it "voted" for the alert
+
+
+def _setup_weight_gauges(model_names: list[str]) -> dict[str, Any]:
+    """Create Prometheus gauges for per-model dynamic weights (graceful if absent)."""
+    gauges: dict[str, Any] = {}
+    try:
+        from prometheus_client import Gauge
+
+        for name in model_names:
+            metric_name = f"ensemble_dynamic_weight_{name.replace('-', '_').replace(' ', '_')}"
+            try:
+                gauges[name] = Gauge(
+                    metric_name,
+                    f"Current dynamic ensemble weight for model {name}",
+                )
+            except Exception:
+                # Gauge already registered (common in test suites); retrieve it
+                from prometheus_client import REGISTRY
+
+                for collector in list(REGISTRY._names_to_collectors.values()):
+                    if hasattr(collector, "_name") and collector._name == metric_name:
+                        gauges[name] = collector
+                        break
+    except Exception:  # pragma: no cover
+        pass
+    return gauges
+
+
+@dataclass
+class _ModelObservations:
+    """Rolling observation buffer for one model."""
+
+    fp_count: int = 0
+    total_count: int = 0
+
+    @property
+    def fp_rate(self) -> float:
+        if self.total_count == 0:
+            return 0.0
+        return self.fp_count / self.total_count
+
+    def record(self, is_fp: bool) -> None:
+        self.total_count += 1
+        if is_fp:
+            self.fp_count += 1
+
+
+class EnsembleDynamicWeightController:
+    """Adjusts per-model ensemble weights inversely proportional to observed FP rates.
+
+    Feedback from operator-verified false positive annotations is used to penalise
+    models that produce frequent false alerts.  Weight updates are exponentially
+    smoothed (``ENSEMBLE_WEIGHT_SMOOTHING_ALPHA``, default 0.1) to prevent
+    overcorrection on small samples.
+
+    A minimum of ``_MIN_FP_FEEDBACK`` (10) confirmed FP annotations are required
+    before any weight is changed from the training-time baseline.
+
+    Systemic reset: when **all** models simultaneously exceed
+    ``ENSEMBLE_SYSTEMIC_FP_THRESHOLD`` (default 0.5), weights revert to the
+    training-time values and a WARNING is logged.
+
+    Weight bounds: [0.05, 0.80] per model.
+
+    Security: every FP observation requires a non-empty ``annotator_id`` and
+    ``audit_trail_id`` so that feedback is linked to the operator's audit trail,
+    preventing anonymous manipulation of ensemble weights.
+    """
+
+    def __init__(
+        self,
+        training_weights: dict[str, float],
+        session_factory=None,
+        smoothing_alpha: float | None = None,
+        systemic_fp_threshold: float | None = None,
+    ) -> None:
+        if not training_weights:
+            raise ValueError("training_weights must map at least one model name to a weight")
+
+        self.training_weights: dict[str, float] = dict(training_weights)
+        self._session_factory = session_factory
+        self._alpha: float = (
+            smoothing_alpha
+            if smoothing_alpha is not None
+            else config.ENSEMBLE_WEIGHT_SMOOTHING_ALPHA
+        )
+        self._systemic_threshold: float = (
+            systemic_fp_threshold
+            if systemic_fp_threshold is not None
+            else config.ENSEMBLE_SYSTEMIC_FP_THRESHOLD
+        )
+
+        self._lock = threading.Lock()
+        self._current_weights: dict[str, float] = dict(training_weights)
+        self._observations: dict[str, _ModelObservations] = {
+            name: _ModelObservations() for name in training_weights
+        }
+        self._systemic_reset_count: int = 0
+
+        self._gauges = _setup_weight_gauges(list(training_weights))
+        self._update_gauges()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def observe_false_positive(
+        self,
+        wallet: str,
+        model_predictions: dict[str, float],
+        annotator_id: str,
+        audit_trail_id: str,
+    ) -> None:
+        """Record a confirmed false positive from an authenticated operator.
+
+        Parameters
+        ----------
+        wallet:
+            The wallet address that was falsely flagged (used for logging only).
+        model_predictions:
+            Per-model predicted wash-trading probability (0–1) at the time of the
+            alert.  Keys must match the model names in ``training_weights``.
+        annotator_id:
+            Non-empty operator identifier — required for authentication.
+        audit_trail_id:
+            Non-empty audit trail entry ID linking this feedback to the verified
+            operator action.  Prevents anonymous weight manipulation.
+        """
+        if not annotator_id:
+            raise ValueError("annotator_id must be a non-empty string")
+        if not audit_trail_id:
+            raise ValueError("audit_trail_id must be a non-empty string (linked to audit trail)")
+
+        with self._lock:
+            for name, obs in self._observations.items():
+                pred = model_predictions.get(name, 0.0)
+                # Model "voted" for the alert if it predicted above the FP threshold
+                is_fp = pred >= _PREDICTION_FP_THRESHOLD
+                obs.record(is_fp)
+
+            logger.info(
+                "FP feedback recorded for wallet=%s by annotator=%s (audit=%s); "
+                "total observations: %s",
+                wallet,
+                annotator_id,
+                audit_trail_id,
+                {name: obs.total_count for name, obs in self._observations.items()},
+            )
+            self._maybe_update_weights()
+
+    def current_weights(self) -> dict[str, float]:
+        """Return the current (possibly adjusted) per-model weight vector."""
+        with self._lock:
+            return dict(self._current_weights)
+
+    def fp_rates(self) -> dict[str, float]:
+        """Return the current observed FP rate per model."""
+        with self._lock:
+            return {name: obs.fp_rate for name, obs in self._observations.items()}
+
+    def observation_counts(self) -> dict[str, int]:
+        """Return how many FP feedback events have been recorded per model."""
+        with self._lock:
+            return {name: obs.total_count for name, obs in self._observations.items()}
+
+    def reset_to_training_weights(self, reason: str = "manual") -> None:
+        """Revert dynamic weights to the training-time values."""
+        with self._lock:
+            self._current_weights = dict(self.training_weights)
+            self._update_gauges()
+            self._persist_weights(is_systemic_reset=True)
+            logger.warning("Ensemble weights reset to training-time values: reason=%s", reason)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _maybe_update_weights(self) -> None:
+        """Recompute and smooth weights if minimum feedback count is met.
+
+        Must be called while holding ``self._lock``.
+        """
+        total = min(obs.total_count for obs in self._observations.values())
+        if total < _MIN_FP_FEEDBACK:
+            return
+
+        rates = {name: obs.fp_rate for name, obs in self._observations.items()}
+
+        # Systemic reset: all models simultaneously above threshold
+        if all(r >= self._systemic_threshold for r in rates.values()):
+            self._systemic_reset_count += 1
+            self._current_weights = dict(self.training_weights)
+            self._update_gauges()
+            self._persist_weights(is_systemic_reset=True)
+            logger.warning(
+                "Systemic FP rate detected (all models >= %.2f). "
+                "Resetting to training-time weights. Reset count: %d",
+                self._systemic_threshold,
+                self._systemic_reset_count,
+            )
+            return
+
+        # Compute raw new weights: inversely proportional to FP rate
+        _eps = 1e-6
+        raw = {name: 1.0 / (rate + _eps) for name, rate in rates.items()}
+        total_raw = sum(raw.values())
+        normalised = {name: v / total_raw for name, v in raw.items()}
+
+        # Clamp to [_DYNAMIC_WEIGHT_MIN, _DYNAMIC_WEIGHT_MAX] then re-normalise
+        clamped = {name: max(_DYNAMIC_WEIGHT_MIN, min(_DYNAMIC_WEIGHT_MAX, w))
+                   for name, w in normalised.items()}
+        total_clamped = sum(clamped.values())
+        target = {name: v / total_clamped for name, v in clamped.items()}
+
+        # Exponential smoothing
+        for name in self._current_weights:
+            old = self._current_weights[name]
+            new = target.get(name, old)
+            self._current_weights[name] = self._alpha * new + (1.0 - self._alpha) * old
+
+        # Re-normalise after smoothing so weights always sum to 1
+        total_w = sum(self._current_weights.values())
+        for name in self._current_weights:
+            self._current_weights[name] /= total_w
+
+        self._update_gauges()
+        self._persist_weights(is_systemic_reset=False)
+        logger.info("Dynamic ensemble weights updated: %s", self._current_weights)
+
+    def _update_gauges(self) -> None:
+        for name, weight in self._current_weights.items():
+            g = self._gauges.get(name)
+            if g is not None:
+                try:
+                    g.set(weight)
+                except Exception:  # pragma: no cover
+                    pass
+
+    def _persist_weights(self, *, is_systemic_reset: bool) -> None:
+        if self._session_factory is None:
+            return
+        try:
+            from detection.persistence import EnsembleWeightRecord
+
+            with self._session_factory() as session:
+                for name, weight in self._current_weights.items():
+                    session.add(
+                        EnsembleWeightRecord(
+                            model_name=name,
+                            weight=weight,
+                            fp_rate=self._observations[name].fp_rate,
+                            observation_count=self._observations[name].total_count,
+                            is_systemic_reset=is_systemic_reset,
+                        )
+                    )
+                session.commit()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Failed to persist ensemble weight history: %s", exc)

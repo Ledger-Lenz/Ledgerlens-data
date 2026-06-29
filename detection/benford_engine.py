@@ -8,10 +8,19 @@ Implements the three metrics described in the project README:
 These are computed per wallet / asset / pair over rolling time windows
 (see `config.BENFORD_WINDOWS_HOURS`) and feed into the Benford feature
 group consumed by `feature_engineering.py`.
+
+Asset-class-aware baselines (issue #279):
+  Stablecoin amounts cluster around round dollar values (100, 1000, 10000 USDC)
+  by convention, naturally producing elevated digit-1 frequency that deviates
+  from the theoretical Benford distribution without indicating manipulation.
+  `AssetClassifier` maintains separate expected distributions per asset class,
+  loaded from `data/build_config.json`, to reduce stablecoin false positives.
 """
 
+import hashlib
 import math
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -42,6 +51,153 @@ class BenfordMetrics:
 # Benford's Law expected frequency for leading digits 1-9
 BENFORD_EXPECTED = {d: math.log10(1 + 1 / d) for d in range(1, 10)}
 
+_BUILD_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "build_config.json")
+
+
+def _load_build_config() -> dict:
+    try:
+        with open(_BUILD_CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Asset-class-aware Benford baseline calibration (issue #279)
+# ---------------------------------------------------------------------------
+
+_ASSET_CLASS_STABLECOIN = "stablecoin"
+_ASSET_CLASS_NATIVE = "native"
+_ASSET_CLASS_VOLATILE = "volatile"
+
+
+@dataclass
+class AssetClassifier:
+    """Classify assets as stablecoin, native, or volatile and supply per-class
+    empirical Benford baseline distributions.
+
+    The stablecoin list is loaded from ``data/build_config.json`` on startup.
+    Empirical baselines for each class are computed from clean-labelled trades
+    via :meth:`fit_from_clean_trades`.  Until ``fit_from_clean_trades`` is
+    called the class falls back to the static distributions in
+    ``build_config.json`` (stablecoins) or the theoretical Benford distribution
+    (native / volatile).
+
+    Security: the stablecoin set is derived exclusively from
+    ``build_config.json``; arbitrary asset codes passed via API parameters are
+    never added to the set.
+    """
+
+    _stablecoins: set[str] = field(default_factory=set)
+    _native_assets: set[str] = field(default_factory=set)
+    # Per-class empirical baselines: class -> {digit: frequency}
+    _baselines: dict[str, dict[int, float]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._load_config()
+
+    def _load_config(self) -> None:
+        cfg = _load_build_config()
+        stablecoins = cfg.get("stablecoins", [])
+        if not isinstance(stablecoins, list) or not all(
+            isinstance(s, str) for s in stablecoins
+        ):
+            raise ValueError(
+                "build_config.json 'stablecoins' must be a list of strings"
+            )
+        self._stablecoins = {s.upper() for s in stablecoins}
+
+        native_assets = cfg.get("native_assets", ["XLM"])
+        self._native_assets = {a.upper() for a in native_assets}
+
+        # Load static stablecoin baseline from config if present
+        static = cfg.get("asset_class_benford_baselines", {})
+        sc_dist = static.get("stablecoin", {}).get("distribution")
+        if sc_dist:
+            try:
+                parsed = {int(k): float(v) for k, v in sc_dist.items()}
+                if len(parsed) == 9:
+                    self._baselines[_ASSET_CLASS_STABLECOIN] = parsed
+            except (ValueError, KeyError):
+                pass
+
+    def classify(self, asset_code: str) -> str:
+        """Return 'stablecoin', 'native', or 'volatile' for *asset_code*.
+
+        *asset_code* is the bare asset code (e.g. 'USDC', 'XLM'), not the
+        full CODE:ISSUER string.
+        """
+        code = asset_code.upper().split(":")[0]
+        if code in self._stablecoins:
+            return _ASSET_CLASS_STABLECOIN
+        if code in self._native_assets:
+            return _ASSET_CLASS_NATIVE
+        return _ASSET_CLASS_VOLATILE
+
+    def classify_pair(self, asset_pair: str) -> str:
+        """Return the asset class for the *base* leg of a CODE:ISSUER/CODE:ISSUER pair.
+
+        If either leg is a stablecoin the pair is classified as stablecoin to
+        apply conservative thresholds.
+        """
+        parts = asset_pair.split("/")
+        classes = [self.classify(p.split(":")[0]) for p in parts if p]
+        if _ASSET_CLASS_STABLECOIN in classes:
+            return _ASSET_CLASS_STABLECOIN
+        if _ASSET_CLASS_NATIVE in classes and len(classes) == 1:
+            return _ASSET_CLASS_NATIVE
+        return _ASSET_CLASS_VOLATILE
+
+    def get_baseline(self, asset_code: str) -> dict[int, float]:
+        """Return the expected digit distribution for *asset_code*'s class.
+
+        Falls back to the theoretical Benford distribution for unknown classes
+        or when no empirical baseline has been fitted.
+        """
+        cls = self.classify(asset_code)
+        return self._baselines.get(cls, dict(BENFORD_EXPECTED))
+
+    def fit_from_clean_trades(
+        self, labelled_df: pd.DataFrame, amount_col: str = "amount"
+    ) -> None:
+        """Compute empirical baselines per asset class from clean (label=0) trades.
+
+        Parameters
+        ----------
+        labelled_df:
+            DataFrame with columns ``amount``, ``asset_code`` (bare code such
+            as ``'USDC'``), and ``label`` (0 = clean, 1 = wash trade).
+        """
+        if labelled_df.empty:
+            return
+        clean = labelled_df[labelled_df.get("label", pd.Series(dtype=int)) == 0]
+        if clean.empty:
+            return
+
+        for cls in (_ASSET_CLASS_STABLECOIN, _ASSET_CLASS_NATIVE, _ASSET_CLASS_VOLATILE):
+            if "asset_code" in clean.columns:
+                mask = clean["asset_code"].apply(
+                    lambda c: self.classify(str(c)) == cls
+                )
+                subset = clean.loc[mask, amount_col].dropna()
+            else:
+                subset = pd.Series(dtype=float)
+
+            if len(subset) >= 30:
+                self._baselines[cls] = observed_distribution(subset)
+
+
+# Module-level singleton, lazily constructed on first access.
+_classifier = None  # type: ignore[assignment]  # AssetClassifier | None
+
+
+def get_asset_classifier() -> "AssetClassifier":
+    """Return the module-level AssetClassifier singleton."""
+    global _classifier
+    if _classifier is None:
+        _classifier = AssetClassifier()
+    return _classifier
+
 MAD_NONCONFORMITY_THRESHOLD = 0.015
 
 
@@ -70,8 +226,16 @@ def observed_distribution(amounts: pd.Series) -> dict[int, float]:
     return {d: float(counts.get(d, 0.0)) for d in range(1, 10)}
 
 
-def chi_square_statistic(amounts: pd.Series) -> float:
-    """Chi-square goodness-of-fit statistic against Benford's distribution."""
+def chi_square_statistic(
+    amounts: pd.Series,
+    baseline: dict[int, float] | None = None,
+) -> float:
+    """Chi-square goodness-of-fit statistic against a digit distribution.
+
+    *baseline* defaults to the theoretical Benford distribution when omitted,
+    but callers may supply an asset-class-specific baseline (issue #279).
+    """
+    expected = baseline if baseline is not None else BENFORD_EXPECTED
     digits = leading_digits(amounts)
     n = len(digits)
     if n == 0:
@@ -80,7 +244,7 @@ def chi_square_statistic(amounts: pd.Series) -> float:
     observed_counts = digits.value_counts()
     chi_sq = 0.0
     for d in range(1, 10):
-        expected_count = BENFORD_EXPECTED[d] * n
+        expected_count = expected.get(d, BENFORD_EXPECTED[d]) * n
         observed_count = observed_counts.get(d, 0)
         if expected_count > 0:
             chi_sq += (observed_count - expected_count) ** 2 / expected_count
@@ -88,8 +252,15 @@ def chi_square_statistic(amounts: pd.Series) -> float:
     return float(chi_sq)
 
 
-def z_scores(amounts: pd.Series) -> dict[int, float]:
-    """Per-digit Z-score of the observed vs. expected Benford proportion."""
+def z_scores(
+    amounts: pd.Series,
+    baseline: dict[int, float] | None = None,
+) -> dict[int, float]:
+    """Per-digit Z-score of the observed vs. expected digit proportion.
+
+    *baseline* defaults to the theoretical Benford distribution when omitted.
+    """
+    expected = baseline if baseline is not None else BENFORD_EXPECTED
     digits = leading_digits(amounts)
     n = len(digits)
     if n == 0:
@@ -98,10 +269,10 @@ def z_scores(amounts: pd.Series) -> dict[int, float]:
     observed = observed_distribution(amounts)
     scores = {}
     for d in range(1, 10):
-        p = BENFORD_EXPECTED[d]
-        # Standard error for a proportion under Benford's expected distribution,
+        p = expected.get(d, BENFORD_EXPECTED[d])
+        # Standard error for a proportion under the expected distribution,
         # with a continuity correction of 1/(2n) per Nigrini (2012).
-        std_err = math.sqrt(p * (1 - p) / n)
+        std_err = math.sqrt(p * (1 - p) / n) if p * (1 - p) > 0 else 0.0
         if std_err == 0:
             scores[d] = 0.0
             continue
@@ -111,23 +282,35 @@ def z_scores(amounts: pd.Series) -> dict[int, float]:
     return scores
 
 
-def mad_score(amounts: pd.Series) -> float:
+def mad_score(
+    amounts: pd.Series,
+    baseline: dict[int, float] | None = None,
+) -> float:
     """Mean Absolute Deviation between observed and expected distributions.
 
+    *baseline* defaults to the theoretical Benford distribution when omitted.
     Values above `MAD_NONCONFORMITY_THRESHOLD` (0.015) indicate the
-    distribution does not conform to Benford's Law (Nigrini, 2012).
+    distribution does not conform (Nigrini, 2012).
     """
+    expected = baseline if baseline is not None else BENFORD_EXPECTED
     digits = leading_digits(amounts)
     if digits.empty:
         return 0.0
 
     observed = observed_distribution(amounts)
-    deviations = [abs(observed[d] - BENFORD_EXPECTED[d]) for d in range(1, 10)]
+    deviations = [abs(observed[d] - expected.get(d, BENFORD_EXPECTED[d])) for d in range(1, 10)]
     return float(sum(deviations) / len(deviations))
 
 
-def compute_benford_metrics(amounts: pd.Series) -> BenfordMetrics:
+def compute_benford_metrics(
+    amounts: pd.Series,
+    asset_code: str | None = None,
+) -> BenfordMetrics:
     """Compute the full set of Benford metrics for a series of amounts.
+
+    When *asset_code* is supplied the appropriate per-class baseline is
+    looked up via :func:`get_asset_classifier` (issue #279).  Falls back
+    to the theoretical Benford distribution for unknown assets.
 
     Returns a BenfordMetrics dataclass (backward compatible with dict access).
     """
@@ -142,12 +325,16 @@ def compute_benford_metrics(amounts: pd.Series) -> BenfordMetrics:
             sample_size=n,
         )
 
-    mad = mad_score(amounts)
+    baseline: dict[int, float] | None = None
+    if asset_code is not None:
+        baseline = get_asset_classifier().get_baseline(asset_code)
+
+    mad = mad_score(amounts, baseline=baseline)
     return BenfordMetrics(
-        chi_square=chi_square_statistic(amounts),
+        chi_square=chi_square_statistic(amounts, baseline=baseline),
         mad=mad,
         mad_nonconforming=mad > MAD_NONCONFORMITY_THRESHOLD,
-        z_scores=z_scores(amounts),
+        z_scores=z_scores(amounts, baseline=baseline),
         sample_size=n,
     )
 
@@ -196,7 +383,7 @@ def compute_benford_metrics_for_windows(
     for hours in windows_hours:
         window_start = ref - pd.Timedelta(hours=hours)
         window_df = df[(timestamps > window_start) & (timestamps <= ref)]
-        results[hours] = compute_benford_metrics(window_df[amount_col])
+        results[hours] = compute_benford_metrics(window_df[amount_col], asset_code=asset)
 
     return results
 
@@ -278,6 +465,111 @@ def chi_square_log(amounts: pd.Series) -> float:
         if expected_count > 0:
             chi_sq += (observed_count - expected_count) ** 2 / expected_count
     return float(chi_sq)
+
+
+def compute_benford_confidence_intervals(
+    amounts: pd.Series,
+    n_bootstrap: int = 1000,
+    alpha: float = 0.05,
+    wallet_id: str = "",
+    window_hours: int = 0,
+) -> dict:
+    """Bootstrap confidence intervals for Benford chi-square, MAD, and z-scores.
+
+    Gated behind ``config.BENFORD_CI_ENABLED`` (default False) because bootstrap
+    resampling is computationally intensive — O(n_bootstrap × n) per call.
+
+    The random seed is derived from (wallet_id, window_hours) so results are
+    reproducible per wallet/window without touching the global random state.
+
+    Args:
+        amounts:      Series of positive trade amounts.
+        n_bootstrap:  Number of bootstrap resamples (default 1000).
+        alpha:        Significance level; 0.05 gives 95% CIs.
+        wallet_id:    Used to derive a per-(wallet, window) RNG seed.
+        window_hours: Used to derive a per-(wallet, window) RNG seed.
+
+    Returns:
+        Dict with keys:
+          chi_square_lower, chi_square_upper, chi_square_ci_width
+          mad_lower, mad_upper, mad_ci_width
+          z_max_lower, z_max_upper, z_max_ci_width
+          insufficient_data  — True when CI width > point estimate (< ~30 trades)
+    """
+    from config import config
+
+    if not config.BENFORD_CI_ENABLED:
+        return {
+            "chi_square_lower": np.nan,
+            "chi_square_upper": np.nan,
+            "chi_square_ci_width": np.nan,
+            "mad_lower": np.nan,
+            "mad_upper": np.nan,
+            "mad_ci_width": np.nan,
+            "z_max_lower": np.nan,
+            "z_max_upper": np.nan,
+            "z_max_ci_width": np.nan,
+            "insufficient_data": False,
+        }
+
+    amounts = amounts[amounts > 0].reset_index(drop=True)
+    n = len(amounts)
+    if n == 0:
+        return {
+            "chi_square_lower": 0.0,
+            "chi_square_upper": 0.0,
+            "chi_square_ci_width": 0.0,
+            "mad_lower": 0.0,
+            "mad_upper": 0.0,
+            "mad_ci_width": 0.0,
+            "z_max_lower": 0.0,
+            "z_max_upper": 0.0,
+            "z_max_ci_width": 0.0,
+            "insufficient_data": True,
+        }
+
+    # Deterministic seed per (wallet_id, window_hours) — no global seed mutation
+    seed = int(hashlib.sha256(f"{wallet_id}:{window_hours}".encode()).hexdigest(), 16) % (2**32)
+    rng = np.random.default_rng(seed)
+
+    chi_samples = []
+    mad_samples = []
+    zmax_samples = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        boot = amounts.iloc[idx]
+        chi_samples.append(chi_square_statistic(boot))
+        mad_samples.append(mad_score(boot))
+        zmax_boot = z_scores(boot)
+        zmax_samples.append(max(zmax_boot.values(), default=0.0))
+
+    lo = alpha / 2 * 100
+    hi = (1 - alpha / 2) * 100
+
+    chi_lo = float(np.percentile(chi_samples, lo))
+    chi_hi = float(np.percentile(chi_samples, hi))
+    mad_lo = float(np.percentile(mad_samples, lo))
+    mad_hi = float(np.percentile(mad_samples, hi))
+    zm_lo = float(np.percentile(zmax_samples, lo))
+    zm_hi = float(np.percentile(zmax_samples, hi))
+
+    chi_point = chi_square_statistic(amounts)
+    chi_width = chi_hi - chi_lo
+    insufficient = (chi_point > 0) and (chi_width > chi_point)
+
+    return {
+        "chi_square_lower": chi_lo,
+        "chi_square_upper": chi_hi,
+        "chi_square_ci_width": chi_width,
+        "mad_lower": mad_lo,
+        "mad_upper": mad_hi,
+        "mad_ci_width": mad_hi - mad_lo,
+        "z_max_lower": zm_lo,
+        "z_max_upper": zm_hi,
+        "z_max_ci_width": zm_hi - zm_lo,
+        "insufficient_data": insufficient,
+    }
 
 
 def bootstrap_chi_square_ci(

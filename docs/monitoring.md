@@ -1,38 +1,65 @@
-# Monitoring
+# LedgerLens Monitoring
 
-## Drift Detection — Sliding Window Covariance Shift (MMD)
+## CUSUM Change-Point Detection (`monitoring/cusum_detector.py`)
 
-`monitoring/drift_detector.py` implements a `CovarianceShiftDetector` that compares the current feature distribution against a reference window using the **Maximum Mean Discrepancy (MMD)** statistic.
+### Theory
 
-### MMD Statistic
+The **CUSUM (Cumulative Sum) control chart** (Page, 1954) detects sustained
+shifts in the mean of a metric stream in O(1) time and O(1) space per update.
 
-MMD measures the distance between two distributions in a reproducing kernel Hilbert space (RKHS):
+LedgerLens uses a **two-sided CUSUM** applied to the stream of risk scores
+produced by the pipeline:
 
 ```
-MMD²(P, Q) = E[k(x,x')] + E[k(y,y')] - 2·E[k(x,y)]
+S_high[n] = max(0, S_high[n-1] + x_n - (μ₀ + k))
+S_low[n]  = max(0, S_low[n-1]  - x_n + (μ₀ - k))
 ```
 
-where `k` is an RBF kernel with bandwidth selected via the **median heuristic** (bandwidth = median of pairwise distances). This gives an unbiased, parameter-free estimate of distribution shift.
+An **alarm** fires when either statistic exceeds the decision threshold **h**.
+After acknowledgement both statistics are reset to zero.
 
-**Why MMD over KL divergence?**
-- KL divergence requires density estimation (histogram binning), which introduces quantisation error and fails for low-sample or continuous distributions.
-- MMD operates directly on samples with no binning, is well-defined even when the two distributions have non-overlapping support, and has stronger theoretical guarantees for finite-sample hypothesis testing.
+| Parameter | Config variable | Default | Meaning |
+|---|---|---|---|
+| μ₀ (target mean) | `CUSUM_TARGET_MEAN` | `30.0` | Expected in-control mean risk score |
+| k (allowable slack) | `CUSUM_ALLOWABLE_SLACK` | `5.0` | Half the minimum detectable shift |
+| h (decision threshold) | `CUSUM_DECISION_THRESHOLD` | `25.0` | Alarm trigger level |
 
-### Configuration
+### Parameter selection guidance
 
-| Variable | Default | Description |
-|---|---|---|
-| `DRIFT_REFERENCE_WINDOW_HOURS` | `168` (7 days) | Look-back window for the reference distribution |
-| `DRIFT_TEST_WINDOW_HOURS` | `1` | Current window to compare against reference |
-| `DRIFT_CHECK_INTERVAL_MINUTES` | `30` | Background task check frequency |
+For a risk score stream with **σ ≈ 15** and a target shift of **10 points**:
 
-### Prometheus Gauge
+- **k = δ/2 = 5.0** — allowable slack set to half the minimum shift of interest
+- **h = 25.0** — achieves:
+  - In-control ARL (average run length before false alarm) ≈ **500 observations**
+  - Out-of-control ARL for a 10-point shift ≈ **10 observations**
 
-`ledgerlens_feature_drift_detected` — set to `1` when drift is detected across any feature, `0` when stable.
+Use the formula `h ≈ (σ²/δ²) · 2 · ln(ARL_out / ARL_in)` for custom tuning,
+or consult Montgomery (2009) Table 9-5.
 
-### Interpreting the Gauge
+Both `CUSUM_ALLOWABLE_SLACK` and `CUSUM_DECISION_THRESHOLD` must be
+non-negative; `CUSUM_DECISION_THRESHOLD` must be strictly positive. A
+`ConfigurationError` is raised on startup if these constraints are violated.
 
-- **0** — all per-feature MMD values are ≤ threshold; model inputs are stable.
-- **1** — at least one feature exceeds the MMD threshold; a warning is logged with the top-5 drifted features ranked by MMD contribution. Consider triggering a retrain.
+### Prometheus metric
 
-Drift reports contain only feature names and MMD statistics — no raw feature values are included.
+`ledgerlens_cusum_alarm{metric="risk_score"}` — Gauge: **1** when alarming, **0** in-control.
+
+The metric is emitted by `monitoring/cusum_detector.py` via `prometheus_client`.
+
+### Alarm state persistence
+
+Alarm state is persisted to Redis under the key
+`ledgerlens:cusum:{metric_name}:alarm` so it survives worker restarts.
+When Redis is unavailable, state is in-memory only (lost on restart).
+
+### Alarm response procedure
+
+1. **Triage**: Check whether the alarm is driven by a genuine new wave of wash
+   trading (risk score distribution shift upward) or model degradation (scores
+   drift upward due to feature drift — cross-reference with PSI drift monitor).
+2. **Investigate**: Query the top-scoring wallets from the past 1h using the
+   `/alerts/recent` API endpoint.
+3. **Resolve**: After investigation, call `CUSUMDetector.acknowledge()` (or
+   the corresponding API endpoint) to reset the statistics.
+4. **Model action**: If the alarm is caused by feature drift, trigger a
+   retraining run via `scripts/retrain_if_drifted.py`.
