@@ -246,6 +246,17 @@ class Config:
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
+    # Incremental LightGBM training
+    # Maximum number of labelled events held in the RecentDataBuffer for
+    # incremental training.  When the buffer reaches this size, incremental
+    # training is triggered automatically.
+    INCREMENTAL_BUFFER_SIZE: int = int(os.getenv("INCREMENTAL_BUFFER_SIZE", "10000"))
+    # Number of new trees appended per incremental pass.
+    INCREMENTAL_N_NEW_TREES: int = int(os.getenv("INCREMENTAL_N_NEW_TREES", "100"))
+    # Maximum consecutive incremental training rounds before forcing a full
+    # retrain to prevent catastrophic forgetting.
+    MAX_INCREMENTAL_ROUNDS: int = int(os.getenv("MAX_INCREMENTAL_ROUNDS", "10"))
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []
