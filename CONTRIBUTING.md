@@ -103,3 +103,84 @@ All security-relevant PRs must reference the threat model and document which mit
 Use the issue templates in `.github/ISSUE_TEMPLATE/`. Include the asset
 pair, wallet, and time window if reporting a detection accuracy issue —
 that's usually enough to reproduce a Benford/feature calculation locally.
+
+## Mutation testing
+
+LedgerLens uses [mutmut](https://github.com/boxed/mutmut) to measure test
+*effectiveness*, not just coverage. A mutation score of **≥ 80%** is
+enforced in CI on the core scoring path:
+
+- `detection/benford_engine.py`
+- `detection/feature_engineering.py`
+- `detection/model_inference.py`
+
+### Running mutation tests locally
+
+```bash
+# Full run — same as CI (may take 10–15 minutes)
+make mutation-test
+
+# Run only and inspect results
+mutmut run \
+  --paths-to-mutate "detection/benford_engine.py,detection/feature_engineering.py,detection/model_inference.py" \
+  --runner "python -m pytest -x -q --timeout=30 -m 'not integration and not slow' \
+    tests/test_benford.py tests/test_benford_ci.py \
+    tests/test_feature_engineering.py tests/test_model_inference.py"
+
+# Show a summary of all mutation outcomes
+mutmut results
+
+# Check whether the score meets the 80% threshold
+python scripts/check_mutation_score.py --threshold 80
+```
+
+### Interpreting the results
+
+| Status | Meaning |
+|---|---|
+| `ok` | Mutation **killed** — at least one test caught the change ✓ |
+| `survived` | Mutation **survived** — the test suite didn't detect the logic error ✗ |
+| `suspicious` | Tests passed but with timing/output differences — treated as killed |
+| `timeout` | Test run timed out — treated as killed |
+| `ba_error` | mutmut could not apply the mutation — excluded from the score |
+
+The **mutation score** is `killed / (killed + survived) × 100`. The CI step
+fails when this drops below 80%.
+
+### Investigating surviving mutations
+
+```bash
+# Show the diff for a specific surviving mutation (ID from `mutmut results`)
+mutmut show <ID>
+
+# Apply the mutation locally, run tests manually, then restore
+mutmut apply <ID>
+pytest tests/test_benford.py -v    # add a test that catches this case
+mutmut unapply <ID>
+
+# Re-run only the surviving mutations (much faster after fixing tests)
+mutmut rerun
+```
+
+### Which mutation operators matter most for a fraud-detection ML pipeline
+
+1. **Relational operators** (`>` ↔ `>=`, `<` ↔ `<=`): threshold comparisons in
+   `bft_trimmed_mean`, `_has_consensus`, `MAD_NONCONFORMITY_THRESHOLD`, and
+   `ML_FLAG_THRESHOLD` are the highest-risk off-by-one sites.
+2. **Arithmetic operators** (`+` ↔ `-`, `*` ↔ `/`): the chi-square and Z-score
+   formulas in `benford_engine.py` contain squared differences and
+   square-root normalisation that silently produce wrong scores when mutated.
+3. **Boolean literals and conditions** (`True`/`False` flips, `and`/`or` swaps):
+   the `diverged`, `consensus_failure`, and `benford_flag` guards must be
+   tested explicitly with boundary-value inputs.
+4. **Return values** (mutating the returned constant 0.0, 1.0, etc.): empty-input
+   fallback paths in feature functions often return sentinel zeros that tests
+   must assert are *exactly* zero, not just non-negative.
+
+### Security note
+
+mutmut applies mutations in-process using Python AST manipulation and
+restores the original file after every test run. **Mutated code is never
+committed, never persisted to `models/`, and never reaches the network.**
+The CI job runs in a dedicated `mutation-test` job isolated from the
+regular `test` matrix.
