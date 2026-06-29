@@ -135,3 +135,116 @@ Each causal attribution in the `CausalForensicReport` now includes a
 
 VanderWeele, T.J. & Ding, P. (2017). Sensitivity Analysis in Observational
 Research: Introducing the E-Value. *Annals of Internal Medicine*, 167(4), 268–274.
+
+---
+
+## Prior Knowledge Constraints (Issue #192)
+
+### Why Prior Constraints?
+
+Purely data-driven causal graphs can contain spurious edges or miss known
+causal relationships.  The PC algorithm is powerful but may infer, for
+example, that trading volume *causes* account age — a physically impossible
+relationship, since account age is determined at creation and cannot be
+changed retroactively.
+
+`CausalPriorConstraints` prevents such violations by encoding domain-expert
+knowledge as (cause, effect, required|forbidden) triples that are enforced
+*after* the data-driven discovery step.
+
+### Constraint Types
+
+| Kind | Semantics | Consequence if violated |
+|---|---|---|
+| **required** (hard) | This directed edge MUST appear in the learned DAG | Missing or reversed edges are inserted / corrected. |
+| **forbidden** (soft) | This directed edge must NOT appear in the learned DAG | Violating edges are removed and a `UserWarning` is emitted. |
+
+The "soft" designation for forbidden edges reflects that data evidence alone
+is not sufficient to override a domain-validated constraint — the constraint
+always wins — but the conflict is surfaced as a warning for operator review.
+
+### Constraint Format (YAML)
+
+Constraints are stored in `data/causal_priors.yaml` as a list of triples:
+
+```yaml
+constraints:
+  # Hard constraint: account age causally precedes trading activity
+  - cause: account_age_days
+    effect: round_trip_frequency
+    kind: required
+
+  # Soft constraint: trading cannot make an account older
+  - cause: round_trip_frequency
+    effect: account_age_days
+    kind: forbidden
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `cause` | string | Name of the causal variable (must exist in the feature set). |
+| `effect` | string | Name of the effect variable (must exist in the feature set). |
+| `kind` | `"required"` or `"forbidden"` | Constraint type (case-insensitive). |
+
+The YAML is parsed with `yaml.safe_load` — `!!python/...` object tags are
+rejected, preventing injection of arbitrary Python objects.
+
+### Security: Schema Validation
+
+Every call to `CausalPriorConstraints.load()` performs:
+
+1. Top-level key check: `constraints` must be a list of mappings.
+2. Per-constraint validation: `cause`, `effect`, `kind` are required string
+   fields; `kind` must be `"required"` or `"forbidden"`.
+3. Variable validation (via `priors.validate(feature_columns)`): all named
+   variables must exist in the feature set; unknown variables raise a
+   `ValueError` with a clear message listing every unknown variable.
+
+### Domain-Validated Constraints (Stellar DEX)
+
+The shipped `data/causal_priors.yaml` encodes the following domain facts:
+
+| Constraint | Kind | Rationale |
+|---|---|---|
+| `account_age_days → round_trip_frequency` | required | Account creation predates all trading. |
+| `account_age_days → self_matching_rate` | required | Same temporal reasoning. |
+| `funding_source_similarity → round_trip_frequency` | required | Shared funder → coordinated wash-ring round-trips. |
+| `counterparty_concentration_ratio → label` | required | High concentration is a direct wash-trade signal. |
+| `benford_mad_24h → label` | required | Benford non-conformity is a direct wash-trade signal. |
+| `round_trip_frequency → account_age_days` | forbidden | Time cannot run backward. |
+| `volume_per_counterparty_ratio → account_age_days` | forbidden | Same: age is immutable. |
+| `label → benford_mad_24h` | forbidden | Label is derived from features, not the reverse. |
+| `label → counterparty_concentration_ratio` | forbidden | Same: label cannot cause its own inputs. |
+
+### Usage
+
+```python
+from detection.causal_discovery import CausalPriorConstraints, WashTradeCausalDiscovery
+
+# Load and validate priors
+priors = CausalPriorConstraints.load("data/causal_priors.yaml")
+priors.validate(df.columns)   # raises ValueError if unknown variables
+
+# Run causal discovery with prior enforcement
+discoverer = WashTradeCausalDiscovery()
+dag = discoverer.fit(df, alpha=0.05, priors=priors)
+```
+
+Priors are optional: calling `discoverer.fit(df)` without `priors` is
+fully backward-compatible.
+
+### Adding New Constraints
+
+1. Identify the domain fact (e.g. "A precedes B in the wash-trade pipeline").
+2. Add the triple to `data/causal_priors.yaml`.
+3. Run `python -m pytest tests/test_causal_prior_constraints.py -v` to verify.
+4. If the constraint references a new feature column, also update the
+   `test_yaml_features_exist_in_synthetic_dataset` test.
+
+### References
+
+- Spirtes, P., Glymour, C. & Scheines, R. (2000) *Causation, Prediction, and
+  Search*, MIT Press.
+- Pearl, J. (2009) *Causality*, 2nd ed., Cambridge University Press.
+- VanderWeele, T.J. & Ding, P. (2017) "Sensitivity Analysis in Observational
+  Research: Introducing the E-Value", *Annals of Internal Medicine*, 167(4).
