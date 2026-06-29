@@ -36,6 +36,7 @@ from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 from config import config
+from detection.conformal import ConformalCalibrator
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -221,6 +222,19 @@ def train_models(
         X_train, y_train = _adversarial_augment(X_train, y_train, ratio, random_state)
         logger.info("Adversarial augmentation: training set expanded to %d rows", len(X_train))
 
+    # Reserve a calibration split (10% of training data, stratified by label)
+    # This is separate from the test split and is never used during model training.
+    cal_size = max(1, int(len(X_train) * 0.1))
+    X_cal, X_train, y_cal, y_train = train_test_split(
+        X_train, y_train, test_size=len(X_train) - cal_size,
+        random_state=random_state, stratify=y_train,
+    )
+    logger.info(
+        "Reserved calibration split: %d rows (indices 0..%d) — stratified by label",
+        cal_size,
+        cal_size - 1,
+    )
+
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
@@ -247,6 +261,23 @@ def train_models(
         if adversarial_augmentation:
             metrics["auc_roc_adversarial"] = float(roc_auc_score(y_test, probs_adv))
 
+        calibrator = ConformalCalibrator(alpha=0.10, random_state=random_state)
+        calibrator.calibrate(model, X_cal, y_cal)
+        # Measure empirical coverage on the calibration split
+        cal_results = calibrator.predict_set(model, X_cal)
+        cal_covered = sum(
+            1 for i, r in enumerate(cal_results) if int(y_cal.iloc[i]) in r["prediction_set"]
+        )
+        empirical_coverage = cal_covered / len(y_cal) if len(y_cal) > 0 else 0.0
+        metrics["conformal_empirical_coverage"] = float(round(empirical_coverage, 4))
+        metrics["conformal_q_hat"] = float(round(calibrator.q_hat, 6)) if calibrator.q_hat is not None else 0.0
+        metrics["calibration_split_size"] = len(X_cal)
+        metrics["calibration_split_index_range"] = f"0..{len(X_cal) - 1}"
+
+        # Save per-model calibration artifact
+        cal_artifact_path = os.path.join(config.MODEL_DIR, f"{name}_conformal.json")
+        calibrator.save(cal_artifact_path)
+
         results[name] = {
             "model": model,
             "metrics": metrics,
@@ -256,8 +287,11 @@ def train_models(
         "results": results,
         "feature_columns": list(X.columns),
         "feature_distributions": compute_feature_distributions(X),
+        "X_cal": X_cal,
+        "y_cal": y_cal,
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "n_cal": len(X_cal),
         "X_test": X_test,
         "y_test": y_test,
     }
@@ -553,6 +587,53 @@ def main() -> None:
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
 
+    # Compute DP-noised aggregate statistics and log privacy budget consumed.
+    try:
+        from privacy.dp_aggregator import DPAggregator
+
+        X_all, _ = split_features_labels(df)
+        dp_agg = DPAggregator(
+            epsilon=config.DP_AGGREGATOR_EPSILON,
+            delta=config.DP_AGGREGATOR_DELTA,
+            random_seed=args.random_state,
+        )
+        dp_stats: dict = {}
+        for col in X_all.columns:
+            vals = X_all[col].dropna().values
+            if len(vals) == 0:
+                continue
+            col_min = float(vals.min())
+            col_max = float(vals.max())
+            dp_stats[col] = {
+                "dp_mean": dp_agg.private_mean(vals, col_min, col_max),
+                "dp_count": dp_agg.private_count(vals),
+            }
+
+        budget = dp_agg.budget_consumed()
+        logger.info(
+            "DP aggregate statistics computed — epsilon_used=%.4f  delta_used=%.2e  queries=%d",
+            budget.epsilon_used,
+            budget.delta_used,
+            budget.queries,
+        )
+
+        # Persist DP stats alongside model metadata
+        dp_stats_path = os.path.join(model_dir, "dp_training_stats.json")
+        with open(dp_stats_path, "w") as f:
+            json.dump(
+                {
+                    "epsilon_used": budget.epsilon_used,
+                    "delta_used": budget.delta_used,
+                    "queries": budget.queries,
+                    "feature_dp_stats": dp_stats,
+                },
+                f,
+                indent=2,
+            )
+        logger.info("DP training statistics written to %s", dp_stats_path)
+    except Exception as _dp_exc:
+        logger.warning("DP aggregation skipped: %s", _dp_exc)
+
     if args.calibrate_ensemble:
         from detection.ensemble_calibrator import EnsembleCalibrator, summarize_pareto_front
 
@@ -571,6 +652,50 @@ def main() -> None:
         logger.info("Signed metrics.json → %s", sig_path)
     else:
         logger.warning("MODEL_SIGNING_PRIVATE_KEY_PATH not set — metrics.json not signed")
+
+    # Generate model cards for each trained model.
+    try:
+        from reporting.model_card_generator import generate_model_card
+
+        metadata_path = os.path.join(model_dir, "model_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as _f:
+                _md = json.load(_f)
+            version = _md.get("ledgerlens_version", "unknown")
+            for model_name in results:
+                # Build per-model metadata overlay
+                metrics = results[model_name]["metrics"]
+                per_model_meta = {
+                    **_md,
+                    "model_name": model_name,
+                    "training_date": _md.get("trained_at", datetime.now(UTC).isoformat()),
+                    "dataset_version": _md.get("data_path", args.data_path),
+                    "hyperparameters": {},
+                    "performance_metrics": {
+                        "overall": {
+                            "precision": round(metrics.get("f1", 0), 4),
+                            "recall": round(metrics.get("pr_auc", 0), 4),
+                            "f1": round(metrics.get("f1", 0), 4),
+                        }
+                    },
+                    "known_limitations": (
+                        "Trained on synthetic data by default. "
+                        "Benford features may flag legitimate high-frequency market makers."
+                    ),
+                    "intended_use": (
+                        "Wash-trade detection on the Stellar DEX for compliance and risk scoring."
+                    ),
+                    "out_of_scope_uses": (
+                        "General financial fraud detection outside the Stellar ecosystem. "
+                        "Sole basis for legal action without human review."
+                    ),
+                    "dataset_fingerprint": data_sha,
+                }
+                card_path = os.path.join(model_dir, f"MODEL_CARD_{model_name}_{version}.md")
+                generate_model_card(metadata_path, card_path)
+                logger.info("Model card written to %s", card_path)
+    except Exception as _mc_exc:
+        logger.warning("Model card generation skipped: %s", _mc_exc)
 
     logger.info("Saved models and artifacts to %s", model_dir)
 

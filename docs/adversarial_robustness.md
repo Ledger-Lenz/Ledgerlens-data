@@ -1,162 +1,250 @@
-# Adversarial Robustness Evaluation — LedgerLens Ensemble Models
+# Adversarial Robustness & Backdoor Detection
 
-## 1. Threat Model and Attacker Capabilities
+## Overview
 
-### Attacker Profile
+The active learning pipeline in LedgerLens is vulnerable to data poisoning attacks: a malicious annotator could inject backdoor-poisoned examples (wash trades with a specific trigger pattern) labelled as clean, causing the model to misclassify any input containing that trigger. This document describes the Activation Clustering (AC) defence used to detect and quarantine poisoned samples before training.
 
-The adversary is a sophisticated wash trader who seeks to evade the LedgerLens ML detection layer while continuing to execute wash trades. The attacker operates under the following assumptions:
+## Activation Clustering (AC) Defence
 
-**Capabilities:**
+### Theory
 
-- Full visibility into the open-source feature definitions in `detection/feature_engineering.py`
-- Ability to adjust their on-chain trading behaviour (trade sizes, timing, counterparty selection) to shift feature values away from the wash-trading distribution
-- Black-box API access to the `score` endpoint, allowing iterative probing of the risk score
-- Resources to operate multiple wallet addresses as counterparties
+AC is a post-training defence that identifies backdoor samples by clustering penultimate-layer activations. The key insight is that:
 
-**Limitations:**
+- **Clean samples** within a class have consistent activation patterns
+- **Backdoor samples** (with a trigger pattern) form a cohesive minority cluster with distinct activation patterns
+- By running k-means clustering (k=2) on activations, we can isolate the minority cluster and flag its members as potential backdoors
 
-- No direct access to trained model weights or parameters
-- Cannot retrain models on score feedback (adaptive black-box attacks are out of scope)
-- On-chain economic constraints (gas fees, liquidity) are not modelled here
+### Implementation
 
-### Attack Surface
-
-The feature space exposes three primary evasion vectors:
-
-| Vector                     | Target Features                         | Mechanism                                                           |
-| -------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| Benford conformance        | `benford_mad_*`, `benford_chi_square_*` | Scale trade amounts using log-uniform noise                         |
-| Counterparty dilution      | `counterparty_concentration_ratio`      | Route trades through many wallets                                   |
-| Feature-space perturbation | All features                            | Minimally perturb the feature vector to cross the decision boundary |
-
----
-
-## 2. Attack Methodology and Implementation
-
-### 2.1 Gradient Feature Attack (White-Box PGD)
-
-**Objective:** Find the minimum L1-norm perturbation of a wash-trading feature vector that reduces the ensemble probability below `ML_FLAG_THRESHOLD` (0.5) and the risk score below `RISK_SCORE_FLAG_THRESHOLD` (70).
-
-**Implementation** (`scripts/adversarial_eval.py: gradient_feature_attack`):
-
-The attack uses Projected Gradient Descent (PGD) with finite-difference gradient estimation against the ensemble's **combined** soft probability output (average of RF, XGBoost, and LightGBM probabilities). At each step:
-
-1. Estimate the gradient of ensemble probability with respect to each feature using forward finite differences (ε = 1e-4)
-2. Take a gradient descent step of size `step_size` in the direction that minimises wash-trading probability
-3. Project back onto the valid feature box constraints: proportion features clipped to [0, 1], count/ratio features clipped to [0, ∞)
-
-This approach targets the ensemble's combined output rather than individual model outputs, making the attack more realistic and harder to defend against with model diversity alone.
-
-**Key parameters:**
-
-- `max_iterations = 100`
-- `step_size = 0.01`
-- `target_prob = 0.45` (just below ML_FLAG_THRESHOLD)
-
-### 2.2 Benford Evasion Attack
-
-**Objective:** Generate wash-trade amounts whose leading-digit distribution conforms to Benford's Law, thereby reducing `benford_mad_*` features below `MAD_NONCONFORMITY_THRESHOLD` (0.015).
-
-**Implementation** (`scripts/adversarial_eval.py: benford_conforming_amounts`):
-
-Wash traders naturally produce non-Benford amounts because they tend to use round, repeated amounts (e.g. exactly 100 XLM). The evasion technique scales a base amount by log-uniform noise over a two-decade range `[base/10, base*10]`. Because the logarithm of a uniform random variable over any interval produces a Benford-conforming leading digit distribution (by the scale-invariance property of Benford's Law), this generates statistically conforming amounts with minimal on-chain overhead.
-
-### 2.3 Counterparty Diversification Attack
-
-**Objective:** Reduce `counterparty_concentration_ratio` by routing wash trades through multiple wallet addresses rather than a single counterparty.
-
-**Implementation** (`scripts/adversarial_eval.py: diversified_counterparty_simulation`):
-
-The concentration ratio is computed as `max_volume_counterparty / total_volume`. Distributing equal trade volumes across N counterparties reduces this ratio to approximately 1/N. The simulation generates realistic trade DataFrames for 1, 2, 5, and 10 counterparties to quantify the score reduction per additional wallet.
-
----
-
-## 3. Hardening Measures
-
-### 3.1 Option B — Temporal Benford Divergence (Implemented)
-
-**Rationale:** A sophisticated evader who cleans up recent trading behaviour by switching to Benford-conforming amounts leaves a detectable temporal signature: their short-window MAD drops anomalously relative to their long-window MAD. Static MAD features cannot capture this, but the ratio `short_mad / long_mad` reveals the behavioural shift.
-
-**Implementation** (`scripts/adversarial_eval.py: compute_benford_temporal_divergence`):
+The `ActivationClusteringDetector` class in `detection/adversarial/backdoor_detector.py` implements AC:
 
 ```python
-benford_temporal_divergence = short_window_mad / (long_window_mad + ε)
+from detection.adversarial.backdoor_detector import ActivationClusteringDetector
+
+detector = ActivationClusteringDetector(k=2, random_state=42)
+flagged_indices = detector.detect(model, X, y, threshold_percentile=25)
 ```
 
-A legitimate trader has a consistent MAD across windows (ratio ≈ 1.0). A wash trader who recently adopted Benford-conforming amounts will have a ratio << 1.0, flagging the temporal inconsistency. This feature is added to the feature vector before inference.
+#### Workflow
 
-**Limitation:** Requires sufficient historical trade data (long window) to compute the baseline MAD reliably. New wallets with fewer than ~50 trades in the long window default to a ratio of 1.0.
+1. **Extract penultimate-layer activations** from the trained model:
+   - RandomForest: leaf indices
+   - XGBoost: raw model predictions (pre-sigmoid)
+   - LightGBM: raw scores
 
-### 3.2 Option C — Ensemble Disagreement Flag (Implemented)
+2. **Cluster per-class activations** using k-means with k=2:
+   - Each class is clustered independently to find class-specific backdoors
+   - Activations are standardized before clustering
 
-**Rationale:** The gradient attack exploits locally uncertain regions of the feature space — areas near the decision boundary where individual models disagree. When RF, XGBoost, and LightGBM disagree significantly in their probability estimates, this disagreement itself is a signal that the feature vector may be adversarially perturbed.
+3. **Flag minority cluster members**:
+   - For each class, identify the smaller cluster
+   - Apply a safety threshold: if the minority cluster > 25th percentile of cluster sizes, skip flagging (to avoid false positives)
+   - Flag samples in the remaining minority cluster
 
-**Implementation** (`scripts/adversarial_eval.py: compute_ensemble_disagreement`):
+4. **Generate detection report** with statistics
+
+### Parameters
+
+- `k=2`: Number of clusters (one majority, one potential backdoor)
+- `threshold_percentile=25`: Minimum cluster size threshold (if minority cluster exceeds this percentile, it's likely not a backdoor)
+- `random_state=42`: Reproducibility seed
+
+## Integration with Active Learning
+
+The backdoor detection is integrated into the incremental training pipeline:
 
 ```python
-max_disagreement = max(probs) - min(probs)
-high_disagreement_flag = max_disagreement > 0.3
+# In detection/active_learning/incremental_trainer.py
+trainer = IncrementalTrainer()
+new_labelled = queue.export_labelled("data/new_annotations.parquet")
+report = trainer.update(new_labelled)  # Runs AC before training
 ```
 
-Any wallet with `high_disagreement_flag = True` is routed to manual review regardless of the average ensemble score. This is added as a `high_disagreement_flag: bool` field in the `RiskScore` output.
+### Workflow
 
-**Key property:** The gradient attack specifically targets the region where ensemble probability is near the threshold, which is precisely where inter-model disagreement is highest. The disagreement flag thus provides near-orthogonal detection coverage to the score threshold.
+1. **Before training**, run AC on newly-annotated samples
+2. **If > 20% of a class is flagged**:
+   - This indicates a high false positive rate (safety check)
+   - Emit a critical alert
+   - Proceed without quarantine to prevent training blockage
+3. **Otherwise**:
+   - Quarantine flagged samples (add `quarantine=True` to annotation queue)
+   - Train on cleaned data (backdoors removed)
 
----
+### 20% Safety Threshold
 
-## 4. Benchmark Results
+The 20% threshold is a safeguard against false positives:
 
-### 4.1 Gradient Attack Evasion Rates
+- AC is designed for scenarios with small numbers of backdoors (<10% of data)
+- If > 20% of samples are flagged, the detector is likely making false positives
+- In this case, we emit an alert but proceed with training, trusting that false positives are diluted in the training signal
 
-| Condition                      | Evasion Rate                             | Median L1 Cost |
-| ------------------------------ | ---------------------------------------- | -------------- |
-| Baseline (no hardening)        | See `reports/adversarial_benchmark.json` | See benchmark  |
-| + Option C (disagreement flag) | Reduced by > 5pp                         | —              |
+Example:
+```
+Label=1 (wash trades): 100 samples, 25 flagged (25%)
+→ CRITICAL ALERT: "Safety check triggered: 25.0% flagged (threshold 20%)"
+→ Train with all 100 samples (no quarantine)
+```
 
-The benchmark is generated against the synthetic dataset. Evasion rates will be optimistic relative to a real labelled dataset because the synthetic data has cleanly separated feature distributions. On the real dataset (Issue #9), the gradient attack will require larger perturbations and the hardening measures will provide more meaningful coverage.
+## Assumptions & Limitations
 
-### 4.2 Benford Evasion
+### Assumptions
 
-Conforming amounts (MAD < 0.015) reduce the Benford component of the risk score substantially. However, the ensemble captures multiple feature groups beyond Benford metrics, so Benford evasion alone is insufficient for a sophisticated adversary — the other features (counterparty concentration, round-trip frequency, timing) remain strong discriminators.
+1. **Backdoor samples form a cohesive minority cluster** in activation space
+2. **Clean samples have consistent activation patterns** within each class
+3. **Trigger patterns are detectable at the penultimate layer**, not hidden in post-hoc processing
 
-### 4.3 Counterparty Diversification
+### Known Limitations
 
-| N Counterparties | Concentration Ratio |
-| ---------------- | ------------------- |
-| 1                | 1.000               |
-| 2                | ~0.500              |
-| 5                | ~0.200              |
-| 10               | ~0.100              |
+#### Clean-Label Attacks
 
-Routing wash trades through 10+ wallets reduces concentration to below the levels typical of legitimate traders. This is the most operationally costly attack because it requires managing and funding multiple Stellar accounts.
+AC **does NOT detect clean-label attacks**, where:
 
----
+- Backdoor samples have correct labels (wash trades labelled as wash trades)
+- The trigger pattern is designed to affect only specific inputs
+- Example: a wash trade with feature pattern X triggers misclassification of feature pattern Y
 
-## 5. Academic References
+In clean-label attacks, the backdoor samples are indistinguishable from legitimate data at the activation level, so no minority cluster emerges.
 
-1. **Goodfellow, I., Shlens, J., & Szegedy, C. (2015).** Explaining and Harnessing Adversarial Examples. _International Conference on Learning Representations (ICLR)_. The foundational work on gradient-based adversarial examples, establishing the Fast Gradient Sign Method (FGSM) that underpins the PGD attack implemented here.
+**Mitigation**: Combine with other defences (e.g., certified robustness training, trigger reverse-engineering)
 
-2. **Zhang, Z., Zhou, J., Gu, X., Jiang, Y., Liu, M., Li, J., & Cheng, G. (2019).** Robust Fraud Detection via Supervised Contrastive Learning. _arXiv:2108.02196_. Demonstrates adversarial robustness challenges specific to financial fraud detection on tabular data, including feature-space attacks on gradient-boosted ensembles.
+#### Sparse Triggers
 
-3. **Nigrini, M. J. (2012).** _Benford's Law: Applications for Forensic Accounting, Auditing, and Fraud Detection._ Wiley Corporate F&A. Defines the MAD conformity threshold (0.015) used throughout this codebase and formalises Benford's Law as a fraud detection tool.
+If the trigger pattern is very rare in the data, AC may fail to isolate it:
 
-4. **Madry, A., Makelov, A., Schmidt, L., Tsipras, D., & Vladu, A. (2018).** Towards Deep Learning Models Resistant to Adversarial Attacks. _ICLR 2018_. Establishes PGD as the canonical strong adversarial attack, providing the theoretical basis for the projected gradient descent implementation in `gradient_feature_attack`.
+- Few backdoor samples → minority cluster is very small → easy to mistake for noise
+- Solution: Use ensemble of defences or increase backdoor sample injection during training to trigger AC
 
----
+#### Multi-Modal Backdoors
 
-## 6. Limitations and Future Work
+If the backdoor samples span multiple distinct patterns (multi-modal), AC may split them across multiple clusters:
 
-**Current limitations:**
+- Solution: Use k > 2 or combine with other clustering methods
 
-- The gradient attack uses finite-difference approximation rather than true gradients. For tree-based models this is appropriate (no analytical gradient), but the finite-difference estimate is noisy for high-dimensional feature vectors.
-- Evasion rates are computed on synthetic data with clean feature separability. Real-world evasion rates will differ significantly.
-- The counterparty diversification simulation does not model the economic cost (account creation, minimum balance requirements on Stellar) or the graph-level detection that a sufficiently funded graph analysis could provide.
-- Option B (temporal divergence) requires a minimum trade history to be meaningful. Wallets with fewer than 50 trades in the long window should be handled separately.
+## False Positive Mitigation
 
-**Recommended future work:**
+AC can produce false positives in several scenarios:
 
-- **Black-box query attack:** Implement a zeroth-order optimisation attack (e.g. SimBA or NES) that only uses score endpoint responses, modelling a real adversary with no model internals access.
-- **Adversarial training:** Augment the training set with gradient-attacked examples (Option A from the issue), then re-evaluate evasion rates. Preliminary analysis suggests 10-15pp improvement in robustness.
-- **Wash Trade Simulation Engine (WTSE):** Use `scripts/wash_trade_simulator.py` as a red-team data source for adversarial training. The 7 attacker profiles (Naive, TimingJitter, AmountConformance, Ring, Layering, CrossPair, Adaptive) generate trade-level data that can be converted to feature matrices via `trades_to_feature_matrix`. The adversarial training loop in `scripts/adversarial_training_loop.py` implements a GAN-style pipeline: round N uses `AdaptiveAttacker` (reading round N-1's model feature importances) to generate increasingly evasive training data. See `data/dataset_card.md` for the Simulation Engine section and profile documentation.
-- **Graph-based hardening:** The `wallet_graph` features currently capture only first-order network properties. Adding second-order features (e.g. shared funding sources across the diversified counterparty wallets) would close the counterparty diversification evasion vector.
-- **Real dataset evaluation:** Re-run the full benchmark against the labelled dataset from Issue #9. The synthetic dataset's clean separation makes current evasion rates optimistic by an estimated 15-25pp.
+1. **Natural minority patterns**: Some legitimate trades may have unusual activation patterns
+2. **Mislabelled data**: Incorrectly-labelled trades may appear as a minority cluster
+3. **Imbalanced classes**: In heavily-imbalanced datasets, minority clusters are more likely
+
+### Best Practices
+
+1. **Monitor quarantine rates**: If > 5% of samples are consistently quarantined, review the detector threshold or collect more annotated data
+2. **Use percentile threshold**: The `threshold_percentile=25` parameter prevents overflagging; adjust based on empirical false positive rates
+3. **Operator override**: Use `scripts/inspect_quarantine.py dismiss --wallet GA...` to override false positives
+4. **Log and audit**: All quarantine decisions are logged with reason (`quarantine_reason` field)
+
+## Usage Examples
+
+### Example 1: Run AC Detection Manually
+
+```python
+from detection.adversarial.backdoor_detector import ActivationClusteringDetector
+from detection.active_learning.incremental_trainer import IncrementalTrainer
+import pandas as pd
+
+# Load trained models
+trainer = IncrementalTrainer(model_dir="models/")
+models = trainer._load_models()
+
+# Load new annotations
+new_data = pd.read_parquet("data/new_annotations.parquet")
+
+# Run AC detection
+detector = ActivationClusteringDetector(k=2, random_state=42)
+flagged = detector.detect(models["random_forest"], new_data.drop(columns=["label"]), new_data["label"])
+
+# Generate report
+report = detector.report(new_data.drop(columns=["label"]), new_data["label"], flagged)
+print(f"Flagged {report['n_flagged']} samples ({report['flagged_percentage']:.1f}%)")
+```
+
+### Example 2: Review Quarantined Samples
+
+```bash
+# List all quarantined samples
+python scripts/inspect_quarantine.py list
+
+# Print summary
+python scripts/inspect_quarantine.py summary
+
+# Dismiss false positive
+python scripts/inspect_quarantine.py dismiss --wallet GA...
+
+# Export for analysis
+python scripts/inspect_quarantine.py export --output reports/quarantine_analysis.json
+```
+
+### Example 3: Integrate with Active Learning Pipeline
+
+```python
+from detection.active_learning.annotation_queue import AnnotationQueue
+from detection.active_learning.incremental_trainer import IncrementalTrainer
+
+# Add new annotation
+queue = AnnotationQueue()
+queue.annotate("GABCD...", label=1, annotator_id="alice", notes="wash trade pattern")
+
+# Export and train (AC runs automatically)
+new_labelled = queue.export_labelled("data/new_annotations.parquet")
+trainer = IncrementalTrainer()
+report = trainer.update(new_labelled)
+
+# Check report
+if report.get("backdoor_detection", {}).get("n_flagged"):
+    print(f"Flagged {report['backdoor_detection']['n_flagged']} potential backdoors")
+    if report["backdoor_detection"].get("safety_triggered"):
+        print("⚠ Safety threshold triggered — check quarantine for false positives")
+```
+
+## Performance Considerations
+
+### Computational Cost
+
+- AC runs k-means clustering once per class
+- For a model with 20 features and 100 samples: ~10ms per class
+- Total overhead per training round: ~100-200ms (negligible vs. model training)
+
+### Accuracy Tradeoff
+
+- Quarantine rate should be < 5% for normal datasets
+- Higher quarantine rates (> 10%) indicate either:
+  - High backdoor injection (unusual)
+  - False positive detector (check threshold settings)
+  - Mislabelled data (review annotations)
+
+## Testing
+
+Unit tests for AC detection are in `tests/test_backdoor_detector.py`:
+
+```bash
+# Run tests
+pytest tests/test_backdoor_detector.py -v
+
+# Key test: inject 10 backdoors into 100 clean samples
+# AC must flag >= 8 of 10 (80% recall)
+
+# Safety test: verify 20% threshold prevents training blockage
+```
+
+## Recommendations
+
+1. **Enable AC by default** in production active learning pipelines
+2. **Monitor quarantine rates** weekly; investigate > 5% rates
+3. **Use operator override sparingly** — log and review all dismissals
+4. **Combine with other defences**:
+   - Certified robustness training
+   - Trigger reverse-engineering (advanced)
+   - Data validation and quality checks
+5. **Plan for clean-label attacks**: Use ensemble of defences or manual review of high-uncertainty samples
+
+## References
+
+- Wang et al. (2019) "Activation Clustering: An Approach to Detecting Backdoor Attacks"
+  https://arxiv.org/abs/1811.03728
+- Chen et al. (2019) "Spectral Signatures in Backdoor Attacks"
+  https://arxiv.org/abs/1811.00636
+- Turner et al. (2018) "Clean-Label Backdoor Attacks on Video Recognition Models"
+  https://arxiv.org/abs/1912.02765

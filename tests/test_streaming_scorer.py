@@ -128,6 +128,10 @@ def test_score_wallet_returns_risk_score_dict(trained_scorer):
     assert 0 <= result["score"] <= 100
     assert isinstance(result["benford_flag"], bool)
     assert isinstance(result["ml_flag"], bool)
+    # Uncertainty fields may be present when calibration is loaded
+    if "score_lower" in result:
+        assert "score_upper" in result
+        assert "coverage_guarantee" in result
 
 
 # ---------------------------------------------------------------------------

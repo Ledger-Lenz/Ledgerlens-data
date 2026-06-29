@@ -55,5 +55,12 @@ jobs:
               print("verify_chain check passed.")
           EOF
 
+      - name: Validate markdown links (Issue #263)
+        run: |
+          npm install -g markdown-link-check
+          markdown-link-check docs/security_threat_model.md
+          markdown-link-check docs/security.md
+          markdown-link-check CONTRIBUTING.md
+
       - name: Test
         run: pytest -q

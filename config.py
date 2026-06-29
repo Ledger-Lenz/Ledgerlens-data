@@ -63,6 +63,11 @@ class Config:
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
     )
 
+    # Silence window for correlated alert deduplication (alerts/deduplicator.py).
+    ALERT_DEDUP_WINDOW_SECONDS: int = min(
+        300, max(5, int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS", "60")))
+    )
+
     RISK_SCORE_FLAG_THRESHOLD: int = int(os.getenv("RISK_SCORE_FLAG_THRESHOLD", "70"))
     # Set to a non-zero integer to pin the alert threshold and disable the RL agent.
     # E.g. THRESHOLD_RL_PINNED=75 → agent is bypassed, threshold is fixed at 75.
@@ -83,6 +88,11 @@ class Config:
     LEDGERLENS_CONTRACT_ID: str = os.getenv("LEDGERLENS_CONTRACT_ID", "")
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
 
+    # Solana RPC endpoint for cross-chain resolution
+    SOLANA_RPC_URL: str = os.getenv(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
+
     MIN_TRADES_FOR_SCORING: int = int(os.getenv("MIN_TRADES_FOR_SCORING", "20"))
     LIST_RELOAD_INTERVAL_SECONDS: int = int(os.getenv("LIST_RELOAD_INTERVAL_SECONDS", "60"))
 
@@ -91,8 +101,15 @@ class Config:
     # Fire an alert when any feature PSI exceeds this value.
     DRIFT_PSI_THRESHOLD: float = float(os.getenv("DRIFT_PSI_THRESHOLD", "0.2"))
 
+    # Sliding window covariance shift detection (MMD)
+    DRIFT_REFERENCE_WINDOW_HOURS: int = int(os.getenv("DRIFT_REFERENCE_WINDOW_HOURS", "168"))
+    DRIFT_TEST_WINDOW_HOURS: int = int(os.getenv("DRIFT_TEST_WINDOW_HOURS", "1"))
+    DRIFT_CHECK_INTERVAL_MINUTES: int = int(os.getenv("DRIFT_CHECK_INTERVAL_MINUTES", "30"))
+
     # Forensic reporting
     REPORT_CONCURRENCY: int = int(os.getenv("REPORT_CONCURRENCY", "4"))
+    # SHAP interaction values are O(n * d^2) — disable by default.
+    SHAP_INTERACTIONS_ENABLED: bool = os.getenv("SHAP_INTERACTIONS_ENABLED", "false").lower() == "true"
 
     # Wallet funding graph — multi-hop traversal + wash-trading ring detection
     WALLET_GRAPH_MAX_DEPTH: int = int(os.getenv("WALLET_GRAPH_MAX_DEPTH", "4"))
@@ -100,6 +117,11 @@ class Config:
     WASH_RING_RESOLUTION: float = float(os.getenv("WASH_RING_RESOLUTION", "1.0"))
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
+
+    # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
+    HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
+    HORIZON_MAX_RETRIES: int = int(os.getenv("HORIZON_MAX_RETRIES", "5"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # Real-time streaming / alerting
     # STREAMING_BACKEND selects the ingestion transport:
@@ -155,10 +177,30 @@ class Config:
     BFT_MIN_CONSENSUS: int = int(os.getenv("BFT_MIN_CONSENSUS", "2"))
     POISON_LABEL_RATIO_THRESHOLD: float = float(os.getenv("POISON_LABEL_RATIO_THRESHOLD", "0.15"))
     ZERO_SHOT_WEIGHT: float = float(os.getenv("ZERO_SHOT_WEIGHT", "0.0"))
+    ZERO_SHOT_MIN_LABELLED_EXAMPLES: int = int(os.getenv("ZERO_SHOT_MIN_LABELLED_EXAMPLES", "20"))
+    BENFORD_CI_ENABLED: bool = os.getenv("BENFORD_CI_ENABLED", "false").lower() == "true"
+    BRIDGE_ROUNDTRIP_WINDOW_HOURS: int = int(os.getenv("BRIDGE_ROUNDTRIP_WINDOW_HOURS", "72"))
+
+    # Differential privacy for SHAP explanations (model inversion defence)
+    DP_EPSILON: float = float(os.getenv("DP_EPSILON", "1.0"))
+    DP_DELTA: float = float(os.getenv("DP_DELTA", "1e-5"))
+    DP_RENYI_QUERY_THRESHOLD: int = int(os.getenv("DP_RENYI_QUERY_THRESHOLD", "100"))
+    DP_RENYI_NOISE_MULTIPLIER: float = float(os.getenv("DP_RENYI_NOISE_MULTIPLIER", "3.0"))
+    DP_DEFAULT_SENSITIVITY: float = float(os.getenv("DP_DEFAULT_SENSITIVITY", "0.05"))
+    SHAP_SENSITIVITY_PATH: str = os.getenv("SHAP_SENSITIVITY_PATH", "models/shap_sensitivity.json")
+
+    # Model inversion attack defence
+    MODEL_INVERSION_QUERY_LIMIT: int = int(os.getenv("MODEL_INVERSION_QUERY_LIMIT", "100"))
+    MODEL_INVERSION_DP_EPSILON: float = float(os.getenv("MODEL_INVERSION_DP_EPSILON", "1.0"))
+    SCORE_ROUNDING_GRANULARITY: int = int(os.getenv("SCORE_ROUNDING_GRANULARITY", "1"))
 
     # Graph Neural Network encoder (detection/gnn_encoder.py)
     GNN_EMBEDDING_DIM: int = int(os.getenv("GNN_EMBEDDING_DIM", "32"))
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
+
+    # Feature selection
+    FEATURE_SELECTION_ENABLED: bool = os.getenv("FEATURE_SELECTION_ENABLED", "").lower() in ("1", "true", "yes")
+    FEATURE_SELECTION_PATH: str = os.getenv("FEATURE_SELECTION_PATH", "models/selected_features.json")
 
     # Annotation integrity
     ANNOTATION_HMAC_SECRET: str = os.getenv("ANNOTATION_HMAC_SECRET", "")
@@ -182,6 +224,22 @@ class Config:
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
     GNN_NUM_LAYERS: int = int(os.getenv("GNN_NUM_LAYERS", "2"))
 
+    # Dynamic ensemble weight adjustment (#268)
+    ENSEMBLE_WEIGHT_SMOOTHING_ALPHA: float = float(os.getenv("ENSEMBLE_WEIGHT_SMOOTHING_ALPHA", "0.1"))
+    ENSEMBLE_SYSTEMIC_FP_THRESHOLD: float = float(os.getenv("ENSEMBLE_SYSTEMIC_FP_THRESHOLD", "0.5"))
+
+    # GNN DiffPool cluster scoring (#269)
+    GNN_DIFFPOOL_CLUSTERS: int = int(os.getenv("GNN_DIFFPOOL_CLUSTERS", "10"))
+
+    # Async federated learning (#270)
+    FEDERATED_ASYNC_TRIGGER_N: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_N", "3"))
+    FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))
+    FEDERATED_MAX_STALENESS: int = int(os.getenv("FEDERATED_MAX_STALENESS", "5"))
+
+    # Label quality estimation (#271)
+    LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
+    ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []
@@ -194,6 +252,12 @@ class Config:
 
         if not cls.MODEL_DIR.strip():
             errors.append("MODEL_DIR is not set.")
+
+        if cls.DP_AGGREGATOR_EPSILON <= 0:
+            errors.append("DP_AGGREGATOR_EPSILON must be > 0.")
+
+        if not (0 < cls.DP_AGGREGATOR_DELTA < 0.5):
+            errors.append("DP_AGGREGATOR_DELTA must be in (0, 0.5).")
 
         if require_onchain:
             if not cls.LEDGERLENS_CONTRACT_ID.strip():
@@ -216,7 +280,7 @@ class Config:
             filename = os.path.basename(filepath)
             asset_key = filename[:-len("_benford_windows.json")]
             try:
-                with open(filepath, "r") as f:
+                with open(filepath) as f:
                     data = json.load(f)
                     if isinstance(data, dict) and "asset" in data and "windows" in data:
                         cls.ASSET_BENFORD_WINDOWS[data["asset"]] = [int(w) for w in data["windows"]]
@@ -234,3 +298,11 @@ class Config:
 
 config = Config()
 Config.load_asset_benford_windows()
+
+# Validate security parameters
+if config.MODEL_INVERSION_QUERY_LIMIT <= 0:
+    raise ValueError(f"MODEL_INVERSION_QUERY_LIMIT must be > 0, got {config.MODEL_INVERSION_QUERY_LIMIT}")
+if config.MODEL_INVERSION_DP_EPSILON <= 0:
+    raise ValueError(f"MODEL_INVERSION_DP_EPSILON must be > 0, got {config.MODEL_INVERSION_DP_EPSILON}")
+if config.SCORE_ROUNDING_GRANULARITY <= 0:
+    raise ValueError(f"SCORE_ROUNDING_GRANULARITY must be > 0, got {config.SCORE_ROUNDING_GRANULARITY}")

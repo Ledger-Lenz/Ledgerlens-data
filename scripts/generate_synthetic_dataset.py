@@ -275,6 +275,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def recompute_asset_class_baselines(df: pd.DataFrame) -> None:
+    """Recompute per-asset-class Benford baselines from clean-labelled rows.
+
+    Called as a post-step after dataset generation so the AssetClassifier
+    singleton reflects the current synthetic dataset distribution (issue #279).
+    The fitted baselines are stored on the module-level classifier and used
+    by subsequent ``compute_benford_metrics`` calls in the same process.
+
+    The synthetic dataset uses feature-level generation and does not include
+    raw trade amounts, so this function generates representative trade amounts
+    per asset class using the same distributional assumptions as the simulator.
+    """
+    from detection.benford_engine import get_asset_classifier
+
+    if "label" not in df.columns:
+        return
+
+    classifier = get_asset_classifier()
+
+    rng = np.random.default_rng(0)
+    n_clean = max(int((df["label"] == 0).sum()), 200)
+
+    # Build a synthetic labelled trade frame with asset_code annotations so
+    # fit_from_clean_trades can group by asset class.
+    stablecoins = list(classifier._stablecoins) or ["USDC"]
+    volatile = ["XLM"]
+
+    records = []
+    # Stablecoin amounts: cluster around round numbers (convention)
+    for amount in [100.0, 500.0, 1000.0, 5000.0, 10000.0] * (n_clean // 5 + 1):
+        records.append({"amount": amount, "asset_code": stablecoins[0], "label": 0})
+    # Volatile amounts: log-uniform (Benford-conforming)
+    for amount in 10 ** rng.uniform(0, 4, size=n_clean):
+        records.append({"amount": float(amount), "asset_code": volatile[0], "label": 0})
+
+    labelled = pd.DataFrame(records)
+    classifier.fit_from_clean_trades(labelled)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -296,6 +335,10 @@ def main() -> None:
         profile=args.profile,
         model_path=args.model_path,
     )
+
+    # Post-step: recompute asset-class-aware Benford baselines (issue #279)
+    recompute_asset_class_baselines(df)
+
     df.to_parquet(args.output)
     print(f"Wrote {len(df)} rows to {args.output}")
     if not args.quiet:
