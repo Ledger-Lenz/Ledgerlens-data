@@ -218,6 +218,12 @@ class Config:
         if not cls.MODEL_DIR.strip():
             errors.append("MODEL_DIR is not set.")
 
+        if cls.DP_AGGREGATOR_EPSILON <= 0:
+            errors.append("DP_AGGREGATOR_EPSILON must be > 0.")
+
+        if not (0 < cls.DP_AGGREGATOR_DELTA < 0.5):
+            errors.append("DP_AGGREGATOR_DELTA must be in (0, 0.5).")
+
         if require_onchain:
             if not cls.LEDGERLENS_CONTRACT_ID.strip():
                 errors.append("LEDGERLENS_CONTRACT_ID is not set.")

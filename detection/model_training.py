@@ -553,6 +553,53 @@ def main() -> None:
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
 
+    # Compute DP-noised aggregate statistics and log privacy budget consumed.
+    try:
+        from privacy.dp_aggregator import DPAggregator
+
+        X_all, _ = split_features_labels(df)
+        dp_agg = DPAggregator(
+            epsilon=config.DP_AGGREGATOR_EPSILON,
+            delta=config.DP_AGGREGATOR_DELTA,
+            random_seed=args.random_state,
+        )
+        dp_stats: dict = {}
+        for col in X_all.columns:
+            vals = X_all[col].dropna().values
+            if len(vals) == 0:
+                continue
+            col_min = float(vals.min())
+            col_max = float(vals.max())
+            dp_stats[col] = {
+                "dp_mean": dp_agg.private_mean(vals, col_min, col_max),
+                "dp_count": dp_agg.private_count(vals),
+            }
+
+        budget = dp_agg.budget_consumed()
+        logger.info(
+            "DP aggregate statistics computed — epsilon_used=%.4f  delta_used=%.2e  queries=%d",
+            budget.epsilon_used,
+            budget.delta_used,
+            budget.queries,
+        )
+
+        # Persist DP stats alongside model metadata
+        dp_stats_path = os.path.join(model_dir, "dp_training_stats.json")
+        with open(dp_stats_path, "w") as f:
+            json.dump(
+                {
+                    "epsilon_used": budget.epsilon_used,
+                    "delta_used": budget.delta_used,
+                    "queries": budget.queries,
+                    "feature_dp_stats": dp_stats,
+                },
+                f,
+                indent=2,
+            )
+        logger.info("DP training statistics written to %s", dp_stats_path)
+    except Exception as _dp_exc:
+        logger.warning("DP aggregation skipped: %s", _dp_exc)
+
     if args.calibrate_ensemble:
         from detection.ensemble_calibrator import EnsembleCalibrator, summarize_pareto_front
 
@@ -571,6 +618,50 @@ def main() -> None:
         logger.info("Signed metrics.json → %s", sig_path)
     else:
         logger.warning("MODEL_SIGNING_PRIVATE_KEY_PATH not set — metrics.json not signed")
+
+    # Generate model cards for each trained model.
+    try:
+        from reporting.model_card_generator import generate_model_card
+
+        metadata_path = os.path.join(model_dir, "model_metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as _f:
+                _md = json.load(_f)
+            version = _md.get("ledgerlens_version", "unknown")
+            for model_name in results:
+                # Build per-model metadata overlay
+                metrics = results[model_name]["metrics"]
+                per_model_meta = {
+                    **_md,
+                    "model_name": model_name,
+                    "training_date": _md.get("trained_at", datetime.now(UTC).isoformat()),
+                    "dataset_version": _md.get("data_path", args.data_path),
+                    "hyperparameters": {},
+                    "performance_metrics": {
+                        "overall": {
+                            "precision": round(metrics.get("f1", 0), 4),
+                            "recall": round(metrics.get("pr_auc", 0), 4),
+                            "f1": round(metrics.get("f1", 0), 4),
+                        }
+                    },
+                    "known_limitations": (
+                        "Trained on synthetic data by default. "
+                        "Benford features may flag legitimate high-frequency market makers."
+                    ),
+                    "intended_use": (
+                        "Wash-trade detection on the Stellar DEX for compliance and risk scoring."
+                    ),
+                    "out_of_scope_uses": (
+                        "General financial fraud detection outside the Stellar ecosystem. "
+                        "Sole basis for legal action without human review."
+                    ),
+                    "dataset_fingerprint": data_sha,
+                }
+                card_path = os.path.join(model_dir, f"MODEL_CARD_{model_name}_{version}.md")
+                generate_model_card(metadata_path, card_path)
+                logger.info("Model card written to %s", card_path)
+    except Exception as _mc_exc:
+        logger.warning("Model card generation skipped: %s", _mc_exc)
 
     logger.info("Saved models and artifacts to %s", model_dir)
 
