@@ -31,5 +31,36 @@ jobs:
           ruff check .
           black --check .
 
+      - name: Check verify_chain called after every joblib.load in detection/
+        run: |
+          python - <<'EOF'
+          import re, sys, pathlib
+
+          issues = []
+          for f in pathlib.Path("detection").rglob("*.py"):
+              lines = f.read_text().splitlines()
+              for i, line in enumerate(lines):
+                  if re.search(r"joblib\.load\(", line):
+                      # Check the next 5 lines for verify_chain
+                      window = "\n".join(lines[i : i + 6])
+                      if "verify_chain" not in window:
+                          issues.append(f"{f}:{i+1}: joblib.load without nearby verify_chain call")
+
+          if issues:
+              print("verify_chain enforcement failures:")
+              for issue in issues:
+                  print(" ", issue)
+              sys.exit(1)
+          else:
+              print("verify_chain check passed.")
+          EOF
+
+      - name: Validate markdown links (Issue #263)
+        run: |
+          npm install -g markdown-link-check
+          markdown-link-check docs/security_threat_model.md
+          markdown-link-check docs/security.md
+          markdown-link-check CONTRIBUTING.md
+
       - name: Test
         run: pytest -q

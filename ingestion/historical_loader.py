@@ -1,6 +1,6 @@
 """Bulk historical trade ingestion via Horizon's paginated trades endpoint."""
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 
 import pandas as pd
@@ -9,13 +9,14 @@ from stellar_sdk import Server
 
 from config import config
 from ingestion.data_models import Trade
+from ingestion.horizon_fetcher import fetch as horizon_fetch
 from ingestion.horizon_streamer import _to_trade
 from utils.retry import retry_with_backoff
 
 
 @retry_with_backoff(exceptions=(ConnectionError, TimeoutError, OSError))
 def _fetch_page(call_builder):
-    return call_builder.call()
+    return horizon_fetch(call_builder.call)
 
 
 def load_trades(
@@ -56,7 +57,7 @@ def load_trades(
         call_builder = call_builder.cursor(records[-1]["paging_token"])
 
 
-def trades_to_dataframe(trades: Iterator[Trade]) -> pd.DataFrame:
+def trades_to_dataframe(trades: Iterable[Trade]) -> pd.DataFrame:
     """Flatten an iterable of `Trade` objects into a DataFrame for feature
     engineering and the Benford engine."""
     rows = []
@@ -76,6 +77,15 @@ def trades_to_dataframe(trades: Iterator[Trade]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def load_pair_to_dataframe(
+    base_asset: SdkAsset,
+    counter_asset: SdkAsset,
+    start_time: datetime | None = None,
+) -> pd.DataFrame:
+    """Load historical trades for a single asset pair into a DataFrame."""
+    return trades_to_dataframe(load_trades(base_asset, counter_asset, start_time=start_time))
+
+
 def load_watched_pairs_to_dataframe(start_time: datetime | None = None) -> pd.DataFrame:
     """Load historical trades for every pair configured in
     `WATCHED_ASSET_PAIRS` and combine them into a single DataFrame."""
@@ -86,7 +96,7 @@ def load_watched_pairs_to_dataframe(start_time: datetime | None = None) -> pd.Da
         asset = xlm if issuer == "native" else SdkAsset(code, issuer)
         if asset == xlm:
             continue
-        frames.append(trades_to_dataframe(load_trades(asset, xlm, start_time=start_time)))
+        frames.append(load_pair_to_dataframe(asset, xlm, start_time=start_time))
 
     if not frames:
         return pd.DataFrame()

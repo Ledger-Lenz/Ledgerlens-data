@@ -75,6 +75,17 @@ python -m scripts.generate_synthetic_dataset \
     --n-wallets 500 \
     --seed 42 \
     --output data/synthetic_dataset.parquet
+
+# Use a specific attacker profile
+python -m scripts.generate_synthetic_dataset \
+    --profile RingAttacker \
+    --n-wallets 20 \
+    --output data/ring_dataset.parquet
+
+# Run the full adversarial training loop
+python -m scripts.generate_synthetic_dataset \
+    --profile AdaptiveAttacker \
+    --gan-rounds 5
 ```
 
 | Flag | Default | Description |
@@ -82,6 +93,87 @@ python -m scripts.generate_synthetic_dataset \
 | `--n-wallets` | `500` | Number of synthetic wallet rows to generate |
 | `--seed` | `42` | Random seed (controls both data generation and the final shuffle) |
 | `--output` | `data/synthetic_dataset.parquet` | Output parquet path |
+| `--profile` | `NaiveAttacker` | Attacker profile: `NaiveAttacker`, `TimingJitterAttacker`, `AmountConformanceAttacker`, `RingAttacker`, `LayeringAttacker`, `CrossPairAttacker`, `AdaptiveAttacker` |
+| `--gan-rounds` | `0` | Run N rounds of adversarial training (0 = skip). Requires `--profile AdaptiveAttacker` |
+| `--model-path` | — | Path to trained model `.joblib` file for `AdaptiveAttacker` |
+
+---
+
+## `wash_trade_simulator.py`
+
+The Wash Trade Simulation Engine (WTSE) implements 7 attacker strategy
+profiles for generating realistic trade-level data.
+
+### Profiles
+
+| Profile | Description |
+|---|---|
+| `NaiveAttacker` | Fixed amounts, regular intervals — baseline |
+| `TimingJitterAttacker` | Poisson-distributed trade intervals |
+| `AmountConformanceAttacker` | Benford-conforming amounts via log-uniform sampling |
+| `RingAttacker` | N-wallet ring where each wallet trades with neighbours |
+| `LayeringAttacker` | Interleaves wash trades with noise trades (3:1 ratio) |
+| `CrossPairAttacker` | Rotates wash volume across K asset pairs |
+| `AdaptiveAttacker` | Reads model feature importances and down-weights top features |
+
+### Programmatic usage
+
+```python
+from scripts.wash_trade_simulator import NaiveAttacker, trades_to_feature_matrix
+
+profile = NaiveAttacker(n_wallets=10, trades_per_wallet=50)
+trades = profile.generate_trades()
+features = trades_to_feature_matrix(trades)
+```
+
+---
+
+## `adversarial_training_loop.py`
+
+Runs a GAN-style adversarial training loop: Round 0 uses `NaiveAttacker`,
+subsequent rounds use `AdaptiveAttacker` (which reads the previous round's
+model feature importances). Per-round metrics are written to
+`reports/adversarial_loop_{timestamp}.json`.
+
+### Usage
+
+```bash
+python -m scripts.adversarial_training_loop \
+    --gan-rounds 5 \
+    --n-wallets 50
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--gan-rounds` | `5` | Number of adversarial rounds |
+| `--n-wallets` | `50` | Wallets per generated dataset |
+| `--trades-per-wallet` | `100` | Trades per wallet |
+| `--output-dir` | `reports` | Directory for output JSON |
+| `--seed` | `42` | Random seed |
+
+---
+
+## `evaluate_simulator_realism.py`
+
+Computes realism metrics for the simulator: Fréchet Feature Distance (FFD)
+and discriminator accuracy between simulated and real labelled data.
+
+### Usage
+
+```bash
+python -m scripts.evaluate_simulator_realism \
+    --simulated data/synthetic_dataset.parquet \
+    --real data/labelled_dataset.parquet
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--simulated` | `data/synthetic_dataset.parquet` | Path to simulated feature matrix |
+| `--real` | `data/labelled_dataset.parquet` | Path to real labelled dataset |
+| `--output-dir` | `reports` | Directory for output JSON |
+| `--seed` | `42` | Random seed |
+
+---
 
 ### Training on the generated dataset
 
@@ -91,44 +183,39 @@ python -m detection.model_training --data-path data/synthetic_dataset.parquet
 
 This trains every model in `MODEL_REGISTRY` (Random Forest, XGBoost,
 LightGBM) with SMOTE-balanced training data, writes the fitted models to
-`config.MODEL_DIR`, and writes both `metrics.json` (AUC-ROC / PR-AUC / F1
-per model) and `model_metadata.json` (feature schema fingerprint and
-training metadata) alongside them.
+`config.MODEL_DIR`, and writes `metrics.json` (AUC-ROC / PR-AUC / F1 per
+model) alongside them.
 
-## `score_wallet.py`
+## `run_adversarial_eval.py`
 
-Scores a single wallet on a single asset pair on demand, printing the full
-RiskScore plus the top-5 SHAP feature attributions to stdout. Useful for
-targeted investigations or testing.
+Generates an adversarial-robustness report for a trained ensemble. It runs
+FGSM and PGD evasion attacks (`detection/adversarial/`) against the
+high-scoring wash wallets in a labelled feature matrix and writes a JSON
+report covering:
+
+- PGD / FGSM evasion success rate (fraction of `80+` wash wallets pushed
+  below the alert threshold within the L-inf budget),
+- per-feature minimum epsilon and the most vulnerable features, and
+- the AUC-ROC gain from adversarial-augmentation retraining.
 
 ### Usage
 
 ```bash
-python -m scripts.score_wallet \
-  --wallet GABC1234... \
-  --pair "USDC:GA5Z.../XLM:native" \
-  --since 2024-01-01
+python -m scripts.run_adversarial_eval \
+    --data-path data/synthetic_dataset.parquet \
+    --model-dir ./models \
+    --output reports/adversarial_robustness.json
 ```
 
-| Flag | Description |
-|---|---|
-| `--wallet` | Stellar wallet public key (G...) |
-| `--pair` | Asset pair to score (e.g. `USDC:GA5Z.../XLM:native`) |
-| `--since` | ISO date to start loading trades from |
-| `--no-orderbook` | Skip loading order-book events |
-| `--json` | Output result as a machine-parseable JSON object |
+| Flag | Default | Description |
+|---|---|---|
+| `--data-path` | *(required)* | Labelled feature matrix (parquet) with a `label` column |
+| `--model-dir` | `MODEL_DIR` | Directory of trained model artifacts |
+| `--output` | `reports/adversarial_robustness.json` | Output JSON report path |
+| `--epsilon` | `3.0` | L-inf perturbation budget (per-feature std units) |
+| `--steps` | `40` | PGD iterations |
+| `--target-score` | `40` | Evasion succeeds when the score drops below this |
+| `--high-score` | `80` | Minimum score for a wallet to enter the attacked cohort |
+| `--skip-augmentation` | off | Skip the slower adversarial-augmentation retraining comparison |
 
-### Output Example (Human-readable)
-
-```text
-Wallet:   GABC1234...
-Pair:     USDC:GA5Z.../XLM:native
-Score:    83  [FLAGGED]
-Benford:  True
-ML:       True (confidence 76)
-
-Top 5 SHAP contributors:
-  1. benford_mad_24h          +0.34  (value: 0.047)
-  2. counterparty_concentration_ratio  +0.29  (value: 0.98)
-  ...
-```
+Requires trained models (run `model_training.py` first).

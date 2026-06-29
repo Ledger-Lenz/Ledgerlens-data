@@ -4,12 +4,25 @@ Used by `run_pipeline.py` to persist `RiskScorer.score()` output for
 `ledgerlens-api` to read, and to look up previously flagged wallets.
 """
 
+import time
 from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from detection.persistence import RiskScoreRecord, get_session_factory
+from config import config
+from detection.persistence import (
+    ModelInversionQueryTracker,
+    RiskScoreRecord,
+    ShapQueryCount,
+    get_session_factory,
+)
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class RiskScoreStore:
@@ -22,36 +35,53 @@ class RiskScoreStore:
         """Insert or update the `RiskScore` record for `(wallet, asset_pair)`.
 
         `risk_score` is the dict returned by `RiskScorer.score()`:
-        `{"score", "benford_flag", "ml_flag", "confidence"}` (and optionally
-        `"timestamp"`, which is ignored — `updated_at` is set server-side).
+        ``{"score", "benford_flag", "ml_flag", "confidence"}`` plus the
+        optional ``"propagated_risk"`` float produced by
+        :func:`detection.risk_propagation.propagate_risk_scores` and the
+        optional ``"ring_id"`` wash-trading ring grouping. ``"timestamp"`` is
+        ignored — ``updated_at`` is set server-side. When ``ring_id`` is absent
+        the existing value is preserved.
         """
-        with self._session_factory() as session:
-            existing = session.scalar(
-                select(RiskScoreRecord).where(
-                    RiskScoreRecord.wallet == wallet,
-                    RiskScoreRecord.asset_pair == asset_pair,
-                )
-            )
-            if existing is None:
-                existing = RiskScoreRecord(wallet=wallet, asset_pair=asset_pair)
-                session.add(existing)
+        for attempt in range(5):
+            try:
+                with self._session_factory() as session:
+                    existing = session.scalar(
+                        select(RiskScoreRecord).where(
+                            RiskScoreRecord.wallet == wallet,
+                            RiskScoreRecord.asset_pair == asset_pair,
+                        )
+                    )
+                    if existing is None:
+                        existing = RiskScoreRecord(wallet=wallet, asset_pair=asset_pair)
+                        session.add(existing)
 
-            existing.score = int(risk_score["score"])
-            existing.benford_flag = bool(risk_score["benford_flag"])
-            existing.ml_flag = bool(risk_score["ml_flag"])
-            existing.confidence = int(risk_score["confidence"])
+                    existing.score = int(risk_score["score"])
+                    existing.benford_flag = bool(risk_score["benford_flag"])
+                    existing.ml_flag = bool(risk_score["ml_flag"])
+                    existing.confidence = int(risk_score["confidence"])
+                    if "propagated_risk" in risk_score:
+                        existing.propagated_risk = float(risk_score["propagated_risk"])
+                    if "ring_id" in risk_score:
+                        existing.ring_id = risk_score["ring_id"]
 
-            session.commit()
-            session.refresh(existing)
-            return existing
+                    session.commit()
+                    session.refresh(existing)
+                    return existing
+            except OperationalError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (2**attempt))
 
     def get(self, wallet: str, asset_pair: str) -> RiskScoreRecord | None:
         with self._session_factory() as session:
-            return session.scalar(
-                select(RiskScoreRecord).where(
-                    RiskScoreRecord.wallet == wallet,
-                    RiskScoreRecord.asset_pair == asset_pair,
-                )
+            return cast(
+                RiskScoreRecord | None,
+                session.scalar(
+                    select(RiskScoreRecord).where(
+                        RiskScoreRecord.wallet == wallet,
+                        RiskScoreRecord.asset_pair == asset_pair,
+                    )
+                ),
             )
 
     def list_flagged(self, threshold: int) -> Iterable[RiskScoreRecord]:
@@ -63,3 +93,70 @@ class RiskScoreStore:
                     .order_by(RiskScoreRecord.score.desc())
                 )
             )
+
+    # ------------------------------------------------------------------
+    # SHAP query accounting (differential-privacy Rényi composition)
+    # ------------------------------------------------------------------
+
+    def increment_shap_query(self, wallet: str) -> int:
+        """Atomically increment and return `wallet`'s SHAP query count."""
+        with self._session_factory() as session:
+            counter = session.get(ShapQueryCount, wallet)
+            if counter is None:
+                counter = ShapQueryCount(wallet=wallet, query_count=0)
+                session.add(counter)
+            counter.query_count += 1
+            new_count = counter.query_count
+            session.commit()
+            return new_count
+
+    def get_shap_query_count(self, wallet: str) -> int:
+        """Return `wallet`'s current SHAP query count (0 if never queried)."""
+        with self._session_factory() as session:
+            counter = session.get(ShapQueryCount, wallet)
+            return counter.query_count if counter is not None else 0
+
+    # ------------------------------------------------------------------
+    # Model inversion attack defence (Issue #264)
+    # ------------------------------------------------------------------
+
+    def check_query_limit(self, caller_id: str, wallet_id: str) -> tuple[bool, int]:
+        """Check if caller has exceeded query limit for wallet (external API calls only).
+
+        Returns:
+            (exceeded, current_count): True if limit exceeded, plus current query count
+        """
+        with self._session_factory() as session:
+            tracker = session.scalar(
+                select(ModelInversionQueryTracker).where(
+                    ModelInversionQueryTracker.caller_id == caller_id,
+                    ModelInversionQueryTracker.wallet_id == wallet_id,
+                )
+            )
+            if tracker is None:
+                return False, 0
+            exceeded = tracker.query_count >= config.MODEL_INVERSION_QUERY_LIMIT
+            return exceeded, tracker.query_count
+
+    def increment_query_count(self, caller_id: str, wallet_id: str) -> int:
+        """Atomically increment and return query count for (caller_id, wallet_id).
+
+        External API calls only. Returns the incremented count.
+        """
+        with self._session_factory() as session:
+            tracker = session.scalar(
+                select(ModelInversionQueryTracker).where(
+                    ModelInversionQueryTracker.caller_id == caller_id,
+                    ModelInversionQueryTracker.wallet_id == wallet_id,
+                )
+            )
+            if tracker is None:
+                tracker = ModelInversionQueryTracker(
+                    caller_id=caller_id, wallet_id=wallet_id, query_count=0
+                )
+                session.add(tracker)
+            tracker.query_count = (tracker.query_count or 0) + 1
+            tracker.last_query_at = datetime.now(UTC)
+            new_count = tracker.query_count
+            session.commit()
+            return new_count

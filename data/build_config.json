@@ -1,0 +1,59 @@
+{
+  "date_range_start": "2024-01-01T00:00:00Z",
+  "date_range_end": "2024-06-30T23:59:59Z",
+  "asset_pairs": [
+    "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/XLM:native",
+    "BTC:GAUTUYY2THLF7SGITDFMXJVYH3LHDSMGEAKSBU267M2K7A3W543CKUEF/XLM:native",
+    "AQUA:GBNZILSTVQZ4R7IKQDGHYGY2QXL5QOFJYQMXPKWRRM5PAV7Y4M67AQUA/XLM:native"
+  ],
+  "stablecoins": [
+    "USDC",
+    "USDT",
+    "USDX",
+    "NUSD",
+    "EURT",
+    "BRLT",
+    "ARST",
+    "NGNT"
+  ],
+  "native_assets": [
+    "XLM"
+  ],
+  "thresholds": {
+    "max_ledger_window": 100,
+    "amount_tolerance": 0.05,
+    "graph_similarity_threshold": 0.7,
+    "min_trades_for_negative": 50,
+    "min_counterparties_for_negative": 5
+  },
+  "thin_market": {
+    "max_unique_traders_7d": 50,
+    "min_liquidity_depth_usd": 1000,
+    "min_amm_tvl_usd": 5000,
+    "benford_chi_square_threshold_multiplier": 3.0,
+    "alert_threshold": 60,
+    "classification_cache_seconds": 3600
+  },
+  "asset_class_benford_baselines": {
+    "stablecoin": {
+      "description": "Expected leading-digit frequencies for stablecoin pairs; clusters around round numbers (1xx, 1000, 10000) cause elevated digit-1 frequency.",
+      "distribution": {
+        "1": 0.38,
+        "2": 0.14,
+        "3": 0.10,
+        "4": 0.09,
+        "5": 0.09,
+        "6": 0.07,
+        "7": 0.05,
+        "8": 0.05,
+        "9": 0.03
+      }
+    },
+    "native": {
+      "description": "Theoretical Benford distribution used for native XLM."
+    },
+    "volatile": {
+      "description": "Theoretical Benford distribution used for volatile assets; empirical baseline computed from clean trades at runtime."
+    }
+  }
+}

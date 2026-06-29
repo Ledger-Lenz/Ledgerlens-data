@@ -1,0 +1,162 @@
+name: Scheduled Retraining
+
+on:
+  schedule:
+    # Every Monday at 02:00 UTC
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days to look back for drift detection"
+        default: "30"
+        required: false
+      retrain_data_path:
+        description: "Path to labelled dataset for retraining"
+        default: "data/synthetic_dataset.parquet"
+        required: false
+
+env:
+  MODEL_STORE_TYPE: ${{ vars.MODEL_STORE_TYPE || 'local' }}
+
+permissions:
+  id-token: write
+  contents: write
+  issues: write
+  pull-requests: read
+
+jobs:
+  detect-and-retrain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff black
+
+      - name: Lint check
+        run: |
+          ruff check .
+          black --check .
+
+      - name: Run drift detection and retraining
+        id: retrain
+        run: |
+          python -m scripts.retrain_if_drifted \
+            --lookback-days ${{ github.event.inputs.lookback_days || 30 }} \
+            --retrain-data-path ${{ github.event.inputs.retrain_data_path || 'data/synthetic_dataset.parquet' }} \
+            2>&1 | tee retrain_output.txt
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Upload drift reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrain-reports
+          path: reports/
+          retention-days: 90
+
+      - name: Commit model artifacts on promotion
+        if: steps.retrain.outputs.exit_code == '2'
+        run: |
+          git config user.name "ledgerlens-bot"
+          git config user.email "bot@ledgerlens.ai"
+          git add models/ metrics.json 2>/dev/null || true
+          git diff --cached --quiet || \
+            git commit -m "auto: promote retrained models [skip ci]"
+          git push
+
+      - name: Create or update tracking issue with drift report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          summary=$(python -c "
+          import json, os, glob
+
+          report_dir = 'reports'
+          if not os.path.isdir(report_dir):
+              print('No reports directory — skipping.')
+              exit(0)
+
+          drift_files = sorted(glob.glob(f'{report_dir}/drift_report_*.json'))
+          retrain_files = sorted(glob.glob(f'{report_dir}/retrain_report_*.json'))
+
+          lines = ['## Weekly Retraining Report\\n']
+
+          if drift_files:
+              with open(drift_files[-1]) as f:
+                  d = json.load(f)
+              lines.append(f'**Drift detected:** {d[\"any_drift_detected\"]}')
+              lines.append(f'**Features drifted:** {d[\"n_features_drifted\"]}/{d[\"n_features_checked\"]}')
+              for feat in d['features']:
+                  flag = '⚠️' if feat['drift_flag'] else '✅'
+                  lines.append(f'- {flag} {feat[\"feature\"]}: PSI={feat[\"psi\"]:.4f}')
+
+          if retrain_files:
+              with open(retrain_files[-1]) as f:
+                  r = json.load(f)
+              lines.append(f'\\n**Retraining triggered:** {r[\"drift_report\"][\"any_drift_detected\"]}')
+              lines.append(f'**Promotion decision:** {r[\"promotion_decision\"]}')
+              lines.append(f'**Reason:** {r[\"reason\"]}')
+
+          body = '\\n'.join(lines)
+          print(body)
+          with open('/tmp/summary.txt', 'w') as f:
+              f.write(body)
+          ")
+
+          if [ -f /tmp/summary.txt ]; then
+            summary=$(cat /tmp/summary.txt)
+            # Find most recent open PR to comment on
+            pr_url=$(gh pr list --state open --limit 1 --json url --jq '.[0].url // empty')
+            if [ -n "$pr_url" ]; then
+              gh pr comment "$pr_url" --body "$summary"
+            else
+              # Create a tracking issue
+              today=$(date +%Y-%m-%d)
+              existing_issue=$(gh issue list --label retraining --state open --json number --jq '.[0].number // empty')
+              if [ -n "$existing_issue" ]; then
+                gh issue comment "$existing_issue" --body "$summary"
+              else
+                gh issue create \
+                  --title "Retraining Report — $today" \
+                  --label retraining \
+                  --body "$summary"
+              fi
+            fi
+          fi
+
+  # Optional: upload to S3/GCS if MODEL_STORE_TYPE is remote
+  upload-artifacts:
+    if: ${{ vars.MODEL_STORE_TYPE == 's3' || vars.MODEL_STORE_TYPE == 'gcs' }}
+    needs: detect-and-retrain
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.MODEL_STORE_TYPE == 's3' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Upload models to S3
+        if: ${{ vars.MODEL_STORE_TYPE == 's3' }}
+        run: |
+          aws s3 sync models/ s3://${{ vars.MODEL_BUCKET }}/${{ github.repository }}/
+          aws s3 sync reports/ s3://${{ vars.MODEL_BUCKET }}/${{ github.repository }}/reports/

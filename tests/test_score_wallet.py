@@ -1,4 +1,5 @@
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -46,7 +47,7 @@ def mock_explainer():
 
 
 def test_score_wallet_outputs_score_and_shap(capsys, mock_scorer, mock_ingestion, mock_explainer):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -60,7 +61,7 @@ def test_score_wallet_outputs_score_and_shap(capsys, mock_scorer, mock_ingestion
 def test_score_wallet_json_output_is_valid_json(
     capsys, mock_scorer, mock_ingestion, mock_explainer
 ):
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     with patch(
         "sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G...", "--json"]
     ):
@@ -75,7 +76,7 @@ def test_score_wallet_json_output_is_valid_json(
 
 def test_score_wallet_flagged_label(capsys, mock_scorer, mock_ingestion, mock_explainer):
     mock_scorer.score.return_value["score"] = 85
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -85,7 +86,7 @@ def test_score_wallet_flagged_label(capsys, mock_scorer, mock_ingestion, mock_ex
 
 def test_score_wallet_ok_label(capsys, mock_scorer, mock_ingestion, mock_explainer):
     mock_scorer.score.return_value["score"] = 30
-    test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
         main()
 
@@ -93,23 +94,160 @@ def test_score_wallet_ok_label(capsys, mock_scorer, mock_ingestion, mock_explain
     assert "[OK]" in out
 
 
-def test_score_wallet_invalid_wallet_id_exits_1(capsys):
+def test_score_wallet_invalid_wallet_address_raises_value_error(capsys):
     with patch("sys.argv", ["score_wallet.py", "--wallet", "BADID", "--pair", "USDC:G..."]):
-        with pytest.raises(SystemExit) as excinfo:
+        with pytest.raises(ValueError, match="Invalid Stellar address"):
             main()
-    assert excinfo.value.code == 1
-    out, _ = capsys.readouterr()
-    assert "Invalid wallet ID format" in out
 
 
-def test_score_wallet_missing_models_exits_1(capsys, mock_ingestion):
+def test_score_wallet_missing_models_exits_1(caplog, mock_ingestion):
     with patch(
         "scripts.score_wallet.RiskScorer", side_effect=RuntimeError("No trained models found")
     ):
-        test_wallet = "GABC1234567890123456789012345678901234567890123456789012"
+        test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         with patch("sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G..."]):
-            with pytest.raises(SystemExit) as excinfo:
-                main()
+            with caplog.at_level(logging.INFO):
+                with pytest.raises(SystemExit) as excinfo:
+                    main()
         assert excinfo.value.code == 1
-        _, err = capsys.readouterr()
-        assert "model_training.py" in err
+        assert any("model_training.py" in r.message for r in caplog.records)
+
+
+def test_score_wallet_quiet_outputs_single_json_line_and_no_stderr(
+    capsys, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch(
+        "sys.argv", ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G...", "-q"]
+    ):
+        main()
+
+    out, err = capsys.readouterr()
+    assert err == ""
+
+    lines = out.strip().splitlines()
+    assert len(lines) == 1
+
+    data = json.loads(lines[0])
+    assert data["wallet"] == test_wallet
+    assert data["score"] == 83
+
+
+def test_score_wallet_causal_json_output_includes_causal_section(
+    capsys, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch("scripts.score_wallet.CounterfactualAttributor") as mock_attributor:
+        attributor_instance = mock_attributor.return_value
+        attributor_instance.counterfactual_score.return_value = {
+            "original_score": 83,
+            "counterfactual_score": 41,
+            "score_delta": 42,
+            "features_changed": {"round_trip_frequency": {"original": 0.6, "counterfactual": 0.0}},
+        }
+        with patch(
+            "sys.argv",
+            [
+                "score_wallet.py",
+                "--wallet",
+                test_wallet,
+                "--pair",
+                "USDC:G...",
+                "--json",
+                "--causal",
+            ],
+        ):
+            main()
+
+    out, _ = capsys.readouterr()
+    data = json.loads(out)
+    assert data["wallet"] == test_wallet
+    assert "causal_attribution" in data
+    assert data["causal_attribution"]["counterfactual_score"] == 41
+
+
+def test_score_wallet_what_if_remove_invalid_trade_raises_value_error(
+    mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch(
+        "sys.argv",
+        [
+            "score_wallet.py",
+            "--wallet",
+            test_wallet,
+            "--pair",
+            "USDC:G...",
+            "--what-if-remove",
+            "not-a-trade",
+        ],
+    ):
+        with pytest.raises(ValueError):
+            main()
+
+
+def test_score_wallet_json_stdout_has_no_log_noise(
+    capsys, caplog, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with caplog.at_level(logging.INFO):
+        with patch(
+            "sys.argv",
+            ["score_wallet.py", "--wallet", test_wallet, "--pair", "USDC:G...", "--json"],
+        ):
+            main()
+
+    out, _ = capsys.readouterr()
+
+    # stdout must be nothing but the JSON payload — no status messages mixed in.
+    data = json.loads(out)
+    assert data["score"] == 83
+    assert "Wallet scored" not in out
+
+    # the status message was emitted through logging (routed to stderr), not print().
+    assert any("Wallet scored" in r.message for r in caplog.records)
+
+
+def test_score_wallet_log_level_flag_sets_root_logger_level(
+    capsys, mock_scorer, mock_ingestion, mock_explainer
+):
+    test_wallet = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    with patch(
+        "sys.argv",
+        [
+            "score_wallet.py",
+            "--wallet",
+            test_wallet,
+            "--pair",
+            "USDC:G...",
+            "--log-level",
+            "DEBUG",
+        ],
+    ):
+        main()
+
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_validate_wallet_address():
+    from scripts.score_wallet import validate_wallet_address
+
+    # Valid
+    valid_addr = "G" + "A" * 55
+    validate_wallet_address(valid_addr)  # Should not raise
+
+    # Too short
+    with pytest.raises(ValueError, match="Invalid Stellar address"):
+        validate_wallet_address("G" + "A" * 54)
+
+    # Too long
+    with pytest.raises(ValueError, match="Invalid Stellar address"):
+        validate_wallet_address("G" + "A" * 56)
+
+    # Lowercase
+    with pytest.raises(ValueError, match="Invalid Stellar address"):
+        validate_wallet_address("g" + "a" * 55)
+
+    # Wrong prefix
+    with pytest.raises(ValueError, match="Invalid Stellar address"):
+        validate_wallet_address("X" + "A" * 55)

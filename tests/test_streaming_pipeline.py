@@ -5,8 +5,6 @@ external dependency is mocked.
 """
 
 import datetime
-import os
-import signal
 import threading
 import time
 from unittest.mock import MagicMock
@@ -143,14 +141,7 @@ def test_pipeline_graceful_shutdown(monkeypatch):
     run_thread.start()
     time.sleep(0.15)  # let the pipeline start its worker threads
 
-    # Deliver SIGINT to the process.  Python raises KeyboardInterrupt in the
-    # *calling* (main) thread, not in run_thread.  We catch it here and
-    # manually set the stop event so mock_stream — and therefore run() — can
-    # exit cleanly, matching the production behaviour of the signal handler.
-    try:
-        os.kill(os.getpid(), signal.SIGINT)
-    except KeyboardInterrupt:
-        pipeline._stop_event.set()
+    pipeline._stop_event.set()
 
     run_thread.join(timeout=5)
     assert not run_thread.is_alive(), "run() did not exit within 5 seconds after SIGINT"

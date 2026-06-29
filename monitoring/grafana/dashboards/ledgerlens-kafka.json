@@ -1,0 +1,96 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens Kafka Streaming",
+  "tags": ["ledgerlens", "kafka"],
+  "timezone": "browser",
+  "time": {"from": "now-15m", "to": "now"},
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Kafka lag by partition",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "kafka_lag_by_partition",
+          "legendFormat": "{{topic}}[{{partition}}]"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Scoring latency (p95, ms)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(scoring_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Messages consumed / s",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "sum(rate(kafka_messages_consumed_total[1m]))",
+          "legendFormat": "consumed/s"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Alerts dispatched / s",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "sum(rate(alerts_dispatched_total[1m]))",
+          "legendFormat": "alerts/s"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Inter-annotator Kappa (rolling)",
+      "description": "Mean Cohen's Kappa across all double-annotated wallets over time. Values below 0.6 indicate systematic disagreement requiring senior review.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0.4},
+              {"color": "yellow", "value": 0.6},
+              {"color": "green", "value": 0.8}
+            ]
+          },
+          "custom": {
+            "thresholdsStyle": {"mode": "line"}
+          },
+          "min": -1,
+          "max": 1,
+          "unit": "short"
+        }
+      },
+      "targets": [
+        {
+          "expr": "inter_annotator_kappa",
+          "legendFormat": "Mean Kappa"
+        },
+        {
+          "expr": "inter_annotator_disputed_total",
+          "legendFormat": "Disputed wallets (cumulative)"
+        }
+      ]
+    }
+  ]
+}

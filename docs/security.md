@@ -1,105 +1,230 @@
 # LedgerLens Security
 
----
+See [`docs/security_threat_model.md`](security_threat_model.md) for a comprehensive STRIDE-based threat model covering data ingestion, model inference, persistence, SHAP interpretability, and on-chain integration.
 
-## Federated Learning Authentication
+## Threat Model: Model Poisoning
+
+LedgerLens is a fraud-detection system — making it a high-value target for adversaries who want their wash trading to go undetected. Three attack vectors are in scope:
+
+| Threat | Description |
+|---|---|
+| **Artifact substitution** | A compromised CI pipeline or model storage replaces a legitimate `.joblib` with a backdoored one. |
+| **Training data poisoning** | An adversary injects fraudulent wash-trade labels into the annotation queue, causing the retrained model to develop a blind spot. |
+| **Ensemble manipulation** | If one of RF/XGBoost/LightGBM is compromised, a naive average gives the poisoned model equal weight, potentially reducing the final score by ~33 points. |
+
+## Artifact Integrity Verification
+
+Every model artifact goes through a four-step trust chain enforced by `ModelArtifact.verify_chain()` in `detection/persistence.py`:
+
+1. **SHA-256 match** — the `.joblib` file's SHA-256 must match the `artifact_sha256` field recorded in `metrics.json` at training time.
+2. **Ed25519 signature** — `metrics.json` must be accompanied by `metrics.json.sig`, a detached Ed25519 signature produced by the authorised signing key.
+3. **Key fingerprint** — the SHA-256 fingerprint of the public key used for verification must match `TRUSTED_SIGNING_KEY_FINGERPRINT` in config.
+4. **Training data SHA-256** — (optional, supplied at call site) the SHA-256 of the training dataset recorded in `metrics.json` must match the caller's expectation.
+
+A `ModelIntegrityError` with a specific failure reason is raised on any step failure. `RiskScorer._load_models()` calls `verify_chain` immediately after every `joblib.load`; a CI grep check enforces this invariant.
+
+### Generating a Signing Key
+
+```bash
+# Generate an Ed25519 private key (PEM format)
+openssl genpkey -algorithm ed25519 -out signing_key.pem
+
+# Extract the corresponding public key
+openssl pkey -in signing_key.pem -pubout -out signing_key_pub.pem
+```
+
+Set `MODEL_SIGNING_PRIVATE_KEY_PATH=./signing_key.pem` in your environment (not in `.env` committed to git).
+
+### Computing the Trusted Fingerprint
+
+```python
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+import hashlib
+
+with open("signing_key_pub.pem", "rb") as f:
+    pub = serialization.load_pem_public_key(f.read())
+
+raw = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+fingerprint = hashlib.sha256(raw).hexdigest()
+print(fingerprint)
+```
+
+Set `TRUSTED_SIGNING_KEY_FINGERPRINT=<output>` in your environment.
+
+### Signing Key Rotation
+
+When rotating the Ed25519 signing key:
+
+1. Generate the new key pair (see above).
+2. Update `MODEL_SIGNING_PRIVATE_KEY_PATH` in CI secrets / deployment environment.
+3. Update `TRUSTED_SIGNING_KEY_FINGERPRINT` to the new public key's fingerprint.
+4. Re-run `python -m detection.model_training --data-path ...` to produce freshly signed artifacts.
+5. Deploy the new artifacts. Old artifacts signed with the previous key will fail `verify_chain` and must not be loaded.
+6. Revoke access to the old private key and delete it from all locations.
+
+**Never commit `signing_key.pem` or its contents to version control.**
+
+## Byzantine-Fault-Tolerant Ensemble Voting
+
+The inference stack uses a trimmed-mean / median voting scheme so that a single compromised model cannot materially change the final score.
+
+### Algorithm
+
+1. Collect the raw 0–100 scores from RF, XGBoost, and LightGBM.
+2. If `|max - min| > BFT_SCORE_DIVERGENCE_THRESHOLD` (default 30): log a WARNING with all three raw scores, increment the `bft_divergence_detected_total` Prometheus counter, and set `bft_divergence: true` in the response. Use the **median** as the final score (for 3 models this is the trimmed mean with the extremes dropped).
+3. If fewer than `BFT_MIN_CONSENSUS` (default 2) models agree within 10 points: return `score=100`, `confidence=0`, `consensus_failure=true`.
+
+### Tuning
+
+| Config var | Default | Effect |
+|---|---|---|
+| `BFT_SCORE_DIVERGENCE_THRESHOLD` | 30 | Minimum score span that triggers trimmed-mean fallback |
+| `BFT_MIN_CONSENSUS` | 2 | Minimum number of models required to be within 10 points of each other |
+
+## Training Data Provenance
+
+`detection/model_training.py` records the following for every training run in `metrics.json`:
+
+- `training_data_sha256` — SHA-256 of the row-sorted input parquet (deterministic).
+- `label_distribution` — `{0: N, 1: M}` counts; a sudden shift in the 1:0 ratio is a poisoning signal.
+
+### Label Poisoning Detection
+
+`detect_label_poisoning()` compares the current wash-trade label ratio against a baseline stored in `models/label_distribution_baseline.json`. If the ratio has shifted by more than `POISON_LABEL_RATIO_THRESHOLD` (default 15%), training is aborted and an alert is written to `reports/poisoning_alert_{timestamp}.json`.
+
+## Supply Chain Security: Model Artifact Transparency Log
 
 ### Overview
 
-The federated coordinator accepts gradient updates from registered participants.
-All communication uses **mutual TLS (mTLS)**: both the server and each participant
-present X.509 certificates, and both sides verify the other's certificate chain.
+`ModelArtifactVerifier` in `detection/persistence.py` extends the existing trust chain with a third independent check: every artifact's SHA-256 must appear in an append-only **transparency log** stored in the risk score database.  A coordinated attack that replaces the artifact **and** tampers with `metrics.json` will still fail unless the attacker also corrupts the transparency log, which is separately backed up.
+
+### Verification Flow
 
 ```
-Participant                    Coordinator
-    |                               |
-    |  ClientHello                  |
-    |------------------------------>|
-    |  ServerHello + server cert    |
-    |<------------------------------|
-    |  client cert (signed by CA)   |
-    |------------------------------>|
-    |  TLS session established      |
-    |  (OpenSSL rejects bad certs)  |
-    |                               |
-    |  POST /gradient_update        |
-    |------------------------------>|
-    |  App layer: CN revocation?    |
-    |  App layer: model_id in scope?|
-    |  202 Accepted / 401 / 403     |
-    |<------------------------------|
+Download artifact
+      │
+      ▼
+1. SHA-256 hash                  — fast, no model parsing
+      │
+      ▼
+2. Ed25519 signature on          — verifies metrics.json
+   metrics.json
+      │
+      ▼
+3. Transparency log lookup       — append-only, separately backed up
+      │
+      ▼
+   ✅ Load model  /  ❌ ModelIntegrityError → refuse to start
 ```
 
-### Certificate Issuance
+Any of the three checks failing raises `ModelIntegrityError` and the scorer refuses to start.
 
-1. **Bootstrap** — a new participant contacts the LedgerLens operator out-of-band
-   (e.g. via a verified Signal message or physical key ceremony) and provides
-   their public key fingerprint or CSR.
-2. The operator runs `python -m scripts.manage_federated_certs issue --cn <CN> --models <models>`.
-3. The signed certificate and private key are written to `certs/participants/`.
-4. The operator transmits the private key to the participant over a secure channel
-   (Signal, encrypted email, or direct physical handoff) and **deletes the local copy**.
-5. The participant private key never appears in the coordinator at any point after step 4.
-
-### Certificate Revocation
-
-- Revocation is stored in the `federated_participant_certs` table (SQLite/PostgreSQL).
-- The coordinator's `RevocationCache` reloads from the DB every 30 seconds,
-  guaranteeing revocation takes effect **within 60 seconds**.
-- No OCSP server is required; the revocation list is loaded in-process.
-- To revoke: `python -m scripts.manage_federated_certs revoke --cn <CN>`
-
-### Certificate Rotation
-
-Participants should rotate certificates before expiry.  The `rotate` command
-atomically revokes the old certificate and issues a replacement:
+### Publishing a New Artifact
 
 ```bash
-python -m scripts.manage_federated_certs rotate --cn participant-A --models benford,gnn
+python -m scripts.publish_model_artifact \
+    --model-name rf \
+    --model-dir ./models \
+    --private-key-path /secrets/signing_key.pem \
+    --db-url sqlite:///ledgerlens.db
 ```
 
-Expiry monitoring: `python -m scripts.manage_federated_certs check-expiry --days 30`
-alerts on certificates expiring within 30 days.
+This script:
+1. Computes the SHA-256 of the `.joblib` file.
+2. Records the hash in `metrics.json` and re-signs it.
+3. Appends the hash to the `transparency_log` DB table.
 
-### Authorisation Scopes
+### Transparency Log Format
 
-Each certificate encodes the set of model IDs the participant may submit
-updates for in the X.509 `organizationalUnitName` (OU) field:
+```sql
+CREATE TABLE transparency_log (
+    id            INTEGER PRIMARY KEY,
+    model_name    TEXT    NOT NULL,
+    artifact_sha256 TEXT  NOT NULL UNIQUE,  -- 64-char lowercase hex
+    registered_at DATETIME NOT NULL
+);
+```
+
+Rows are never updated or deleted.  The table supports public auditability: export the full `artifact_sha256` column to a public append-only ledger (e.g. Sigstore Rekor, a public blockchain, or a signed NDJSON file) to allow external parties to verify artifact provenance without access to the internal database.
+
+### Security Requirements
+
+| Requirement | Detail |
+|---|---|
+| **Signing key storage** | Store the Ed25519 private key in an HSM or encrypted secrets manager (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager). Never write it to disk unencrypted in production. |
+| **Transparency log backup** | Back up the `transparency_log` table separately from the model artifact store. A coordinated attacker who modifies both the artifact and the log would otherwise bypass the check. |
+| **Log immutability** | The application layer exposes no UPDATE or DELETE path for `transparency_log`. Implement DB-level row-security policies to enforce this in production. |
+
+## Annotation Queue Integrity
+
+Each entry in `data/annotation_queue.json` carries an `annotation_hmac` field: HMAC-SHA256 of `wallet|label|annotator_id|annotated_at` keyed by `ANNOTATION_HMAC_SECRET`. `export_labelled()` verifies every HMAC before including an annotation; tampered entries are logged as WARNING and excluded.
+
+**Set `ANNOTATION_HMAC_SECRET` to a cryptographically random value (≥ 32 bytes hex) and never commit it.**
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+## Model Inversion Attack Defence
+
+A model inversion attack allows an adversary to reconstruct features used in
+scoring by querying the model repeatedly and analyzing the gradients (or in
+discrete settings, the score deltas). In LedgerLens, an attacker could query
+the score for a wallet, remove one trade, re-query, and observe the delta to
+identify which individual trade was most anomalous. Repeated queries across
+variants reconstruct the full anomaly profile.
+
+### Output Perturbation (Laplace Mechanism)
+
+`detection/model_inference.py::score()` applies **Laplace output perturbation**
+per external API call to defend against this attack. The mechanism:
+
+1. **Per-query random seed**: derived from `(caller_id, timestamp_bucket)` so
+   identical repeated queries produce different scores, preventing averaging.
+2. **Laplace noise**: drawn with scale `σ = sensitivity / ε`, where sensitivity
+   is the max score change from one trade (bounded at 100) and `ε` is the privacy
+   budget (default 1.0).
+3. **Clipping + rounding**: perturbed scores clipped to [0, 100] and rounded to
+   `SCORE_ROUNDING_GRANULARITY` (default 1 point).
+
+**Internal pipeline calls** (e.g. `run_pipeline.py` → model training) use
+`caller_id="internal"` and are **not perturbed**, preserving model quality for
+batch operations.
+
+### Query Rate-Limiting
+
+`detection/risk_score_store.py::RiskScoreStore` tracks queries per
+`(caller_id, wallet_id)` pair. Once a caller exceeds `MODEL_INVERSION_QUERY_LIMIT`
+queries (default 100) on a wallet, subsequent API requests for that wallet return
+**429 Too Many Requests**. This prevents sustained gradient-based attacks.
+
+| Config Variable | Default | Description |
+|---|---|---|
+| `MODEL_INVERSION_QUERY_LIMIT` | `100` | Max queries per (caller, wallet) before 429 |
+| `MODEL_INVERSION_DP_EPSILON` | `1.0` | Privacy budget ε for Laplace mechanism |
+| `SCORE_ROUNDING_GRANULARITY` | `1` | Quantize scores to this granularity |
+
+### Seeding Prevents Averaging
+
+The seed derivation `hash(caller_id + timestamp_bucket)` ensures:
+- **Different results for identical queries**: Attacker's repeated score queries
+  get different noisy values, so averaging them doesn't converge to the truth.
+- **Reproducibility within a time window**: For testing / audit, the same
+  `(caller_id, timestamp)` always produces the same noise.
+
+### Example: Attacker Scenario
 
 ```
-Subject: CN=participant-A, OU=benford,gnn, O=LedgerLens Participant
+Attacker's intended attack:
+  Query 1: GET /score/G...wallet.../USDC:G.../XLM:native → score = 75
+  Remove last trade, re-query
+  Query 2: GET /score/G...wallet.../USDC:G.../XLM:native → score = 72
+  Delta = 3 points → identifies last trade as moderately anomalous
+
+With model inversion defence:
+  Query 1: score = 75 + Laplace(0, 100/ε) → 68 (noisy)
+  Query 2: score = 72 + Laplace(0, 100/ε) → 79 (different noise seed)
+  Delta = 11 points (includes noise) → cannot invert
+  After 100 queries: 429 Too Many Requests → rate limited
 ```
-
-The coordinator's `require_participant` dependency rejects any gradient update
-for a `model_id` not listed in the participant's OU.
-
-### CA Private Key Storage Requirement
-
-> **The CA private key MUST be stored in a hardware security module (HSM) or
-> an encrypted secrets manager (e.g. HashiCorp Vault, AWS KMS, GCP Secret Manager).**
-
-The `generate_ca_keypair()` function (and the `init-ca` CLI command) print the CA
-private key to stdout exactly once.  The operator is responsible for loading it
-into the secrets manager immediately.  It must never be written to plaintext files.
-
-At runtime, inject the key via the `FEDERATED_CA_KEY_PEM` environment variable,
-sourced from the secrets manager by the deployment pipeline (e.g. via
-`vault kv get -field=key secret/ledgerlens/ca`).
-
----
-
-## Webhook Security
-
-- `ALERT_WEBHOOK_URL` must use `https://`; `http://` is rejected at startup.
-- The URL is never written to log output.
-
-## WebSocket Security
-
-- The WebSocket server binds to `127.0.0.1` by default (loopback only).
-- Setting `WS_BIND_HOST=0.0.0.0` requires `WS_ALLOW_EXTERNAL=1` to be explicitly
-  set; the server raises `ValueError` otherwise.
-
-## On-Chain Secret
-
-- `LEDGERLENS_SUBMITTER_SECRET` (the service-account Stellar secret key) must be
-  stored in a secrets manager and never committed to source control.
