@@ -228,3 +228,110 @@ With model inversion defence:
   Delta = 11 points (includes noise) → cannot invert
   After 100 queries: 429 Too Many Requests → rate limited
 ```
+
+---
+
+## Federated Learning Auditability (Issue #227)
+
+### Overview
+
+LedgerLens uses a federated learning architecture in which multiple participants
+train on local data and submit gradient updates to a central coordinator.  To
+satisfy regulatory requirements and enable post-incident investigation of
+Byzantine participants, every training round is recorded in a tamper-evident
+audit trail.
+
+### Information Recorded per Round
+
+Each row in the `federated_audit_trail` database table captures:
+
+| Field | Type | Description |
+|---|---|---|
+| `round_id` | SHA-256 hex | Deterministic hash of `(timestamp, sorted fingerprints, model_version)` — prevents sequential-ID manipulation |
+| `round_timestamp` | ISO-8601 UTC | When the round was recorded |
+| `participant_fingerprints` | JSON array | SHA-256 certificate fingerprints of every contributing participant |
+| `gradient_norms` | JSON object | `{"participant_id": l2_norm}` — scalar norms only, **never raw tensors** |
+| `aggregation_algorithm` | string | E.g. `"fedavg"`, `"staleness_weighted_fedavg"` |
+| `aggregate_model_hash` | SHA-256 hex | Hash of the post-aggregation global model weights |
+| `round_outcome` | string | `"success"` or `"abort"` |
+| `model_version` | integer | Monotonically increasing version counter after aggregation |
+| `participant_count` | integer | Number of contributors in this round |
+| `prev_hash` | SHA-256 hex | Hash of the previous record's canonical JSON — forms a Merkle chain |
+| `recorded_at` | datetime | DB insertion timestamp |
+
+### Security Invariants
+
+| Invariant | Enforcement |
+|---|---|
+| **No raw gradients** | `FederatedAuditTrail.record_round()` raises `TypeError` if any `gradient_norms` value is not a scalar. Raw tensors are rejected before reaching the DB. |
+| **Append-only records** | The application layer exposes no UPDATE or DELETE path for `federated_audit_trail`. Enforce DB-level row-security policies in production (e.g. PostgreSQL `GRANT INSERT` only). |
+| **Deterministic round ID** | `round_id = SHA-256(timestamp + sorted(fingerprints) + model_version)` — an attacker cannot insert a fake round without the hash changing. |
+| **Merkle chain** | `prev_hash` chains each record to its predecessor. Retroactive insertion or deletion breaks the chain and is detectable. |
+
+### Enabling the Audit Trail
+
+Attach a `FederatedAuditTrail` instance to `AsyncFederatedCoordinator`:
+
+```python
+from detection.federated.coordinator import AsyncFederatedCoordinator, FederatedAuditTrail
+
+audit = FederatedAuditTrail()          # uses RISK_SCORE_DB_URL by default
+coord = AsyncFederatedCoordinator(weight_dim=256)
+coord._audit = audit
+
+# Optionally register real certificate fingerprints (hex SHA-256 of cert DER)
+audit.set_participant_fingerprints({
+    "participant_alice": "aabbccddeeff...",
+    "participant_bob":   "11223344...",
+})
+```
+
+If `coord._audit` is `None` (the default), no audit records are written.
+
+### Query Tool
+
+`scripts/query_federated_audit.py` provides a CLI interface to the audit trail.
+
+```bash
+# Look up a specific round by its deterministic hash
+python -m scripts.query_federated_audit --round-id <round_id_hex>
+
+# List all rounds a participant contributed to
+python -m scripts.query_federated_audit --participant <fingerprint_hex>
+
+# Find the round that produced a specific model version
+python -m scripts.query_federated_audit --model-hash <sha256_hex>
+
+# List the 50 most recent rounds (default)
+python -m scripts.query_federated_audit --list
+
+# List with pagination
+python -m scripts.query_federated_audit --list --limit 20 --offset 40
+
+# Machine-readable NDJSON output
+python -m scripts.query_federated_audit --list --json
+
+# Full detail for each record
+python -m scripts.query_federated_audit --round-id <round_id_hex> --detail
+
+# Use a custom database URL
+python -m scripts.query_federated_audit \
+    --db-url postgresql://user:pass@host/dbname \
+    --list
+```
+
+### Regulatory Compliance Notes
+
+Gradient norms (L2 scalar values) are recorded to enable anomaly detection
+(unusually large or small norms may indicate a Byzantine participant) without
+exposing any model parameters or training data.  The combination of:
+
+- Deterministic, content-addressed round IDs
+- Certificate fingerprints linking each round to specific participants
+- Merkle hash chain over all records
+- Aggregate model hash per round
+
+…provides a complete, verifiable training lineage that satisfies common
+regulatory requirements (e.g. EU AI Act audit trail obligations, MAS TRM
+guidelines on model governance) and allows investigators to pinpoint exactly
+which participant's update corrupted a model version.
