@@ -4,6 +4,8 @@
 
 Sophisticated wash traders do not operate within a single exchange. This module detects coordinated wash trading campaigns that span both the **Stellar SDEX** (Central Limit Order Book) and **Stellar AMM liquidity pools** by ingesting trade signals from both venues and identifying temporally and volumetrically correlated activity.
 
+Additionally, this module detects **cross-chain coordination** with the **Solana blockchain** through the **Wormhole bridge**, identifying Stellar wallets that have linked Solana addresses used for coordinated wash trading across chains.
+
 ## Venue Architecture
 
 ```
@@ -24,13 +26,27 @@ Sophisticated wash traders do not operate within a single exchange. This module 
 │               └─────────────────┬─────────────────┘                   │
 │                                  │                                     │
 │                     FeatureBuffer (keyed by wallet)                   │
-└──────────────────────────────────┼─────────────────────────────────────┘
+└──────────────────────────────────┼──────────────────────────────────────┘
                                    │
-                                   ▼
-                     CrossVenueFeatureSet + CoordinationGraph
+                        ┌──────────▼──────────┐
+                        │                     │
+                        │  Identity Graph     │
+                        │  (Cross-chain)      │
+                        │                     │
+                        └──────────┬──────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+                    ▼                             ▼
+        ┌────────────────────┐       ┌────────────────────┐
+        │  Stellar Wallets   │       │  Solana Wallets    │
+        │  (Risk Scores)     │       │  (via Wormhole)    │
+        └────────────────────┘       └────────────────────┘
 ```
 
 Stellar **Protocol 18** introduced native AMM liquidity pools alongside the existing SDEX order book. Trades on these two venues are tracked via different Horizon API endpoints and would be invisible to a single-venue detector. This module bridges that gap.
+
+Additionally, the **Wormhole bridge** enables wrapped asset trading across chains. A Stellar wallet might bridge USDC to Solana, engage in wash trading on Solana, then bridge back to Stellar. This module detects such cross-chain linkages.
 
 ## Data Ingestion
 
@@ -48,6 +64,33 @@ Stellar **Protocol 18** introduced native AMM liquidity pools alongside the exis
 
 **Error handling:** HTTP 404 from Horizon raises `PoolNotFoundError`, not a generic exception.
 
+### Solana Cross-Chain Resolver (`detection/cross_chain/solana_resolver.py`)
+
+**NEW**: Solana address resolution for Wormhole-linked wallets.
+
+| Function | Description |
+|---|---|
+| `validate_solana_address(address)` | Validate base58-encoded Solana public key (32-44 chars) |
+| `parse_wormhole_vaa_payload(tx_data)` | Extract destination address from Wormhole VAA payload |
+| `extract_stellar_address_from_vaa(vaa_data)` | Decode embedded Stellar address from VAA |
+| `resolve_stellar_to_solana(stellar_addr, rpc_client)` | Query Solana RPC to find linked Solana addresses |
+| `SolanaRPCClient.get_signatures_for_address(addr)` | Query Solana RPC with 1-hour caching |
+| `SolanaRPCClient.get_transaction(signature)` | Fetch transaction data (cached) |
+
+**Security:**
+- Solana addresses validated before RPC calls to prevent injection attacks
+- Wormhole VAA signatures require verification (see Signature Verification section below)
+- RPC endpoint configurable via `SOLANA_RPC_URL` environment variable (defaults to public endpoint; private RPC recommended for production)
+
+**Caching:**
+- Solana RPC responses cached with **1-hour TTL** to avoid rate limiting
+- Cache size: 1000 entries (configurable)
+
+**Rate Limiting:**
+- Solana public RPC: ~100 requests/sec limit
+- Recommended: use private RPC endpoint with higher limits
+- Backoff logic: exponential retry on rate limit errors (future enhancement)
+
 ## Cross-Venue Features (`detection/cross_venue_features.py`)
 
 Seven features are computed per wallet from combined SDEX + AMM trade data:
@@ -63,6 +106,16 @@ Seven features are computed per wallet from combined SDEX + AMM trade data:
 | `cross_venue_cluster_score` | Centrality in Louvain cross-venue cluster | High score |
 
 All features fall back to `0.0` gracefully when AMM data is unavailable.
+
+### Cross-Chain Features
+
+**NEW**: One feature from Solana cross-chain linkage:
+
+| Feature | Description | Wash trader signal |
+|---|---|---|
+| `solana_linked_wash_score` | Risk score of linked Solana address (via Wormhole) | High score (0-100) from linked Solana wallet |
+
+This feature queries the identity graph to find Solana addresses linked to a Stellar wallet via Wormhole bridge transactions. If a cached risk score is available for the Solana address (from external Solana chain analysis), this signal is surfaced. Value: [0, 100], or 0 if no link found.
 
 ## Coordination Graph Construction
 
@@ -116,9 +169,46 @@ The `StreamingPipeline` now accepts `amm_pools: list[str]` (or reads from `confi
 ```env
 # .env
 WATCHED_AMM_POOLS=<64-char-pool-id-1>,<64-char-pool-id-2>
+
+# Solana RPC endpoint (NEW)
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com  # or private RPC for production
 ```
 
 Pool IDs are validated at config load time. An invalid hex string raises `ValueError` immediately.
+
+## Wormhole VAA Signature Verification
+
+When parsing Wormhole VAA payloads, the embedded Stellar destination address must be verified before trusting it. The VAA (Verified Action Approval) is signed by multiple Wormhole Guardians.
+
+### Guardian Signature Verification
+
+```python
+from detection.cross_chain.solana_resolver import parse_wormhole_vaa_payload
+
+vaa_data = parse_wormhole_vaa_payload(transaction_data)
+
+# Full VAA verification requires:
+# 1. Reconstruct the VAA hash from core fields
+# 2. Verify each signature against the Guardian set (threshold-based, e.g., 2/3)
+# 3. Compare signature count against current Guardian set size
+
+# Implementation: Use Wormhole SDK or custom signature verification
+```
+
+**Current Implementation:** Basic structure validation only (see `parse_wormhole_vaa_payload`). Full signature verification requires:
+- Access to Wormhole Guardian set state (updated weekly)
+- ECDSA signature verification library
+- Threshold signature scheme (2/3 or configurable)
+
+**Recommendation:** For production use, integrate [Wormhole TypeScript SDK](https://github.com/wormhole-foundation/wormhole) or implement Guardian set verification with caching.
+
+### Data Freshness Limitations
+
+1. **Bridge Latency:** Wormhole Guardians require ~15 minutes to finalize cross-chain transfers. VAAs are not immediately available.
+2. **Observability Lag:** Solana RPC queries reflect on-chain state, which lags by 1-2 blocks (~1 second).
+3. **Cache TTL:** Solana RPC responses cached for 1 hour to avoid rate limits. Fresh lookups require cache invalidation.
+
+**Implication:** Cross-chain linkages detected with 15-60 minute latency, suitable for retrospective analysis but not real-time alerts.
 
 ## Backfill Script
 
