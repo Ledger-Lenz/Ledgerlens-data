@@ -19,6 +19,8 @@ import json
 import math
 import os
 
+import numpy as np
+
 from config import config
 from utils.logging import get_logger
 
@@ -78,3 +80,32 @@ def feature_sensitivity(sensitivities: dict, feature: str, default: float | None
     default = config.DP_DEFAULT_SENSITIVITY if default is None else default
     value = sensitivities.get(feature, default) if sensitivities else default
     return float(value)
+
+
+def laplace_scale(sensitivity: float, epsilon: float) -> float:
+    """Scale parameter for Laplace mechanism: Δ / ε.
+    
+    Laplace noise N(0, scale) with this scale is (ε, 0)-DP.
+    """
+    if epsilon <= 0:
+        raise ValueError("epsilon must be > 0")
+    if sensitivity < 0:
+        raise ValueError("sensitivity must be >= 0")
+    return sensitivity / epsilon
+
+
+def add_laplace_noise(value: float, scale: float, rng: np.random.Generator | None = None) -> float:
+    """Add Laplace noise to a value for output perturbation.
+    
+    Args:
+        value: The score to perturb
+        scale: Laplace scale parameter (Δ / ε)
+        rng: numpy random generator (uses default if None)
+    
+    Returns:
+        Perturbed score
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    noise = rng.laplace(loc=0.0, scale=scale)
+    return value + noise

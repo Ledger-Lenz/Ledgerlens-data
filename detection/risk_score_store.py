@@ -6,13 +6,23 @@ Used by `run_pipeline.py` to persist `RiskScorer.score()` output for
 
 import time
 from collections.abc import Iterable
+from datetime import UTC, datetime
 from typing import cast
 
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
-from detection.persistence import RiskScoreRecord, ShapQueryCount, get_session_factory
+from config import config
+from detection.persistence import (
+    ModelInversionQueryTracker,
+    RiskScoreRecord,
+    ShapQueryCount,
+    get_session_factory,
+)
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class RiskScoreStore:
@@ -105,3 +115,48 @@ class RiskScoreStore:
         with self._session_factory() as session:
             counter = session.get(ShapQueryCount, wallet)
             return counter.query_count if counter is not None else 0
+
+    # ------------------------------------------------------------------
+    # Model inversion attack defence (Issue #264)
+    # ------------------------------------------------------------------
+
+    def check_query_limit(self, caller_id: str, wallet_id: str) -> tuple[bool, int]:
+        """Check if caller has exceeded query limit for wallet (external API calls only).
+
+        Returns:
+            (exceeded, current_count): True if limit exceeded, plus current query count
+        """
+        with self._session_factory() as session:
+            tracker = session.scalar(
+                select(ModelInversionQueryTracker).where(
+                    ModelInversionQueryTracker.caller_id == caller_id,
+                    ModelInversionQueryTracker.wallet_id == wallet_id,
+                )
+            )
+            if tracker is None:
+                return False, 0
+            exceeded = tracker.query_count >= config.MODEL_INVERSION_QUERY_LIMIT
+            return exceeded, tracker.query_count
+
+    def increment_query_count(self, caller_id: str, wallet_id: str) -> int:
+        """Atomically increment and return query count for (caller_id, wallet_id).
+
+        External API calls only. Returns the incremented count.
+        """
+        with self._session_factory() as session:
+            tracker = session.scalar(
+                select(ModelInversionQueryTracker).where(
+                    ModelInversionQueryTracker.caller_id == caller_id,
+                    ModelInversionQueryTracker.wallet_id == wallet_id,
+                )
+            )
+            if tracker is None:
+                tracker = ModelInversionQueryTracker(
+                    caller_id=caller_id, wallet_id=wallet_id, query_count=0
+                )
+                session.add(tracker)
+            tracker.query_count = (tracker.query_count or 0) + 1
+            tracker.last_query_at = datetime.now(UTC)
+            new_count = tracker.query_count
+            session.commit()
+            return new_count

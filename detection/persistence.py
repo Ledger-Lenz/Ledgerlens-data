@@ -76,6 +76,26 @@ class ShapQueryCount(Base):
     )
 
 
+class ModelInversionQueryTracker(Base):
+    """Track API score queries per (caller_id, wallet_id) pair to defend against
+    model inversion attacks via repeated queries (Issue #264).
+
+    When a caller exceeds MODEL_INVERSION_QUERY_LIMIT queries on a wallet,
+    subsequent API requests return 429 Too Many Requests.
+    """
+
+    __tablename__ = "model_inversion_query_tracker"
+    __table_args__ = (UniqueConstraint("caller_id", "wallet_id", name="uq_caller_wallet"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    caller_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    wallet_id: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    query_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_query_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
 def get_engine(db_url: str | None = None) -> Engine:
     """Create SQLAlchemy engine with connection pooling.
 

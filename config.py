@@ -156,6 +156,19 @@ class Config:
     POISON_LABEL_RATIO_THRESHOLD: float = float(os.getenv("POISON_LABEL_RATIO_THRESHOLD", "0.15"))
     ZERO_SHOT_WEIGHT: float = float(os.getenv("ZERO_SHOT_WEIGHT", "0.0"))
 
+    # Differential privacy for SHAP explanations (model inversion defence)
+    DP_EPSILON: float = float(os.getenv("DP_EPSILON", "1.0"))
+    DP_DELTA: float = float(os.getenv("DP_DELTA", "1e-5"))
+    DP_RENYI_QUERY_THRESHOLD: int = int(os.getenv("DP_RENYI_QUERY_THRESHOLD", "100"))
+    DP_RENYI_NOISE_MULTIPLIER: float = float(os.getenv("DP_RENYI_NOISE_MULTIPLIER", "3.0"))
+    DP_DEFAULT_SENSITIVITY: float = float(os.getenv("DP_DEFAULT_SENSITIVITY", "0.05"))
+    SHAP_SENSITIVITY_PATH: str = os.getenv("SHAP_SENSITIVITY_PATH", "models/shap_sensitivity.json")
+
+    # Model inversion attack defence
+    MODEL_INVERSION_QUERY_LIMIT: int = int(os.getenv("MODEL_INVERSION_QUERY_LIMIT", "100"))
+    MODEL_INVERSION_DP_EPSILON: float = float(os.getenv("MODEL_INVERSION_DP_EPSILON", "1.0"))
+    SCORE_ROUNDING_GRANULARITY: int = int(os.getenv("SCORE_ROUNDING_GRANULARITY", "1"))
+
     # Graph Neural Network encoder (detection/gnn_encoder.py)
     GNN_EMBEDDING_DIM: int = int(os.getenv("GNN_EMBEDDING_DIM", "32"))
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
@@ -182,6 +195,11 @@ class Config:
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
     GNN_NUM_LAYERS: int = int(os.getenv("GNN_NUM_LAYERS", "2"))
 
+    # Model inversion attack defence (#264)
+    MODEL_INVERSION_QUERY_LIMIT: int = int(os.getenv("MODEL_INVERSION_QUERY_LIMIT", "100"))
+    MODEL_INVERSION_DP_EPSILON: float = float(os.getenv("MODEL_INVERSION_DP_EPSILON", "1.0"))
+    SCORE_ROUNDING_GRANULARITY: int = int(os.getenv("SCORE_ROUNDING_GRANULARITY", "1"))
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []
@@ -194,6 +212,15 @@ class Config:
 
         if not cls.MODEL_DIR.strip():
             errors.append("MODEL_DIR is not set.")
+
+        if cls.MODEL_INVERSION_QUERY_LIMIT <= 0:
+            errors.append("MODEL_INVERSION_QUERY_LIMIT must be > 0.")
+
+        if cls.MODEL_INVERSION_DP_EPSILON <= 0:
+            errors.append("MODEL_INVERSION_DP_EPSILON must be > 0.")
+
+        if cls.SCORE_ROUNDING_GRANULARITY <= 0:
+            errors.append("SCORE_ROUNDING_GRANULARITY must be > 0.")
 
         if require_onchain:
             if not cls.LEDGERLENS_CONTRACT_ID.strip():
@@ -216,7 +243,7 @@ class Config:
             filename = os.path.basename(filepath)
             asset_key = filename[:-len("_benford_windows.json")]
             try:
-                with open(filepath, "r") as f:
+                with open(filepath) as f:
                     data = json.load(f)
                     if isinstance(data, dict) and "asset" in data and "windows" in data:
                         cls.ASSET_BENFORD_WINDOWS[data["asset"]] = [int(w) for w in data["windows"]]
@@ -234,3 +261,11 @@ class Config:
 
 config = Config()
 Config.load_asset_benford_windows()
+
+# Validate security parameters
+if config.MODEL_INVERSION_QUERY_LIMIT <= 0:
+    raise ValueError(f"MODEL_INVERSION_QUERY_LIMIT must be > 0, got {config.MODEL_INVERSION_QUERY_LIMIT}")
+if config.MODEL_INVERSION_DP_EPSILON <= 0:
+    raise ValueError(f"MODEL_INVERSION_DP_EPSILON must be > 0, got {config.MODEL_INVERSION_DP_EPSILON}")
+if config.SCORE_ROUNDING_GRANULARITY <= 0:
+    raise ValueError(f"SCORE_ROUNDING_GRANULARITY must be > 0, got {config.SCORE_ROUNDING_GRANULARITY}")
