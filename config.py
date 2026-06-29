@@ -83,6 +83,11 @@ class Config:
     LEDGERLENS_CONTRACT_ID: str = os.getenv("LEDGERLENS_CONTRACT_ID", "")
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
 
+    # Solana RPC endpoint for cross-chain resolution
+    SOLANA_RPC_URL: str = os.getenv(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
+
     MIN_TRADES_FOR_SCORING: int = int(os.getenv("MIN_TRADES_FOR_SCORING", "20"))
     LIST_RELOAD_INTERVAL_SECONDS: int = int(os.getenv("LIST_RELOAD_INTERVAL_SECONDS", "60"))
 
