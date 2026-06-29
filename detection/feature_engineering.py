@@ -167,6 +167,22 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "temporal patterns of co-trading with common counterparties. Values near 1.0 "
         "indicate predicted imminent collaboration (wash trade signal)."
     ),
+    # Bot fingerprint features
+    "bot_trust_line_latency": (
+        "Time in seconds from account creation to first trust line. Bots rapidly "
+        "create trust lines for multiple assets within seconds; humans typically "
+        "create them on-demand over hours/days. Values <60s are strong bot signal."
+    ),
+    "bot_interval_regularity": (
+        "Coefficient of variation (population std / mean) of inter-trade intervals. "
+        "Bots trade with mechanical regularity (CV<0.1); humans have irregular patterns (CV>0.3). "
+        "Returns None (mapped to 0.0 for feature matrix) if fewer than 5 trades."
+    ),
+    "bot_op_entropy": (
+        "Shannon entropy of Horizon operation type distribution (in bits). Bots cluster "
+        "specific operations (low entropy); humans diversify (high entropy). Values <1.5 "
+        "indicate bot-like clustering."
+    ),
 }
 
 
@@ -961,6 +977,68 @@ def compute_temporal_kge_features(
     except Exception as e:
         logger.warning(f"Temporal KGE prediction failed for {wallet}: {e}")
         return {"temporal_kge_collab_score": 0.0}
+
+
+def compute_bot_fingerprint_features(
+    wallet: str,
+    wallet_trades: pd.DataFrame | None = None,
+    bot_fingerprint: object | None = None,
+) -> dict:
+    """Compute bot detection fingerprint features.
+
+    Extracts behavioral signatures from Horizon events and trade patterns
+    that distinguish bots from humans: trust line latency, trading regularity,
+    and operation clustering.
+
+    Args:
+        wallet: Stellar account ID.
+        wallet_trades: DataFrame of trades involving the wallet.
+        bot_fingerprint: BotFingerprint object from detection.bot_fingerprinter.
+            When None, returns zero-valued features.
+
+    Returns:
+        A dictionary with three bot detection features:
+        - bot_trust_line_latency: Seconds from account creation to first trust line
+        - bot_interval_regularity: Coefficient of variation of inter-trade intervals
+        - bot_op_entropy: Shannon entropy of operation type distribution
+    """
+    if not bot_fingerprint:
+        return {
+            "bot_trust_line_latency": 0.0,
+            "bot_interval_regularity": 0.0,
+            "bot_op_entropy": 0.0,
+        }
+
+    try:
+        # Import here to avoid circular dependency
+        from ingestion.data_models import BotFingerprint
+
+        if not isinstance(bot_fingerprint, BotFingerprint):
+            return {
+                "bot_trust_line_latency": 0.0,
+                "bot_interval_regularity": 0.0,
+                "bot_op_entropy": 0.0,
+            }
+
+        features = {
+            "bot_trust_line_latency": float(
+                bot_fingerprint.trust_line_creation_latency_seconds or 0.0
+            ),
+            "bot_interval_regularity": float(
+                bot_fingerprint.inter_trade_interval_cv or 0.0
+            ),
+            "bot_op_entropy": float(bot_fingerprint.account_management_cluster_score),
+        }
+
+        return features
+
+    except Exception as e:
+        logger.warning(f"Bot fingerprint computation failed for {wallet}: {e}")
+        return {
+            "bot_trust_line_latency": 0.0,
+            "bot_interval_regularity": 0.0,
+            "bot_op_entropy": 0.0,
+        }
 
 
 def build_feature_vector(

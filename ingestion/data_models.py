@@ -57,3 +57,31 @@ class AccountActivity(BaseModel):
     account_created_at: datetime
     funding_account: str | None = None
     home_domain: str | None = None
+
+
+class BotFingerprint(BaseModel):
+    """Bot detection fingerprint extracted from Horizon event patterns."""
+
+    account_id: str
+    trust_line_creation_latency_seconds: float | None = Field(
+        default=None,
+        description="Time in seconds from account creation to first trust line"
+    )
+    inter_trade_interval_cv: float | None = Field(
+        default=None,
+        description="Coefficient of variation of inter-trade intervals (low=robotic)"
+    )
+    account_management_cluster_score: float = Field(
+        default=0.0,
+        description="Entropy of operation type distribution (low=clustered=bot)"
+    )
+    is_valid: bool = Field(
+        default=True,
+        description="False if insufficient data (< 5 trades)"
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score for bot fingerprint validity [0, 1]"
+    )
