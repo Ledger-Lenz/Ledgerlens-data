@@ -174,6 +174,13 @@ class Config:
     # Adversarial training augmentation
     ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))
 
+    # FGSM adversarial training (Issue #191)
+    # Set ADV_TRAINING_ENABLED=true to enable the FGSM adversarial training loop.
+    ADV_TRAINING_ENABLED: bool = os.getenv("ADV_TRAINING_ENABLED", "false").lower() == "true"
+    ADV_TRAINING_EPOCHS: int = int(os.getenv("ADV_TRAINING_EPOCHS", "3"))
+    ADV_TRAINING_EPSILON: float = float(os.getenv("ADV_TRAINING_EPSILON", "0.1"))
+    ADV_TRAINING_RATIO: float = float(os.getenv("ADV_TRAINING_RATIO", "0.5"))
+
     # Model integrity & BFT voting
     MODEL_SIGNING_PRIVATE_KEY_PATH: str = os.getenv("MODEL_SIGNING_PRIVATE_KEY_PATH", "")
     TRUSTED_SIGNING_KEY_FINGERPRINT: str = os.getenv("TRUSTED_SIGNING_KEY_FINGERPRINT", "")

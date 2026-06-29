@@ -248,3 +248,124 @@ pytest tests/test_backdoor_detector.py -v
   https://arxiv.org/abs/1811.00636
 - Turner et al. (2018) "Clean-Label Backdoor Attacks on Video Recognition Models"
   https://arxiv.org/abs/1912.02765
+
+---
+
+## FGSM Adversarial Training (Issue #191)
+
+### Motivation
+
+A sophisticated wash-trade operator who reverse-engineers LedgerLens's scoring
+system could craft transactions specifically designed to move their Benford and
+ML features away from the suspicious region. The existing `FGSMAttack` /
+`PGDAttack` classes measure *evasion success rates* — they tell us the model is
+vulnerable but do not fix it. **Adversarial training** makes the model robust
+to such targeted perturbations by augmenting the training set with the
+worst-case examples it would encounter under attack.
+
+### Feature-Space FGSM (`feature_space_fgsm`)
+
+Unlike classical image-space FGSM, LedgerLens operates on a tabular feature
+vector of engineered metrics (Benford MAD, counterparty concentration, etc.).
+`detection.adversarial.attack.feature_space_fgsm` applies the FGSM step in
+this **normalised feature space**:
+
+```python
+from detection.adversarial.attack import feature_space_fgsm
+from detection.adversarial.robustness import feature_scale_from_matrix
+
+scale = feature_scale_from_matrix(df)  # per-feature std (for L-inf budget)
+perturbed = feature_space_fgsm(
+    feature_row,   # pd.Series — the wallet's feature vector
+    epsilon=0.1,   # L-inf budget in standardised units
+    scorer=scorer, # RiskScorer instance
+    feature_scale=scale,
+)
+```
+
+The perturbation direction is **score-increasing** (towards higher risk), so
+the augmented example sits near the decision boundary from the clean side.
+Training on it forces the model to classify correctly under worst-case
+feature-space perturbations.
+
+#### Epsilon Bounds and Feature Validity
+
+Epsilon must be positive. The perturbation budget per feature is
+`epsilon × scale[feature]`. Post-perturbation, the following validity
+constraints are enforced:
+
+| Constraint | Affected features |
+|---|---|
+| `≥ 0` | `benford_chi_square_*`, `benford_mad_*`, all rate/probability features, ring density |
+| Immutable (scale=0) | `account_age_days` — time cannot be reversed |
+| L-inf budget | All features: `|Δ| ≤ epsilon × scale` |
+
+Generating physically impossible feature values (e.g. trade count < 0) is
+prevented by the non-negativity clip.
+
+### Adversarial Training Step (`adversarial_training_step`)
+
+`detection.adversarial.robustness.adversarial_training_step` generates
+adversarial examples for a training batch and mixes them in at a configurable
+ratio (`adv_ratio`, default 0.5 — 50% of wash-trade rows get an adversarial
+copy appended):
+
+```python
+from detection.adversarial.robustness import adversarial_training_step
+
+X_aug, y_aug = adversarial_training_step(
+    X_batch, y_batch, scorer,
+    epsilon=0.1,
+    adv_ratio=0.5,   # ADV_TRAINING_RATIO
+)
+```
+
+### Multi-Epoch Adversarial Training Loop (`run_adversarial_training`)
+
+`run_adversarial_training` runs the full iterative loop:
+
+1. Train the ensemble on the (optionally augmented) training set.
+2. Generate FGSM adversarial examples using the freshly trained scorer.
+3. Mix them into the training set for the next epoch.
+4. Report clean AUC-ROC and adversarial AUC-ROC after each epoch.
+
+**Acceptance criterion (Issue #191):** Clean test accuracy must not degrade
+by more than **3 percentage points** vs. the baseline trained without
+adversarial augmentation.
+
+### Enabling Adversarial Training
+
+Adversarial training is opt-in. Enable it via:
+
+```bash
+# Environment variable (takes effect for any training run)
+ADV_TRAINING_ENABLED=true python -m detection.model_training --data-path ...
+
+# Or CLI flag
+python -m detection.model_training --data-path ... --adv-training
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADV_TRAINING_ENABLED` | `false` | Enable the FGSM adversarial training loop |
+| `ADV_TRAINING_EPOCHS` | `3` | Number of adversarial training epochs |
+| `ADV_TRAINING_EPSILON` | `0.1` | L-inf budget (standardised units) |
+| `ADV_TRAINING_RATIO` | `0.5` | Fraction of wash-trade rows to augment per epoch |
+
+A JSON report (`reports/adversarial_training_<timestamp>.json`) is written
+after each run with per-epoch clean and adversarial AUC-ROC values.
+
+### Accuracy–Robustness Trade-off
+
+Adversarial training imposes a trade-off: the model becomes more robust to
+perturbations at the cost of slightly lower clean accuracy. Empirically,
+`epsilon=0.1` and `adv_ratio=0.5` keeps clean accuracy degradation well within
+the 3 pp tolerance. Increase `epsilon` or `adv_ratio` for stronger robustness
+guarantees at the cost of higher clean degradation.
+
+### References
+
+- Goodfellow, I. et al. (2015) "Explaining and Harnessing Adversarial Examples"
+  https://arxiv.org/abs/1412.6572
+- Madry, A. et al. (2018) "Towards Deep Learning Models Resistant to Adversarial Attacks"
+  https://arxiv.org/abs/1706.06083
