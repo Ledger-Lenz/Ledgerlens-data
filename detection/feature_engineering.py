@@ -926,6 +926,7 @@ def build_feature_vector(
     pair_benford_sketches: dict | None = None,
     community_map: dict[str, int] | None = None,
     ring_stats: dict[int, dict] | None = None,
+    path_flows: list | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -936,7 +937,9 @@ def build_feature_vector(
     output of `detection.wallet_graph.build_funding_graph`, used for the
     wallet graph features. `all_pairs_df` (optional) enables cross-asset
     coordination features. `amm_trades` (optional) enables cross-venue
-    coordination features.
+    coordination features. `path_flows` (optional) is a list of
+    ReconstructedPathFlow dicts from `ingestion.payment_path_analyzer`,
+    used to compute payment path analysis features.
     """
     reference_time = (
         pd.to_datetime(wallet_trades["ledger_close_time"], utc=True).max()
@@ -959,6 +962,7 @@ def build_feature_vector(
                 wallet, all_pairs_df, pair_benford_sketches=pair_benford_sketches
             )
         )
+    features.update(compute_payment_path_features(wallet, path_flows))
     features.update(compute_hardening_features(wallet_trades))
     features.update(compute_ts_decomposition_features(wallet_trades))
     if amm_trades is not None:
