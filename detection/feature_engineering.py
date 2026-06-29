@@ -1217,3 +1217,200 @@ def build_feature_matrix(
         rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Feature range validation (data/feature_dictionary.md)
+# ---------------------------------------------------------------------------
+
+#: Hard theoretical bounds for every named feature.
+#: Values outside [min, max] trigger a WARNING from validate_feature_ranges().
+#: GNN embedding dimensions are intentionally excluded — their range is
+#: model-dependent and validated separately.
+FEATURE_RANGES: dict[str, tuple[float, float]] = {
+    # Benford features — 5 windows
+    **{f"benford_chi_square_{h}h": (0.0, float("inf")) for h in [1, 4, 24, 168, 720]},
+    **{f"benford_mad_{h}h": (0.0, 1.0) for h in [1, 4, 24, 168, 720]},
+    **{f"benford_z_max_{h}h": (0.0, float("inf")) for h in [1, 4, 24, 168, 720]},
+    # Residual Benford — 5 windows
+    **{f"benford_residual_chi_square_{h}h": (0.0, float("inf")) for h in [1, 4, 24, 168, 720]},
+    **{f"benford_residual_mad_{h}h": (0.0, 1.0) for h in [1, 4, 24, 168, 720]},
+    # Trade pattern features
+    "counterparty_concentration_ratio": (0.0, 1.0),
+    "round_trip_frequency": (0.0, 1.0),
+    "net_roundtrip_ratio": (0.0, 1.0),
+    "self_matching_rate": (0.0, 1.0),
+    "order_cancellation_rate": (0.0, 1.0),
+    # Volume and timing features
+    "volume_per_counterparty_ratio": (0.0, float("inf")),
+    "intra_minute_clustering": (0.0, 1.0),
+    "off_hours_activity_ratio": (0.0, 1.0),
+    "volume_spike_frequency": (0.0, 1.0),
+    # Wallet graph features
+    "funding_source_similarity": (0.0, 1.0),
+    "network_centrality": (0.0, 1.0),
+    "account_age_days": (0.0, float("inf")),
+    "ring_size": (0.0, float("inf")),
+    "ring_internal_density": (0.0, 1.0),
+    # Cross-asset coordination features
+    "cross_pair_trade_synchrony": (0.0, 1.0),
+    "net_asset_flow_deviation": (0.0, float("inf")),
+    "cross_pair_counterparty_overlap": (0.0, 1.0),
+    "cross_pair_volume_correlation": (-1.0, 1.0),
+    "pair_diversity_score": (0.0, 1.0),
+    "cross_pair_mad_std": (0.0, 1.0),
+    # Hardening features
+    "inter_arrival_cv": (0.0, float("inf")),
+    "entropy_of_amounts": (0.0, float("inf")),
+    "cross_wallet_volume_corr": (-1.0, 1.0),
+    # Cross-venue features
+    "venue_trade_ratio": (0.0, 1.0),
+    "cross_venue_volume_correlation": (-1.0, 1.0),
+    "cross_venue_timing_synchrony": (0.0, 1.0),
+    "cross_venue_net_flow": (0.0, 1.0),
+    "counterparty_venue_overlap": (0.0, 1.0),
+    "simultaneous_order_pair": (0.0, 1.0),
+    "cross_venue_cluster_score": (0.0, 1.0),
+    # Miscellaneous / optional features
+    "solana_linked_wash_score": (0.0, 100.0),
+    "temporal_kge_collab_score": (0.0, 1.0),
+    "bot_trust_line_latency": (0.0, float("inf")),
+    "bot_interval_regularity": (0.0, float("inf")),
+    "bot_op_entropy": (0.0, float("inf")),
+    "bridge_round_trip_ratio": (0.0, 1.0),
+}
+
+#: URL prefix used to build per-feature hyperlinks in SHAP output.
+#: Points to the feature dictionary inside the repository.
+FEATURE_DICT_BASE_URL: str = (
+    "https://github.com/Ledger-Lenz/Ledgerlens-data/blob/main/data/feature_dictionary.md"
+)
+
+#: Mapping from feature name to the markdown anchor in feature_dictionary.md.
+#: Used by shap_explainer.feature_dict_url() to build deep links.
+_FEATURE_ANCHORS: dict[str, str] = {
+    **{f"benford_chi_square_{h}h": "#11--benford_chi_square_hh" for h in [1, 4, 24, 168, 720]},
+    **{f"benford_mad_{h}h": "#12--benford_mad_hh" for h in [1, 4, 24, 168, 720]},
+    **{f"benford_z_max_{h}h": "#13--benford_z_max_hh" for h in [1, 4, 24, 168, 720]},
+    **{f"benford_residual_chi_square_{h}h": "#14--benford_residual_chi_square_hh" for h in [1, 4, 24, 168, 720]},
+    **{f"benford_residual_mad_{h}h": "#15--benford_residual_mad_hh" for h in [1, 4, 24, 168, 720]},
+    "benford_ci_width": "#16--benford_ci_width",
+    "counterparty_concentration_ratio": "#21--counterparty_concentration_ratio",
+    "round_trip_frequency": "#22--round_trip_frequency",
+    "net_roundtrip_ratio": "#23--net_roundtrip_ratio",
+    "self_matching_rate": "#24--self_matching_rate",
+    "order_cancellation_rate": "#25--order_cancellation_rate",
+    "volume_per_counterparty_ratio": "#31--volume_per_counterparty_ratio",
+    "intra_minute_clustering": "#32--intra_minute_clustering",
+    "off_hours_activity_ratio": "#33--off_hours_activity_ratio",
+    "volume_spike_frequency": "#34--volume_spike_frequency",
+    "funding_source_similarity": "#41--funding_source_similarity",
+    "network_centrality": "#42--network_centrality",
+    "account_age_days": "#43--account_age_days",
+    "in_wash_trading_ring": "#44--in_wash_trading_ring",
+    "ring_size": "#45--ring_size",
+    "ring_internal_density": "#46--ring_internal_density",
+    "cross_pair_trade_synchrony": "#51--cross_pair_trade_synchrony",
+    "net_asset_flow_deviation": "#52--net_asset_flow_deviation",
+    "cross_pair_counterparty_overlap": "#53--cross_pair_counterparty_overlap",
+    "cross_pair_volume_correlation": "#54--cross_pair_volume_correlation",
+    "pair_diversity_score": "#55--pair_diversity_score",
+    "cross_pair_mad_std": "#56--cross_pair_mad_std",
+    "inter_arrival_cv": "#61--inter_arrival_cv",
+    "entropy_of_amounts": "#62--entropy_of_amounts",
+    "cross_wallet_volume_corr": "#63--cross_wallet_volume_corr",
+    "venue_trade_ratio": "#71--venue_trade_ratio",
+    "cross_venue_volume_correlation": "#72--cross_venue_volume_correlation",
+    "cross_venue_timing_synchrony": "#73--cross_venue_timing_synchrony",
+    "cross_venue_net_flow": "#74--cross_venue_net_flow",
+    "counterparty_venue_overlap": "#75--counterparty_venue_overlap",
+    "simultaneous_order_pair": "#76--simultaneous_order_pair",
+    "cross_venue_cluster_score": "#77--cross_venue_cluster_score",
+    "solana_linked_wash_score": "#91--solana_linked_wash_score",
+    "temporal_kge_collab_score": "#92--temporal_kge_collab_score",
+    "bot_trust_line_latency": "#93--bot_trust_line_latency",
+    "bot_interval_regularity": "#94--bot_interval_regularity",
+    "bot_op_entropy": "#95--bot_op_entropy",
+    "bridge_round_trip_ratio": "#96--bridge_round_trip_ratio",
+    **{f"gnn_{i}": "#81--gnn_0--gnn_31" for i in range(32)},
+}
+
+
+def feature_dict_url(feature_name: str) -> str | None:
+    """Return the full URL to the feature dictionary entry for *feature_name*.
+
+    Returns ``None`` if the feature is not listed in the dictionary (e.g. the
+    ``wallet`` identifier column or unknown features added after this release).
+
+    Example::
+
+        >>> feature_dict_url("benford_mad_24h")
+        'https://github.com/Ledger-Lenz/Ledgerlens-data/blob/main/data/feature_dictionary.md#12--benford_mad_hh'
+    """
+    anchor = _FEATURE_ANCHORS.get(feature_name)
+    if anchor is None:
+        return None
+    return f"{FEATURE_DICT_BASE_URL}{anchor}"
+
+
+def validate_feature_ranges(
+    feature_dict: dict[str, float],
+    *,
+    raise_on_violation: bool = False,
+) -> list[str]:
+    """Check each feature value in *feature_dict* against its documented range.
+
+    Compares every key in *feature_dict* that is present in ``FEATURE_RANGES``
+    against its ``[min, max]`` hard bounds. Out-of-range values are logged as
+    WARNING and returned as a list of human-readable violation strings.
+
+    NaN and inf values that fall outside a finite bound are also flagged.
+    Features not listed in ``FEATURE_RANGES`` (e.g. ``wallet``, GNN dimensions,
+    experimental features) are silently skipped.
+
+    Args:
+        feature_dict: A ``{feature_name: value}`` mapping for a single wallet.
+            Typically the output of ``build_feature_vector``.
+        raise_on_violation: When ``True``, raise ``ValueError`` listing all
+            violations instead of merely logging them. Defaults to ``False``
+            (log-only) so production scoring never hard-fails on range errors.
+
+    Returns:
+        List of violation strings, one per out-of-range feature. Empty list
+        means all checked features are within bounds.
+
+    Example::
+
+        warnings = validate_feature_ranges({"benford_mad_24h": 0.5, "account_age_days": -1.0})
+        # → ["account_age_days=-1.0 violates range [0.0, inf]"]
+    """
+    violations: list[str] = []
+
+    for feature, (lo, hi) in FEATURE_RANGES.items():
+        if feature not in feature_dict:
+            continue
+        raw = feature_dict[feature]
+        # Convert bool / int to float for comparison; skip non-numeric values
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(value):
+            # NaN is allowed (indicates missing data); skip range check
+            continue
+        out_of_range = False
+        if not math.isinf(lo) and value < lo:
+            out_of_range = True
+        if not math.isinf(hi) and value > hi:
+            out_of_range = True
+        if out_of_range:
+            msg = f"{feature}={value} violates range [{lo}, {hi}]"
+            violations.append(msg)
+            logger.warning("validate_feature_ranges: %s", msg)
+
+    if raise_on_violation and violations:
+        raise ValueError(
+            f"Feature range violations detected:\n" + "\n".join(f"  {v}" for v in violations)
+        )
+
+    return violations
