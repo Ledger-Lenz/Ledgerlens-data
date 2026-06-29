@@ -84,6 +84,9 @@ pytest-timeout>=2.3.0
 hypothesis>=6.100.0
 factory-boy>=3.3.0
 
+# Load testing / memory sampling
+psutil>=5.9.0
+
 # Forensic reporting
 jinja2>=3.1.0
 tqdm>=4.66.0
