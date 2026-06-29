@@ -1,0 +1,156 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens — Per-Asset-Pair Health",
+  "tags": ["ledgerlens", "per-pair", "health"],
+  "timezone": "browser",
+  "time": {"from": "now-6h", "to": "now"},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "asset_pair",
+        "type": "query",
+        "label": "Asset Pair",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(ledgerlens_risk_score_distribution_bucket, asset_pair)",
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Scoring Latency Heatmap (p95 by pair)",
+      "type": "heatmap",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ledgerlens_score_duration_seconds_bucket{asset_pair=~\"$asset_pair\"}[5m])) by (le, asset_pair))",
+          "legendFormat": "{{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "calculate": false,
+        "yAxis": {"unit": "s"},
+        "color": {"scheme": "Oranges", "mode": "scheme"}
+      }
+    },
+    {
+      "id": 2,
+      "title": "Benford MAD Time Series (per pair)",
+      "description": "Mean Absolute Deviation from the asset-class baseline. Values above 0.015 indicate non-conformity. Stablecoin pairs use the stablecoin baseline; volatile pairs use the theoretical Benford distribution.",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "ledgerlens_benford_mad_gauge{asset_pair=~\"$asset_pair\"}",
+          "legendFormat": "{{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.015},
+              {"color": "red", "value": 0.03}
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 3,
+      "title": "Alert Volume: Confirmed vs False Positive (per pair)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(ledgerlens_benford_computation_total{asset_pair=~\"$asset_pair\", status=\"alert_confirmed\"}[10m])) by (asset_pair)",
+          "legendFormat": "confirmed {{asset_pair}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ledgerlens_benford_computation_total{asset_pair=~\"$asset_pair\", status=\"false_positive\"}[10m])) by (asset_pair)",
+          "legendFormat": "false_positive {{asset_pair}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {"unit": "reqps"},
+        "overrides": [
+          {
+            "matcher": {"id": "byNamePattern", "options": "false_positive.*"},
+            "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]
+          }
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "title": "Pair Health Score (composite 0–1)",
+      "description": "Composite health score combining scoring latency (p95 < 0.5s), Benford MAD freshness (updated in last hour), and false-positive rate. Score < 0.7 for 30 min triggers an alert.",
+      "type": "gauge",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "clamp_max(clamp_min(\n  (\n    (1 - clamp_max(histogram_quantile(0.95, sum(rate(ledgerlens_score_duration_seconds_bucket{asset_pair=~\"$asset_pair\"}[5m])) by (le, asset_pair)) / 0.5, 1)) * 0.4\n    +\n    (1 - clamp_max(ledgerlens_benford_mad_gauge{asset_pair=~\"$asset_pair\"} / 0.03, 1)) * 0.4\n    +\n    (1 - clamp_max(\n      sum(rate(ledgerlens_benford_computation_total{asset_pair=~\"$asset_pair\", status=\"false_positive\"}[10m])) by (asset_pair)\n      /\n      (sum(rate(ledgerlens_benford_computation_total{asset_pair=~\"$asset_pair\", status=\"alert_confirmed\"}[10m])) by (asset_pair) + 0.001)\n    , 1)) * 0.2\n  ),\n  0), 1)",
+          "legendFormat": "health {{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.7},
+              {"color": "green", "value": 0.85}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "showThresholdLabels": false}
+    },
+    {
+      "id": 5,
+      "title": "Risk Score Distribution (per pair, last 1h)",
+      "type": "histogram",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(ledgerlens_risk_score_distribution_bucket{asset_pair=~\"$asset_pair\"}[1h])) by (le, asset_pair)",
+          "legendFormat": "{{asset_pair}} le={{le}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "bucketSize": 10,
+        "fillOpacity": 60
+      }
+    }
+  ]
+}

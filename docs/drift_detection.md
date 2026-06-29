@@ -188,3 +188,125 @@ Eight tests cover:
 6. Promotion gate allows improvement
 7. Archive created before promotion
 8. All exit codes (0, 2, 3, 1)
+
+---
+
+## Dynamic Ensemble Weight Adjustment
+
+### Motivation
+
+The ensemble calibrator (`detection/ensemble_calibrator.py`) finds Pareto-optimal
+model weights at training time via NSGA-II.  Those weights are fixed until the next
+retraining cycle.  In production, the three models (Random Forest, XGBoost,
+LightGBM) may diverge in their false positive rates on specific asset pairs or
+market regimes.  `EnsembleDynamicWeightController` adjusts weights between retrains
+using confirmed operator feedback.
+
+### How It Works
+
+1. An operator reviews a flagged wallet and marks it as a **confirmed false positive**
+   (label = 0 in the annotation queue).
+2. `observe_false_positive(wallet, model_predictions, annotator_id, audit_trail_id)` is
+   called with the per-model probabilities at alert time and the operator's authenticated
+   identity.
+3. For each model, an FP observation is recorded if the model predicted ≥ 0.5.
+4. Once at least **10 confirmed FP feedbacks** have been received, weights are
+   recomputed inversely proportional to each model's FP rate:
+
+   ```
+   raw_weight[model] = 1 / (fp_rate[model] + ε)
+   normalised        = raw_weight / sum(raw_weight)
+   ```
+
+5. Weight updates are **exponentially smoothed** to prevent overcorrection:
+
+   ```
+   new_weight = α × target + (1 − α) × old_weight
+   ```
+
+   where `α = ENSEMBLE_WEIGHT_SMOOTHING_ALPHA` (default **0.1**).
+
+6. Weights are **bounded** to [0.05, 0.80] per model to preserve ensemble diversity.
+
+### Systemic Reset
+
+If **all three models simultaneously** exceed `ENSEMBLE_SYSTEMIC_FP_THRESHOLD`
+(default **0.5**), this signals a systemic issue (e.g., a major regime change) rather
+than individual model failure.  In this case:
+
+- Weights are **reset to training-time values**.
+- A structured `WARNING` log is emitted so operators can investigate.
+- The Prometheus gauges reflect the reset weights immediately.
+
+Tune `ENSEMBLE_SYSTEMIC_FP_THRESHOLD` to match your expected per-model FP rate
+under normal operating conditions.
+
+### Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `ENSEMBLE_WEIGHT_SMOOTHING_ALPHA` | `0.1` | EMA smoothing factor (0 = no update, 1 = instant) |
+| `ENSEMBLE_SYSTEMIC_FP_THRESHOLD` | `0.5` | Per-model FP rate above which systemic reset fires |
+
+### Prometheus Gauges
+
+One gauge per model is exposed:
+
+```
+ensemble_dynamic_weight_rf{} 0.34
+ensemble_dynamic_weight_xgb{} 0.33
+ensemble_dynamic_weight_lgbm{} 0.33
+```
+
+### Security
+
+`observe_false_positive` requires both `annotator_id` (non-empty) and
+`audit_trail_id` (non-empty, linking to the operator's verified audit trail entry).
+Calling with empty strings raises `ValueError`.  This prevents an unauthenticated or
+anonymous annotator from manipulating ensemble weights.
+
+### Usage Example
+
+```python
+from detection.ensemble_calibrator import (
+    EnsembleCalibrator, EnsembleDynamicWeightController
+)
+
+# 1. Get training-time weights from Pareto front
+calibrator = EnsembleCalibrator()
+training_weights = calibrator.select_operating_point()
+
+# 2. Create controller
+controller = EnsembleDynamicWeightController(training_weights)
+
+# 3. Feed confirmed FP feedback (from annotation queue)
+controller.observe_false_positive(
+    wallet="GABC...",
+    model_predictions={"rf": 0.82, "xgb": 0.79, "lgbm": 0.11},
+    annotator_id="analyst_alice",
+    audit_trail_id="audit-entry-uuid-1234",
+)
+
+# 4. Use updated weights for scoring
+weights = controller.current_weights()
+scorer = RiskScorer(weights=weights)
+```
+
+### DB Persistence
+
+Each weight update appends rows to the `ensemble_weight_history` table:
+
+| Column | Type | Description |
+|---|---|---|
+| `model_name` | str | Model identifier |
+| `weight` | float | Updated weight value |
+| `fp_rate` | float | Observed FP rate at update time |
+| `observation_count` | int | Total FP feedbacks received |
+| `is_systemic_reset` | bool | True if this row was written as part of a systemic reset |
+| `timestamp` | datetime | UTC timestamp of the update |
+
+### Testing
+
+```bash
+pytest tests/test_ensemble_dynamic_weights.py -v
+```

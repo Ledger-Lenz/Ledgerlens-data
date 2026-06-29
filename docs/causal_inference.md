@@ -60,3 +60,78 @@ Use SHAP for attribution. Use causal scoring for investigation and evidence tria
 - Rank counterparties by how much they contribute to the score.
 - Trace the funding chain behind a flagged wallet.
 - Test whether an apparent wash-trading signal propagates into downstream trade-pattern features.
+
+## E-Value Sensitivity Analysis
+
+### What Is an E-Value?
+
+The causal attribution system attributes a wallet's risk score to specific causal
+factors (e.g. *"high counterparty concentration caused a 30-point score increase"*).
+However, the causal model may be confounded by unobserved variables — for example,
+a market-maker responding to a liquidity event might share observable features with
+a wash trader, but the underlying cause differs.
+
+An **E-value** (VanderWeele & Ding, 2017) quantifies the minimum strength of
+association that an unobserved confounder would need to have with *both* the exposure
+and the outcome to fully explain away the observed causal effect.
+
+- **High E-value** → the attribution is robust; a very strong confounder would be
+  required to invalidate it.
+- **Low E-value** → the attribution is fragile; even a modest unobserved variable
+  could account for the observed effect.
+
+### Formula
+
+For a risk ratio RR ≥ 1:
+
+```
+E = RR + sqrt(RR × (RR − 1))
+```
+
+Special case: RR = 1.0 (no effect) → E-value = 1.0.
+
+For RR < 1 the ratio is inverted first.
+
+**Verification**: RR = 2.0 → E = 2.0 + √(2.0 × 1.0) = 2.0 + 1.414 ≈ **3.41**
+
+### Confidence Threshold
+
+Attributions with **E-value < 2.0** are flagged as *"low confidence — possible
+confounding"* in the forensic report.  This threshold means a confounder with
+only a 2× association with both exposure and outcome could invalidate the finding.
+
+### For Compliance Officers
+
+Think of the E-value as a *minimum bar for an alternative explanation*.  An
+E-value of 3.41 means any alternative explanation would need to be at least
+3.41× more common in wash traders than in legitimate traders, *and* 3.41× more
+likely to produce the observed risk signal.  The higher the E-value, the harder
+it is for any hidden factor to explain away the flagged behaviour.
+
+E-values are **advisory context for investigators** and must not be used to
+suppress alerts or change gating logic.  A low E-value means the finding
+warrants more scrutiny, not dismissal.
+
+### In the Forensic Report
+
+Each causal attribution in the `CausalForensicReport` now includes a
+`sensitivity_results` field:
+
+```json
+"sensitivity_results": [
+  {
+    "label": "overall score vs counterfactual",
+    "risk_ratio": 2.0,
+    "evalue": 3.41,
+    "low_confidence": false,
+    "interpretation": "Robust attribution (E-value=3.41): an unobserved confounder
+      would need a 3.41× association with both exposure and outcome to explain
+      away this effect."
+  }
+]
+```
+
+### Reference
+
+VanderWeele, T.J. & Ding, P. (2017). Sensitivity Analysis in Observational
+Research: Introducing the E-Value. *Annals of Internal Medicine*, 167(4), 268–274.

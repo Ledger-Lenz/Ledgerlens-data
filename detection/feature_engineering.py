@@ -16,6 +16,7 @@ buffered into a DataFrame) for a single wallet.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import networkx as nx
@@ -23,6 +24,8 @@ import numpy as np
 import pandas as pd
 
 from config import config
+
+logger = logging.getLogger(__name__)
 from detection.benford_engine import (
     BenfordMetrics,
     compute_benford_metrics_for_windows,
@@ -150,11 +153,12 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "Benford non-conformity is equally distributed across all pairs — "
         "consistent with a systematic automated trading pattern."
     ),
-    # Payment path features
-    "path_payment_round_trip_frequency": (
-        "Fraction of a wallet's effective volume (after path reconstruction) that "
-        "returns to the originating wallet within 24 hours. Multi-hop path payments "
-        "that form closed loops are a hallmark of obfuscated wash trading."
+    # Cross-chain features
+    "solana_linked_wash_score": (
+        "Risk score of a linked Solana address (via Wormhole bridge) if found. "
+        "If the Stellar wallet has a linked Solana address and that address's "
+        "Solana-chain risk score is available (from external provider, cached), "
+        "this feature surfaces that signal. Value [0, 100]; 0 if no link found."
     ),
     # Temporal KGE features
     "temporal_kge_collab_score": (
@@ -223,6 +227,16 @@ def compute_benford_features(
         _add_calibrated_benford_features(
             features, wallet_trades, per_window, liquidity_profiler, asset
         )
+
+    # Bootstrap CI width — only computed when BENFORD_CI_ENABLED=True
+    if config.BENFORD_CI_ENABLED and not wallet_trades.empty:
+        from detection.benford_engine import compute_benford_confidence_intervals
+
+        amounts = wallet_trades["amount"] if "amount" in wallet_trades.columns else pd.Series(dtype=float)
+        ci = compute_benford_confidence_intervals(amounts)
+        features["benford_ci_width"] = ci["chi_square_ci_width"]
+    else:
+        features["benford_ci_width"] = np.nan
 
     return features
 
@@ -870,38 +884,56 @@ def compute_graph_embedding_features(
         return zero_features
 
 
-def compute_payment_path_features(
+def compute_solana_linked_features(
     wallet: str,
-    path_flows: list | None = None,
+    identity_graph=None,
+    solana_risk_cache: dict[str, float] | None = None,
 ) -> dict:
-    """Compute payment path analysis features for a wallet.
+    """Compute features based on linked Solana addresses via Wormhole bridge.
 
-    Analyzes multi-hop payment path flows to detect round-trip wash trading
-    routes where the effective sender and receiver are the same wallet,
-    connected through intermediate hops and asset conversions.
+    Queries the identity graph to find Solana addresses linked to a Stellar
+    wallet via Wormhole bridge transactions. If found and a cached risk score
+    is available for the Solana address, surfaces that signal.
 
     Args:
-        wallet: Stellar account ID to analyze.
-        path_flows: Optional list of ReconstructedPathFlow dicts from
-            ingestion.payment_path_analyzer. When None or empty, returns
-            zero-valued features.
+        wallet: Stellar account id to score.
+        identity_graph: IdentityGraph instance (from detection.cross_chain.identity_graph).
+            If None, returns zero features.
+        solana_risk_cache: Optional cache mapping Solana address -> risk_score.
+            Risk scores should be in [0, 100]. If None or address not in cache,
+            returns 0.0.
 
     Returns:
-        A dictionary with the following key:
+        A dictionary with:
+        - ``solana_linked_wash_score``: highest risk score among linked Solana
+          addresses, or 0.0 if none found.
 
-        - ``path_payment_round_trip_frequency``: Fraction of the wallet's
-          effective volume (after path reconstruction) that returns to the
-          originating wallet within 24 hours. Values near 1.0 indicate
-          closed-loop wash trading via payment paths.
+    Raises:
+        Any exceptions from the identity graph are caught and logged.
     """
-    if not path_flows:
-        return {"path_payment_round_trip_frequency": 0.0}
+    if identity_graph is None or solana_risk_cache is None:
+        return {"solana_linked_wash_score": 0.0}
 
-    # Import here to avoid circular dependency
-    from ingestion.payment_path_analyzer import compute_path_payment_round_trip_frequency
+    try:
+        # Resolve Stellar wallet to linked Solana addresses
+        component = identity_graph.get_connected_component(wallet)
+        linked_sol_addresses = [node["address"] for node in component.get("sol", [])]
 
-    round_trip_freq = compute_path_payment_round_trip_frequency(wallet, path_flows)
-    return {"path_payment_round_trip_frequency": float(round_trip_freq)}
+        if not linked_sol_addresses:
+            return {"solana_linked_wash_score": 0.0}
+
+        # Find max risk score among linked Solana addresses
+        max_risk_score = 0.0
+        for sol_addr in linked_sol_addresses:
+            if sol_addr in solana_risk_cache:
+                risk = solana_risk_cache[sol_addr]
+                max_risk_score = max(max_risk_score, float(risk))
+
+        return {"solana_linked_wash_score": max_risk_score}
+
+    except Exception as exc:
+        logger.error("Failed to compute Solana linked features for %s: %s", wallet, exc)
+        return {"solana_linked_wash_score": 0.0}
 
 
 def compute_temporal_kge_features(
@@ -1065,8 +1097,10 @@ def build_feature_vector(
     features.update(compute_payment_path_features(wallet, path_flows))
     features.update(compute_temporal_kge_features(wallet, wallet_counterparties, kge_encoder))
     features.update(compute_hardening_features(wallet_trades))
+    features.update(compute_ts_decomposition_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
+    features["bridge_round_trip_ratio"] = 0.0  # populated by callers that supply bridge tx data
 
     # GNN embedding features — graceful zero-fallback when encoder is absent
     if gnn_encoder is not None and funding_graph is not None:

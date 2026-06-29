@@ -63,6 +63,11 @@ class Config:
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
     )
 
+    # Silence window for correlated alert deduplication (alerts/deduplicator.py).
+    ALERT_DEDUP_WINDOW_SECONDS: int = min(
+        300, max(5, int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS", "60")))
+    )
+
     RISK_SCORE_FLAG_THRESHOLD: int = int(os.getenv("RISK_SCORE_FLAG_THRESHOLD", "70"))
     # Set to a non-zero integer to pin the alert threshold and disable the RL agent.
     # E.g. THRESHOLD_RL_PINNED=75 → agent is bypassed, threshold is fixed at 75.
@@ -83,6 +88,11 @@ class Config:
     LEDGERLENS_CONTRACT_ID: str = os.getenv("LEDGERLENS_CONTRACT_ID", "")
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
 
+    # Solana RPC endpoint for cross-chain resolution
+    SOLANA_RPC_URL: str = os.getenv(
+        "SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"
+    )
+
     MIN_TRADES_FOR_SCORING: int = int(os.getenv("MIN_TRADES_FOR_SCORING", "20"))
     LIST_RELOAD_INTERVAL_SECONDS: int = int(os.getenv("LIST_RELOAD_INTERVAL_SECONDS", "60"))
 
@@ -93,6 +103,8 @@ class Config:
 
     # Forensic reporting
     REPORT_CONCURRENCY: int = int(os.getenv("REPORT_CONCURRENCY", "4"))
+    # SHAP interaction values are O(n * d^2) — disable by default.
+    SHAP_INTERACTIONS_ENABLED: bool = os.getenv("SHAP_INTERACTIONS_ENABLED", "false").lower() == "true"
 
     # Wallet funding graph — multi-hop traversal + wash-trading ring detection
     WALLET_GRAPH_MAX_DEPTH: int = int(os.getenv("WALLET_GRAPH_MAX_DEPTH", "4"))
@@ -100,6 +112,11 @@ class Config:
     WASH_RING_RESOLUTION: float = float(os.getenv("WASH_RING_RESOLUTION", "1.0"))
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
+
+    # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
+    HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
+    HORIZON_MAX_RETRIES: int = int(os.getenv("HORIZON_MAX_RETRIES", "5"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # Real-time streaming / alerting
     # STREAMING_BACKEND selects the ingestion transport:
@@ -155,10 +172,17 @@ class Config:
     BFT_MIN_CONSENSUS: int = int(os.getenv("BFT_MIN_CONSENSUS", "2"))
     POISON_LABEL_RATIO_THRESHOLD: float = float(os.getenv("POISON_LABEL_RATIO_THRESHOLD", "0.15"))
     ZERO_SHOT_WEIGHT: float = float(os.getenv("ZERO_SHOT_WEIGHT", "0.0"))
+    ZERO_SHOT_MIN_LABELLED_EXAMPLES: int = int(os.getenv("ZERO_SHOT_MIN_LABELLED_EXAMPLES", "20"))
+    BENFORD_CI_ENABLED: bool = os.getenv("BENFORD_CI_ENABLED", "false").lower() == "true"
+    BRIDGE_ROUNDTRIP_WINDOW_HOURS: int = int(os.getenv("BRIDGE_ROUNDTRIP_WINDOW_HOURS", "72"))
 
     # Graph Neural Network encoder (detection/gnn_encoder.py)
     GNN_EMBEDDING_DIM: int = int(os.getenv("GNN_EMBEDDING_DIM", "32"))
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
+
+    # Feature selection
+    FEATURE_SELECTION_ENABLED: bool = os.getenv("FEATURE_SELECTION_ENABLED", "").lower() in ("1", "true", "yes")
+    FEATURE_SELECTION_PATH: str = os.getenv("FEATURE_SELECTION_PATH", "models/selected_features.json")
 
     # Annotation integrity
     ANNOTATION_HMAC_SECRET: str = os.getenv("ANNOTATION_HMAC_SECRET", "")
@@ -182,10 +206,21 @@ class Config:
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
     GNN_NUM_LAYERS: int = int(os.getenv("GNN_NUM_LAYERS", "2"))
 
-    # Trade ingestion deduplication (Redis)
-    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    TRADE_DEDUP_TTL_SECONDS: int = int(os.getenv("TRADE_DEDUP_TTL_SECONDS", "86400"))  # 24 hours
-    TRADE_DEDUP_CACHE_KEY_PREFIX: str = os.getenv("TRADE_DEDUP_CACHE_KEY_PREFIX", "ledgerlens:trades:")
+    # Dynamic ensemble weight adjustment (#268)
+    ENSEMBLE_WEIGHT_SMOOTHING_ALPHA: float = float(os.getenv("ENSEMBLE_WEIGHT_SMOOTHING_ALPHA", "0.1"))
+    ENSEMBLE_SYSTEMIC_FP_THRESHOLD: float = float(os.getenv("ENSEMBLE_SYSTEMIC_FP_THRESHOLD", "0.5"))
+
+    # GNN DiffPool cluster scoring (#269)
+    GNN_DIFFPOOL_CLUSTERS: int = int(os.getenv("GNN_DIFFPOOL_CLUSTERS", "10"))
+
+    # Async federated learning (#270)
+    FEDERATED_ASYNC_TRIGGER_N: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_N", "3"))
+    FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))
+    FEDERATED_MAX_STALENESS: int = int(os.getenv("FEDERATED_MAX_STALENESS", "5"))
+
+    # Label quality estimation (#271)
+    LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
+    ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
     @classmethod
     def validate(cls, require_onchain: bool = False):
@@ -199,6 +234,12 @@ class Config:
 
         if not cls.MODEL_DIR.strip():
             errors.append("MODEL_DIR is not set.")
+
+        if cls.DP_AGGREGATOR_EPSILON <= 0:
+            errors.append("DP_AGGREGATOR_EPSILON must be > 0.")
+
+        if not (0 < cls.DP_AGGREGATOR_DELTA < 0.5):
+            errors.append("DP_AGGREGATOR_DELTA must be in (0, 0.5).")
 
         if require_onchain:
             if not cls.LEDGERLENS_CONTRACT_ID.strip():

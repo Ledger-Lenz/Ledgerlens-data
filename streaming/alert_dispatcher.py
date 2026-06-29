@@ -104,7 +104,10 @@ class AlertDispatcher:
             "score": risk_score["score"],
             "benford_flag": risk_score.get("benford_flag"),
             "ml_flag": risk_score.get("ml_flag"),
-            "confidence": risk_score.get("confidence")
+            "confidence": risk_score.get("confidence"),
+            "score_lower": risk_score.get("score_lower"),
+            "score_upper": risk_score.get("score_upper"),
+            "coverage_guarantee": risk_score.get("coverage_guarantee"),
         })
 
     def _write_to_dead_letter(self, payload: dict) -> None:

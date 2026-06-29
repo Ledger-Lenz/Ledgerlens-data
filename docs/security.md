@@ -91,6 +91,69 @@ The inference stack uses a trimmed-mean / median voting scheme so that a single 
 
 `detect_label_poisoning()` compares the current wash-trade label ratio against a baseline stored in `models/label_distribution_baseline.json`. If the ratio has shifted by more than `POISON_LABEL_RATIO_THRESHOLD` (default 15%), training is aborted and an alert is written to `reports/poisoning_alert_{timestamp}.json`.
 
+## Supply Chain Security: Model Artifact Transparency Log
+
+### Overview
+
+`ModelArtifactVerifier` in `detection/persistence.py` extends the existing trust chain with a third independent check: every artifact's SHA-256 must appear in an append-only **transparency log** stored in the risk score database.  A coordinated attack that replaces the artifact **and** tampers with `metrics.json` will still fail unless the attacker also corrupts the transparency log, which is separately backed up.
+
+### Verification Flow
+
+```
+Download artifact
+      │
+      ▼
+1. SHA-256 hash                  — fast, no model parsing
+      │
+      ▼
+2. Ed25519 signature on          — verifies metrics.json
+   metrics.json
+      │
+      ▼
+3. Transparency log lookup       — append-only, separately backed up
+      │
+      ▼
+   ✅ Load model  /  ❌ ModelIntegrityError → refuse to start
+```
+
+Any of the three checks failing raises `ModelIntegrityError` and the scorer refuses to start.
+
+### Publishing a New Artifact
+
+```bash
+python -m scripts.publish_model_artifact \
+    --model-name rf \
+    --model-dir ./models \
+    --private-key-path /secrets/signing_key.pem \
+    --db-url sqlite:///ledgerlens.db
+```
+
+This script:
+1. Computes the SHA-256 of the `.joblib` file.
+2. Records the hash in `metrics.json` and re-signs it.
+3. Appends the hash to the `transparency_log` DB table.
+
+### Transparency Log Format
+
+```sql
+CREATE TABLE transparency_log (
+    id            INTEGER PRIMARY KEY,
+    model_name    TEXT    NOT NULL,
+    artifact_sha256 TEXT  NOT NULL UNIQUE,  -- 64-char lowercase hex
+    registered_at DATETIME NOT NULL
+);
+```
+
+Rows are never updated or deleted.  The table supports public auditability: export the full `artifact_sha256` column to a public append-only ledger (e.g. Sigstore Rekor, a public blockchain, or a signed NDJSON file) to allow external parties to verify artifact provenance without access to the internal database.
+
+### Security Requirements
+
+| Requirement | Detail |
+|---|---|
+| **Signing key storage** | Store the Ed25519 private key in an HSM or encrypted secrets manager (AWS Secrets Manager, HashiCorp Vault, GCP Secret Manager). Never write it to disk unencrypted in production. |
+| **Transparency log backup** | Back up the `transparency_log` table separately from the model artifact store. A coordinated attacker who modifies both the artifact and the log would otherwise bypass the check. |
+| **Log immutability** | The application layer exposes no UPDATE or DELETE path for `transparency_log`. Implement DB-level row-security policies to enforce this in production. |
+
 ## Annotation Queue Integrity
 
 Each entry in `data/annotation_queue.json` carries an `annotation_hmac` field: HMAC-SHA256 of `wallet|label|annotator_id|annotated_at` keyed by `ANNOTATION_HMAC_SECRET`. `export_labelled()` verifies every HMAC before including an annotation; tampered entries are logged as WARNING and excluded.

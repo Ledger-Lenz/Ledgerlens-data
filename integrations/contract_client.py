@@ -117,6 +117,66 @@ class LedgerLensContractClient:
             )
         return tx.sign_and_submit()
 
+    def submit_score_with_uncertainty(
+        self,
+        wallet: str,
+        asset_pair: str,
+        risk_score_dict: dict,
+    ) -> object:
+        """Submit a risk score with uncertainty bounds to the Soroban contract.
+
+        Passes ``score_lower`` and ``score_upper`` as additional Soroban i128
+        fields (scaled x100 for integer representation).
+
+        NOTE: The ``ledgerlens-contract`` repo's ``RiskScore`` struct must be
+        extended with:
+
+        .. code-block:: rust
+
+            pub struct RiskScore {
+                pub score: u32,
+                pub benford_flag: bool,
+                pub ml_flag: bool,
+                pub timestamp: u64,
+                pub confidence: u32,
+                pub score_lower: i128,   // NEW — scaled x100
+                pub score_upper: i128,   // NEW — scaled x100
+                pub coverage_guarantee: u32,  // NEW — percentage 0-100
+            }
+
+        See https://github.com/Ledger-Lenz/ledgerlens-contract/issues/... for
+        the matching change.
+        """
+        if not self.submitter_secret:
+            raise ValueError("LEDGERLENS_SUBMITTER_SECRET is not configured")
+
+        signer = Keypair.from_secret(self.submitter_secret)
+
+        score_lower_scaled = int(round(risk_score_dict.get("score_lower", 0.0) * 100))
+        score_upper_scaled = int(round(risk_score_dict.get("score_upper", 100.0) * 100))
+        coverage_pct = int(round(risk_score_dict.get("coverage_guarantee", 1.0) * 100))
+
+        params = [
+            scval.to_address(wallet),
+            scval.to_string(asset_pair),
+            scval.to_uint32(int(risk_score_dict["score"])),
+            scval.to_bool(bool(risk_score_dict["benford_flag"])),
+            scval.to_bool(bool(risk_score_dict["ml_flag"])),
+            scval.to_uint64(int(risk_score_dict["timestamp"])),
+            scval.to_uint32(int(risk_score_dict["confidence"])),
+            scval.to_int128(score_lower_scaled),
+            scval.to_int128(score_upper_scaled),
+            scval.to_uint32(coverage_pct),
+        ]
+
+        tx = self._client.invoke(
+            "submit_score_with_uncertainty",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        return tx.sign_and_submit()
+
     def submit_score_with_commitment(
         self,
         wallet: str,

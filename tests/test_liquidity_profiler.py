@@ -184,3 +184,124 @@ def test_empty_trades_calibrated_features_default():
     for h in config.BENFORD_WINDOWS_HOURS:
         assert features.get(f"benford_calibrated_chi_{h}h", None) == pytest.approx(0.0)
         assert features.get(f"benford_calibrated_mad_{h}h", None) == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Issue #273 — Thin market wash trade detection
+# ---------------------------------------------------------------------------
+
+
+def _make_thin_trades(n_traders: int, n_trades: int = 100) -> pd.DataFrame:
+    """Return a trade DataFrame with exactly n_traders unique base accounts."""
+    accounts = [f"G{i:055d}" for i in range(n_traders)]
+    rng = np.random.default_rng(42)
+    return pd.DataFrame(
+        {
+            "base_account": rng.choice(accounts, size=n_trades).tolist(),
+            "counter_account": [f"GCOUNTER{i:050d}" for i in range(n_trades)],
+            "amount": rng.uniform(1, 1000, size=n_trades),
+        }
+    )
+
+
+def test_thin_market_classification_few_traders():
+    """A pair with fewer than max_unique_traders_7d must be classified as thin market."""
+    from detection.liquidity_profiler import ThinMarketDetector
+
+    detector = ThinMarketDetector()
+    trades = _make_thin_trades(n_traders=20)  # < default 50
+    result = detector.classify(
+        "AQUA:GABC/XLM:native",
+        trades,
+        liquidity_depth_usd=10_000,
+        amm_tvl_usd=50_000,
+    )
+    assert result.is_thin is True
+    assert result.unique_traders_7d == 20
+
+
+def test_thin_market_classification_liquid_pair():
+    """A liquid pair must not be classified as thin market."""
+    from detection.liquidity_profiler import ThinMarketDetector
+
+    detector = ThinMarketDetector()
+    trades = _make_thin_trades(n_traders=1000)
+    result = detector.classify(
+        "USDC:GABC/XLM:native",
+        trades,
+        liquidity_depth_usd=500_000,
+        amm_tvl_usd=1_000_000,
+    )
+    assert result.is_thin is False
+
+
+def test_thin_market_wash_risk_nan_for_liquid_pair():
+    """thin_market_wash_risk must return NaN for a liquid pair (1000 traders)."""
+    import math
+    from detection.liquidity_profiler import ThinMarketDetector
+
+    detector = ThinMarketDetector()
+    trades = _make_thin_trades(n_traders=1000)
+    score = detector.thin_market_wash_risk(
+        "USDC:GABC/XLM:native",
+        trades,
+        liquidity_depth_usd=500_000,
+        amm_tvl_usd=1_000_000,
+        round_trip_frequency=0.8,
+    )
+    assert math.isnan(score), f"Expected NaN for liquid pair, got {score}"
+
+
+def test_thin_market_alert_fires_above_threshold():
+    """Alert must fire when composite score exceeds THIN_MARKET_ALERT_THRESHOLD."""
+    from detection.liquidity_profiler import ThinMarketDetector
+
+    detector = ThinMarketDetector()
+    # Very thin market: 5 traders, near-zero depth and TVL
+    trades = _make_thin_trades(n_traders=5)
+    score = detector.thin_market_wash_risk(
+        "MYSTERY:GABC/XLM:native",
+        trades,
+        liquidity_depth_usd=10.0,  # almost zero
+        amm_tvl_usd=50.0,
+        round_trip_frequency=0.9,
+    )
+    assert score is not None and not __import__("math").isnan(score)
+    assert score >= detector._cfg["alert_threshold"], (
+        f"Expected score >= {detector._cfg['alert_threshold']}, got {score}"
+    )
+
+
+def test_thin_market_invalid_config_raises_on_startup():
+    """Invalid thin_market config must raise ValueError immediately."""
+    import json
+    import os
+    import tempfile
+    from unittest.mock import patch
+
+    bad_config = {
+        "thin_market": {
+            "max_unique_traders_7d": -10,  # invalid
+            "min_liquidity_depth_usd": 1000,
+            "min_amm_tvl_usd": 5000,
+            "benford_chi_square_threshold_multiplier": 3.0,
+            "alert_threshold": 60,
+            "classification_cache_seconds": 3600,
+        }
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(bad_config, f)
+        tmp_path = f.name
+
+    try:
+        import detection.liquidity_profiler as lp_mod
+
+        with patch.object(lp_mod, "_BUILD_CONFIG_PATH", tmp_path):
+            with pytest.raises(ValueError, match="positive number"):
+                from detection.liquidity_profiler import ThinMarketDetector, _load_thin_market_config, _validate_thin_market_config
+                cfg = _load_thin_market_config()
+                # Manually trigger the load with the bad config
+                cfg["max_unique_traders_7d"] = -10
+                _validate_thin_market_config(cfg)
+    finally:
+        os.unlink(tmp_path)
