@@ -9,13 +9,14 @@ from stellar_sdk import Server
 
 from config import config
 from ingestion.data_models import Trade
+from ingestion.horizon_fetcher import fetch as horizon_fetch
 from ingestion.horizon_streamer import _to_trade
 from utils.retry import retry_with_backoff
 
 
 @retry_with_backoff(exceptions=(ConnectionError, TimeoutError, OSError))
 def _fetch_page(call_builder):
-    return call_builder.call()
+    return horizon_fetch(call_builder.call)
 
 
 def load_trades(

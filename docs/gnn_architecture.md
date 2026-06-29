@@ -190,22 +190,127 @@ See `data/dataset_card.md` for the updated feature schema including GNN columns.
 
 ```
 detection/
-├── gnn_encoder.py          ← GNNEncoder class, _GraphSAGEModel, pretrain_gnn_contrastive
-├── wallet_graph.py         ← build_funding_graph, build_co_trade_graph (new)
-│                               funding_source_similarity (@deprecated)
-│                               network_centrality (@deprecated)
-└── feature_engineering.py  ← compute_graph_embedding_features (new)
-                                build_feature_vector (updated — gnn_encoder param)
-                                build_feature_matrix (updated — gnn_encoder param)
+├── gnn_encoder.py          ← GNNEncoder, _GraphSAGEModel, GraphLevelPooling,
+│                               pretrain_gnn_contrastive
+├── wallet_graph.py         ← build_funding_graph, build_co_trade_graph
+└── feature_engineering.py  ← compute_graph_embedding_features, build_feature_vector
 
 models/
 ├── gnn_encoder.pt          ← GraphSAGE state dict
-└── metrics.json            ← SHA-256 manifest (gnn_encoder + ensemble models)
+└── metrics.json            ← SHA-256 manifest
 
 streaming/
 └── streaming_scorer.py     ← StreamingScorer.observe_new_edges (incremental update)
 
 tests/
-└── test_gnn_encoder.py     ← unit tests (build_co_trade_graph, encode, update_node,
-                                integrity, zero-fallback)
+├── test_gnn_encoder.py     ← encoder unit tests
+└── test_cluster_scoring.py ← DiffPool / cluster scoring unit tests
 ```
+
+---
+
+## DiffPool Graph-Level Pooling & Cluster Scoring
+
+### Motivation
+
+The GraphSAGE encoder produces **per-wallet node embeddings** used in individual
+wallet scoring.  Wash-trade rings are **cluster-level phenomena** — the entire ring
+is suspicious, not just individual wallets.  A cluster-level risk score captures
+ring-level patterns (circular trade flows, shared funding ancestry) that per-node
+scores cannot aggregate in a permutation-invariant way.
+
+### Architecture
+
+`GraphLevelPooling` (in `detection/gnn_encoder.py`) implements hierarchical DiffPool:
+
+```
+Per-node embeddings X  (N × D)  ←  GNNEncoder
+         │
+         ▼
+_DiffPoolAssignNet   →  S  (N × K)       soft cluster assignment
+         │
+         ▼
+Pooled features:  X_out = S^T · X       (K × D)
+         │
+         ▼
+Global mean-readout: mean(X_out, dim=0)  (D,)
+         │
+         ▼
+Linear head:  logit = W · emb + b        (scalar)
+         │
+         ▼
+Cluster score = sigmoid(logit) × 100     ∈ [0, 100]
+```
+
+| Hyperparameter | Default | Config key |
+|---|---|---|
+| Target cluster count K | 10 | `GNN_DIFFPOOL_CLUSTERS` |
+| Max input nodes | 50 | hard-coded |
+| Assignment net hidden dim | `GNN_HIDDEN_DIM` | `GNN_HIDDEN_DIM` |
+
+The assignment network uses the **same SAGEConv + Softmax** architecture.
+It is initialised with random weights; a trained linear head gives interpretable
+cluster-level logits.
+
+### Cluster Scoring API
+
+```python
+from detection.model_inference import score_cluster
+from detection.gnn_encoder import GNNEncoder, GraphLevelPooling
+
+encoder = GNNEncoder()
+encoder.load()
+
+pooler = GraphLevelPooling()   # uses GNN_DIFFPOOL_CLUSTERS, GNN_HIDDEN_DIM
+
+result = score_cluster(
+    wallet_ids=["GABC...", "GXYZ...", "GDEF...", "GHIJ...", "GKLM..."],
+    graph=wallet_graph,
+    scorer=risk_scorer,
+    feature_matrix=feature_matrix,
+    pooler=pooler,
+    encoder=encoder,
+)
+
+print(result["cluster_score"])     # int 0–100
+print(result["cluster_id"])        # SHA-256 of sorted wallet addresses
+print(result["individual_scores"]) # per-wallet scores
+```
+
+### Permutation Invariance
+
+The cluster score is **order-independent**:
+
+- Node ordering is canonically sorted (`sorted(wallet_ids)`) before graph encoding.
+- DiffPool's assignment matrix `S` is a function of sorted node features.
+- Global mean-readout is permutation-invariant by construction.
+
+### Cluster ID
+
+Each result carries a `cluster_id` = SHA-256 of `"|".join(sorted(wallet_ids))`.
+This prevents duplicate scoring of the same ring under different orderings and
+allows cluster scores to be deduplicated in the database.
+
+### How Cluster Score Relates to Individual Wallet Scores
+
+| Mode | Description |
+|---|---|
+| Pooler + features available | 50% DiffPool graph embedding score + 50% mean individual score |
+| Features only (no pooler) | 90th-percentile of individual scores |
+| Pooler only (no features) | DiffPool graph embedding score |
+| Neither | 0 (no information available) |
+
+### Prometheus Counter
+
+```
+ledgerlens_cluster_scored_total  ← incremented on each score_cluster() call
+```
+
+### Testing
+
+```bash
+pytest tests/test_cluster_scoring.py -v
+```
+
+Tests cover permutation invariance, cluster ID stability, correct return shape,
+high-risk ring produces score > 80, and DiffPool pooling to `n_clusters`.

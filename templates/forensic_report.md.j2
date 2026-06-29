@@ -105,6 +105,28 @@ Each trade can be independently verified via the Horizon URL.
 
 ---
 
+{% if report.top_interactions %}
+## Feature Interactions
+
+The table below shows the strongest pairwise feature interactions identified by
+SHAP TreeExplainer interaction values (Shapley interaction index). A high value
+means the two features together explain more of the score than either feature alone.
+
+| # | Feature A | Feature B | Interaction (points) |
+|---|---|---|---|
+{% for ix in report.top_interactions -%}
+| {{ loop.index }} | `{{ ix.feature_a }}` | `{{ ix.feature_b }}` | {{ "%.4f" | format(ix.interaction) }} |
+{% endfor %}
+
+> **Interpretation:** An interaction value of X means that the *combined* effect
+> of Feature A and Feature B adds X points to the risk score **beyond what each
+> feature contributes independently**. Large positive values indicate the model
+> has learned a synergistic risk signal — e.g. "high counterparty concentration
+> AND low account age is a stronger indicator of wash trading than either alone."
+{% endif %}
+
+---
+
 ## On-Chain Anchor & Verification
 
 This report's integrity is protected by a SHA-256 fingerprint of all fields

@@ -81,6 +81,84 @@ def test_minimum_sample_guard():
         config.MIN_TRADES_FOR_SCORING = orig_min
 
 
+# ---------------------------------------------------------------------------
+# Issue #279 — Asset-class-aware Benford baseline calibration
+# ---------------------------------------------------------------------------
+
+
+def test_asset_classifier_classifies_stablecoins():
+    from detection.benford_engine import AssetClassifier
+
+    clf = AssetClassifier()
+    assert clf.classify("USDC") == "stablecoin"
+    assert clf.classify("USDT") == "stablecoin"
+    assert clf.classify("usdc") == "stablecoin"  # case-insensitive
+
+
+def test_asset_classifier_classifies_native():
+    from detection.benford_engine import AssetClassifier
+
+    clf = AssetClassifier()
+    assert clf.classify("XLM") == "native"
+
+
+def test_asset_classifier_classifies_volatile():
+    from detection.benford_engine import AssetClassifier
+
+    clf = AssetClassifier()
+    assert clf.classify("BTC") == "volatile"
+    assert clf.classify("AQUA") == "volatile"
+    assert clf.classify("UNKNOWN") == "volatile"
+
+
+def test_unknown_asset_falls_back_to_theoretical_benford():
+    """An asset not in the classifier must use the theoretical Benford distribution."""
+    from detection.benford_engine import AssetClassifier, BENFORD_EXPECTED
+
+    clf = AssetClassifier()
+    baseline = clf.get_baseline("MYSTERY")
+    assert baseline == dict(BENFORD_EXPECTED)
+
+
+def test_stablecoin_round_amounts_lower_chi_square_against_stablecoin_baseline():
+    """Stablecoin amounts clustered around 100, 1000, 10000 must produce lower
+    chi-square against the stablecoin baseline than against the theoretical
+    Benford distribution (issue #279 acceptance criterion)."""
+    from detection.benford_engine import AssetClassifier, chi_square_statistic, BENFORD_EXPECTED
+
+    # Round-number stablecoin amounts — elevated digit-1 frequency
+    amounts = pd.Series(
+        [100.0] * 400 + [1000.0] * 300 + [10000.0] * 200 + [500.0] * 100
+    )
+
+    clf = AssetClassifier()
+    stablecoin_baseline = clf.get_baseline("USDC")
+
+    chi_vs_stablecoin = chi_square_statistic(amounts, baseline=stablecoin_baseline)
+    chi_vs_theoretical = chi_square_statistic(amounts, baseline=dict(BENFORD_EXPECTED))
+
+    assert chi_vs_stablecoin < chi_vs_theoretical, (
+        f"Expected stablecoin chi-square ({chi_vs_stablecoin:.2f}) < "
+        f"theoretical chi-square ({chi_vs_theoretical:.2f})"
+    )
+
+
+def test_compute_benford_metrics_uses_asset_class_baseline():
+    """compute_benford_metrics with asset_code='USDC' must use stablecoin baseline."""
+    from config import config
+    from detection.benford_engine import compute_benford_metrics, chi_square_statistic, BENFORD_EXPECTED, AssetClassifier
+
+    # Enough samples to exceed MIN_TRADES_FOR_SCORING
+    amounts = pd.Series([100.0] * 400 + [1000.0] * 300 + [10000.0] * 300)
+
+    clf = AssetClassifier()
+    stablecoin_baseline = clf.get_baseline("USDC")
+
+    metrics_with_class = compute_benford_metrics(amounts, asset_code="USDC")
+    expected_chi = chi_square_statistic(amounts, baseline=stablecoin_baseline)
+    assert abs(metrics_with_class.chi_square - expected_chi) < 1e-9
+
+
 def test_optimizer_returns_ascending_windows():
     from detection.benford_window_optimizer import optimize_windows_for_asset
 

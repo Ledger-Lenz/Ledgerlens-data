@@ -42,6 +42,39 @@ accounts was conducted using [Stellar Expert](https://stellar.expert) and
 > A production release against live Horizon data would populate this table with real observations.
 > The `review_notes` column in the Parquet file stores per-wallet rationale.
 
+## Ground Truth Dataset — Historical Backtesting
+
+`data/known_manipulation_events.csv` contains 25 curated market manipulation events on
+Stellar Mainnet, compiled from the following public sources:
+
+| Source | Count | Domain |
+|---|---|---|
+| DEX Explorer Stellar anomaly flags | 8 | https://dexexplorer.stellar.org |
+| Community-reported wash trade campaigns | 9 | https://community.stellar.org |
+| Public wash trade reports | 7 | https://stellar.expert |
+| Academic paper on Stellar DEX wash trading | 1 | https://academic.oup.com/cybersecurity |
+
+### Event Selection Criteria
+
+1. **Verifiable on-chain footprint** — each wallet has ≥ 50 trades during the campaign period
+2. **Clear temporal boundaries** — campaign start/end are determinable from trade pattern breaks
+3. **Multiple detection signals** — each event exhibits ≥ 2 of: round-trip pattern, Benford anomaly,
+   graph ring membership, or volume spike signature
+4. **Sourced** — every event links to a public URL documenting the anomaly
+
+### Confidence Scale
+
+| Level | Meaning |
+|---|---|
+| 3 (High) | Multi-signal confirmation with public documentation and independent verifiability |
+| 2 (Medium) | Strong evidence from 2+ signals or a single highly reliable source |
+| 1 (Low) | Single signal or community report without independent verification |
+
+### Label Source Requirements
+
+All `label_source` URLs in the CSV must use HTTPS. HTTP sources are rejected by the
+backtesting framework's validation step (prevents MITM on ground truth provenance).
+
 ## Known Limitations and Biases
 
 1. **Round-trip window** — The 100-ledger window may miss slow wash-trading rings that operate
@@ -56,6 +89,9 @@ accounts was conducted using [Stellar Expert](https://stellar.expert) and
    emerged after the window will not be represented.
 5. **Negative label quality** — Wallets labelled `0` satisfy minimum trade and counterparty
    thresholds, but this is not a guarantee of legitimacy.
+6. **Ground truth completeness** — The 25 curated events represent a sample of known manipulation;
+   actual wash trading on Stellar Mainnet is likely more prevalent. Missed events in the
+   ground truth will cause the backtesting framework to overstate detection performance.
 
 ## Ethics and Privacy
 

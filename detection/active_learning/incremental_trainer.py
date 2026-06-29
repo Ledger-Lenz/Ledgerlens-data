@@ -8,6 +8,13 @@ Rollback policy:
     If AUC-ROC drops by more than ``config.AL_ROLLBACK_AUC_DROP`` (default 0.01)
     on the held-out validation set, the new models are discarded, the original
     artifacts are restored, and their SHA-256 is re-verified before serving.
+
+Backdoor detection:
+    Before training, the incremental trainer runs Activation Clustering (AC) to
+    detect potential backdoor-poisoned samples. If > 20% of a class's samples are
+    flagged, a critical alert is emitted and training proceeds without quarantine
+    (to prevent false positives from blocking training). Otherwise, flagged samples
+    are quarantined (added to a quarantine list in the annotation queue).
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from config import config
+from detection.adversarial.backdoor_detector import ActivationClusteringDetector
 from detection.model_training import (
     MODEL_REGISTRY,
     load_training_data,
@@ -36,6 +44,118 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 REPORTS_DIR = "reports"
+
+# Backdoor detection safety threshold: if > 20% of samples are flagged,
+# emit alert and proceed without quarantine (safety check to prevent false positives)
+BACKDOOR_SAFETY_THRESHOLD = 0.20
+
+
+def _detect_and_quarantine_backdoors(
+    models: dict,
+    new_df: pd.DataFrame,
+    report: dict,
+) -> tuple[pd.DataFrame, list[int]]:
+    """Run backdoor detection and quarantine flagged samples.
+
+    Args:
+        models: Trained models (ensemble)
+        new_df: New annotated samples
+        report: AL update report dict (will be updated with detection info)
+
+    Returns:
+        Tuple of (cleaned_df, quarantined_indices):
+          - cleaned_df: new_df with quarantined samples removed
+          - quarantined_indices: list of indices of quarantined samples in original new_df
+
+    Side effects:
+        - Updates report dict with backdoor detection info
+        - Emits critical alert if > 20% of class samples are flagged
+    """
+    quarantined_indices: list[int] = []
+
+    if new_df.empty:
+        return new_df, quarantined_indices
+
+    try:
+        # Use the first model (RandomForest) for AC detection
+        model = models.get("random_forest")
+        if model is None:
+            logger.warning("RandomForest model not available for backdoor detection")
+            return new_df, quarantined_indices
+
+        X, y = split_features_labels(new_df)
+        detector = ActivationClusteringDetector(k=2, random_state=42)
+        flagged_indices = detector.detect(model, X, y, threshold_percentile=25)
+
+        if not flagged_indices:
+            report["backdoor_detection"] = {
+                "method": "activation_clustering",
+                "n_flagged": 0,
+                "quarantined": 0,
+                "safety_triggered": False,
+            }
+            logger.info("Backdoor detection: no samples flagged")
+            return new_df, quarantined_indices
+
+        # Check safety threshold for each class
+        flagged_set = set(flagged_indices)
+        safety_triggered = False
+
+        for label in sorted(y.unique()):
+            label_mask = y == label
+            label_count = label_mask.sum()
+            label_flagged = sum(1 for idx in flagged_indices if label_mask.iloc[idx])
+
+            if label_count > 0:
+                flagged_pct = label_flagged / label_count
+                if flagged_pct > BACKDOOR_SAFETY_THRESHOLD:
+                    logger.critical(
+                        "Backdoor detection safety check triggered for label=%d: "
+                        "%.1f%% flagged (threshold=%.1f%%). Proceeding without quarantine.",
+                        label,
+                        100.0 * flagged_pct,
+                        100.0 * BACKDOOR_SAFETY_THRESHOLD,
+                    )
+                    safety_triggered = True
+
+        # If safety threshold triggered, emit alert but don't quarantine
+        if safety_triggered:
+            report["backdoor_detection"] = {
+                "method": "activation_clustering",
+                "n_flagged": len(flagged_indices),
+                "quarantined": 0,
+                "safety_triggered": True,
+                "message": "Safety check triggered — high false positive rate detected",
+            }
+            logger.warning("Proceeding with training despite backdoor detection warnings")
+            return new_df, quarantined_indices
+
+        # Otherwise, quarantine flagged samples
+        quarantined_indices = sorted(flagged_indices)
+        cleaned_df = new_df.drop(quarantined_indices).reset_index(drop=True)
+
+        report["backdoor_detection"] = {
+            "method": "activation_clustering",
+            "n_flagged": len(flagged_indices),
+            "quarantined": len(quarantined_indices),
+            "safety_triggered": False,
+        }
+
+        logger.info(
+            "Backdoor detection: flagged %d samples, quarantined %d",
+            len(flagged_indices),
+            len(quarantined_indices),
+        )
+
+        return cleaned_df, quarantined_indices
+
+    except Exception as exc:
+        logger.error("Backdoor detection failed: %s. Proceeding with all samples.", exc)
+        report["backdoor_detection"] = {
+            "method": "activation_clustering",
+            "error": str(exc),
+        }
+        return new_df, quarantined_indices
 
 
 def _sha256_file(path: str) -> str:
@@ -212,6 +332,11 @@ class IncrementalTrainer:
             - ``auc_before``, ``auc_after``: mean AUC-ROC change
             - ``rolled_back``: True if the update was rejected
             - ``strategy``: "warm_start" or "full_retrain"
+            - ``backdoor_detection``: Backdoor detection results
+
+        Backdoor detection is run before training. If > 20% of a class's samples
+        are flagged, a critical alert is emitted and training proceeds without
+        quarantine (to prevent false positives from blocking training).
         """
         model_dir = model_dir or self.model_dir
         threshold = config.AL_RETRAIN_THRESHOLD
@@ -221,16 +346,27 @@ class IncrementalTrainer:
         if not models_before:
             raise RuntimeError(f"No trained models found in {model_dir}. Train first.")
 
-        # Split new data for before/after AUC evaluation
-        if len(new_labelled) < 4:
+        # Run backdoor detection before training
+        report: dict = {}
+        new_labelled_cleaned, quarantined_indices = _detect_and_quarantine_backdoors(
+            models_before, new_labelled, report
+        )
+
+        # Use cleaned data for training (backdoors removed if below safety threshold)
+        training_data = new_labelled_cleaned
+
+        # Split cleaned data for before/after AUC evaluation
+        if len(training_data) < 4:
             # Too small to split — use the whole set for eval
-            val_df = new_labelled
+            val_df = training_data
         else:
             _, val_df = train_test_split(
-                new_labelled,
+                training_data,
                 test_size=self.val_size,
                 random_state=self.random_state,
-                stratify=new_labelled["label"] if new_labelled["label"].nunique() > 1 else None,
+                stratify=training_data["label"]
+                if training_data["label"].nunique() > 1
+                else None,
             )
 
         auc_before = _auc_on_df(models_before, val_df)
@@ -238,22 +374,26 @@ class IncrementalTrainer:
 
         strategy: str
         try:
-            if len(new_labelled) < threshold:
+            if len(training_data) < threshold:
                 logger.info(
-                    "Warm-start update: %d new samples (threshold=%d)", len(new_labelled), threshold
+                    "Warm-start update: %d new samples (threshold=%d)",
+                    len(training_data),
+                    threshold,
                 )
                 strategy = "warm_start"
-                updated_models = _warm_start_update(models_before, new_labelled, model_dir)
+                updated_models = _warm_start_update(models_before, training_data, model_dir)
             else:
                 logger.info(
-                    "Full retrain: %d new samples >= threshold=%d", len(new_labelled), threshold
+                    "Full retrain: %d new samples >= threshold=%d",
+                    len(training_data),
+                    threshold,
                 )
                 strategy = "full_retrain"
                 if self.historical_data_path and os.path.exists(self.historical_data_path):
                     historical = load_training_data(self.historical_data_path)
-                    combined = pd.concat([historical, new_labelled], ignore_index=True)
+                    combined = pd.concat([historical, training_data], ignore_index=True)
                 else:
-                    combined = new_labelled
+                    combined = training_data
                     logger.warning("No historical dataset found — retraining on new data only")
                 training_output = train_models(combined, random_state=self.random_state)
                 results = training_output["results"]
@@ -280,15 +420,19 @@ class IncrementalTrainer:
             _restore_models(model_dir, original_shas)
             raise
 
-        report = {
-            "updated_at": datetime.now(UTC).isoformat(),
-            "strategy": strategy,
-            "n_new_samples": len(new_labelled),
-            "auc_before": round(auc_before, 6),
-            "auc_after": round(auc_after, 6),
-            "auc_delta": round(auc_after - auc_before, 6),
-            "rolled_back": rolled_back,
-        }
+        report.update(
+            {
+                "updated_at": datetime.now(UTC).isoformat(),
+                "strategy": strategy,
+                "n_new_samples": len(new_labelled),
+                "n_quarantined": len(quarantined_indices),
+                "n_training_samples": len(training_data),
+                "auc_before": round(auc_before, 6),
+                "auc_after": round(auc_after, 6),
+                "auc_delta": round(auc_after - auc_before, 6),
+                "rolled_back": rolled_back,
+            }
+        )
 
         os.makedirs(REPORTS_DIR, exist_ok=True)
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
