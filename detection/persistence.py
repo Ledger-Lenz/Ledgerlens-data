@@ -46,6 +46,15 @@ class RiskScoreRecord(Base):
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 
+    @property
+    def propagated_risk_score(self) -> float | None:
+        return self.propagated_risk
+
+    @property
+    def propagated_risk_score(self) -> float | None:
+        """Alias for propagated_risk (used by WeightedRiskPropagation cache)."""
+        return self.propagated_risk
+
     def to_risk_score(self) -> dict:
         result = {
             "score": self.score,

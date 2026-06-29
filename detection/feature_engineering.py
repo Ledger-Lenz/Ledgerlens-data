@@ -960,6 +960,7 @@ def build_feature_vector(
             )
         )
     features.update(compute_hardening_features(wallet_trades))
+    features.update(compute_ts_decomposition_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
     features["bridge_round_trip_ratio"] = 0.0  # populated by callers that supply bridge tx data
