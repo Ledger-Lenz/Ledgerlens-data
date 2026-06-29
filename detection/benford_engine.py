@@ -8,6 +8,14 @@ Implements the three metrics described in the project README:
 These are computed per wallet / asset / pair over rolling time windows
 (see `config.BENFORD_WINDOWS_HOURS`) and feed into the Benford feature
 group consumed by `feature_engineering.py`.
+
+Real-time scoring
+-----------------
+For latency-sensitive (streaming) paths, use ``SlidingWindowBenfordAggregator``
+from ``detection.sliding_window_benford``.  It maintains running digit counts
+updated incrementally as trades arrive and expire, reducing per-call latency
+from O(N_trades) to O(1).  The DB-based ``compute_benford_metrics_for_windows``
+below is retained for batch scoring.
 """
 
 import math

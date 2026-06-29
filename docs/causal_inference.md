@@ -60,3 +60,88 @@ Use SHAP for attribution. Use causal scoring for investigation and evidence tria
 - Rank counterparties by how much they contribute to the score.
 - Trace the funding chain behind a flagged wallet.
 - Test whether an apparent wash-trading signal propagates into downstream trade-pattern features.
+
+---
+
+## Causal Transfer Learning (Issue #255)
+
+Causal models trained on one asset pair (e.g. USDC/XLM) do not always
+generalise to structurally different pairs (e.g. a low-liquidity token pair)
+because the causal graph structure may differ.  **Causal transfer learning**
+identifies the invariant causal mechanisms shared across pairs and trains
+pair-specific adjustments on top.
+
+### Invariant Causal Prediction (ICP)
+
+`CausalTransfer` (`detection/causal_transfer.py`) implements ICP
+(Peters et al., 2016).
+
+**Algorithm**:
+
+1. Each unique asset pair is treated as a separate *environment*.
+2. For every feature subset S ⊆ features (up to `max_subset_size=8`):
+   - Fit a linear regression of the label on S within each environment.
+   - Pool within-environment residuals.
+   - Run a one-way ANOVA F-test at α=0.01 across environments.
+   - If p > 0.01 (fail to reject equal-mean null), S is "potentially invariant".
+3. The invariant feature set = intersection of all accepted subsets.
+4. If no features survive the test (empty intersection), fall back to the global model.
+
+### Shared mechanism + pair-specific adjustments
+
+Once the invariant set is identified:
+
+- A **global model** is trained on all environments using only the invariant features.
+- A **pair-specific logistic regression** is trained on each environment's data
+  as a local adjustment layer.
+- At inference, the pair-specific model is used when the pair is known; the
+  global model handles unseen pairs.
+
+### Environment definition for Stellar DEX
+
+Environments are defined by **asset pair**.  Alternative definitions
+(time period, market regime) can be substituted by changing the `pair_col`
+argument to `CausalTransfer.fit`.
+
+### Security: anonymised environment labels
+
+Raw pair IDs (e.g. `USDC:GA5Z.../XLM:native`) are hashed with SHA-256
+(first 8 hex characters) before use as environment labels.  The raw pair
+string is never stored in the fitted model.
+
+### Usage
+
+```python
+from detection.causal_transfer import CausalTransfer
+
+ct = CausalTransfer(feature_cols=["benford_chi_square_24h", "round_trip_frequency", ...])
+result = ct.fit(train_df, pair_col="pair_id", label_col="label")
+
+# Evaluate on a held-out pair
+auc = ct.evaluate(test_df, pair_col="pair_id", label_col="label")
+
+# Predict probabilities (uses pair-specific model if available)
+probs = ct.predict_proba(new_df, pair_col="pair_id")
+```
+
+### Fallback behaviour
+
+When `result.fallback_to_global is True`, all predictions use a single
+logistic regression trained on the full feature set.  This happens when the
+ANOVA test finds no stable features across environments.
+
+### Generalisation benchmark
+
+The benchmark compares three models on a held-out pair:
+
+| Model | Description |
+|---|---|
+| Transferred causal model | `CausalTransfer` trained on all other pairs |
+| Pair-specific model (10× data) | Trained on 10× more labelled data for the held-out pair |
+| Global model | Single model trained on all data without causal transfer |
+
+The target is: transferred model AUC ≥ pair-specific model AUC − 0.05.
+
+### References
+
+- Peters, J., Bühlmann, P., & Meinshausen, N. (2016). Causal Inference Using Invariant Prediction: Identification and Confidence Intervals. *Journal of the Royal Statistical Society: Series B*, 78(5), 947–1012.
