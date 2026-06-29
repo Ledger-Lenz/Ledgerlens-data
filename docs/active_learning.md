@@ -179,83 +179,119 @@ make test     # includes test_query_strategies, test_annotation_queue, test_incr
 make lint
 ```
 
-## Multi-Annotator Workflow
+---
 
-### Overview
+## Label Quality Estimation
 
-When a wallet is flagged as uncertain or sensitive, a second analyst independently
-labels it (blind double-annotation). The annotation queue tracks all per-annotator
-labels under a wallet's `"annotations"` list and automatically computes
-inter-rater agreement metrics when at least two verified labels are present.
+### Motivation
 
-### Agreement Metrics
+Human annotators make errors, particularly on borderline wallets where wash-trading
+patterns are ambiguous.  Noisy labels cause model underfitting and reduce detection
+performance.  `LabelQualityEstimator` (in
+`detection/active_learning/label_quality_estimator.py`) runs **confident learning**
+([Northcutt et al., 2021](https://jair.org/index.php/jair/article/view/12125)) on
+each new annotation batch before it reaches the training set.
 
-| Metric | When used | Threshold |
-|---|---|---|
-| **Cohen's Kappa** | Binary labels (0 = clean, 1 = wash trading) | κ ≥ 0.6 = acceptable |
-| **Krippendorff's Alpha** | Ordinal / multi-class extensions; handles missing annotations | α ≥ 0.667 = acceptable (Krippendorff, 2004) |
+### How It Works
 
-**Why Cohen's Kappa for binary labels?**  Kappa corrects for chance agreement,
-making it more reliable than raw percent agreement when label base rates are
-skewed (which they are in LedgerLens: genuine wash trading is rare).
+1. The **production model** generates out-of-sample predicted probabilities for
+   each sample in the batch.
+2. `cleanlab.filter.find_label_issues` computes a per-sample **noise score** using
+   class-conditional confidence matrices.  Class-conditional estimation handles
+   severe class imbalance (typical in wash-trade datasets).
+3. The top `LABEL_QUALITY_NOISE_THRESHOLD` percent (default **10 %**) of flagged
+   samples are **quarantined** — they are withheld from the training set and logged
+   for re-annotation.
+4. Per-annotator noise rates are tracked cumulatively; when an annotator's rate
+   exceeds `ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD` (default **20 %**) a structured
+   `WARNING` log is emitted.
 
-**Why Krippendorff's Alpha for multi-class?**  Alpha generalises across
-measurement levels (nominal, ordinal, interval) and gracefully handles the
-common case where not every wallet is annotated by every annotator — only
-doubly-annotated wallets appear in the reliability matrix.
-
-### Adding a Second Annotation
-
-```python
-from detection.active_learning.annotation_queue import AnnotationQueue
-
-queue = AnnotationQueue()
-
-# First annotator
-queue.multi_annotate("GABCD...", label=1, annotator_id="anon-7f3a", notes="clear wash pattern")
-
-# Second annotator (blind — different session)
-queue.multi_annotate("GABCD...", label=0, annotator_id="anon-2b9c")
-
-# Check agreement
-result = queue.compute_inter_annotator_agreement("GABCD...")
-# {"kappa": -1.0, "alpha": -1.0, "n_annotators": 2, "disputed": True}
 ```
-
-Annotator IDs **must be pseudonymous opaque strings** (e.g. `"anon-7f3a"`).
-Email addresses and real names are explicitly forbidden to protect annotator
-privacy in the queue file.
-
-### Dispute Resolution Process
-
-1. When `compute_inter_annotator_agreement()` returns `disputed=True`
-   (Kappa < 0.6), the wallet's queue status is automatically set to
-   `"disputed"`.
-
-2. A senior analyst retrieves the disputed wallets:
-
-   ```python
-   disputed = queue.get_senior_review_queue()
-   # ["GABCD...", ...]
-   ```
-
-3. The senior analyst reviews the original annotations plus SHAP
-   explanations and casts a tie-breaking label via `queue.annotate()`.
-
-4. The resolved label is included in the next `export_labelled()` run and
-   used for model retraining.
-
-### Grafana Dashboard
-
-A **"Inter-annotator Kappa (rolling)"** panel is available in the
-`LedgerLens Kafka Streaming` Grafana dashboard (`monitoring/grafana/dashboards/ledgerlens-kafka.json`).
-It plots the mean Cohen's Kappa over time (Prometheus metric: `inter_annotator_kappa`)
-and the cumulative count of disputed wallets (`inter_annotator_disputed_total`).
-Threshold lines at κ = 0.4 (red), 0.6 (yellow), and 0.8 (green) give instant
-visual feedback on annotation quality.
+New annotation batch
+        │
+        ▼
+LabelQualityEstimator.evaluate_batch()
+        │
+        ├─ cleanlab: find_label_issues()
+        │
+        ├─ top 10% noisy → quarantined   ──► data/label_quality_quarantine.ndjson
+        │
+        └─ remainder → clean_indices     ──► IncrementalTrainer
+```
 
 ### Configuration
 
-| Variable | Default | Description |
+| Environment variable | Default | Description |
 |---|---|---|
-| `DISPUTE_KAPPA_THRESHOLD` | `0.6` | Kappa below which a wallet is routed to senior review |
+| `LABEL_QUALITY_NOISE_THRESHOLD` | `0.10` | Fraction of batch to quarantine |
+| `ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD` | `0.20` | Alert threshold for per-annotator noise rate |
+
+### Re-annotation Workflow
+
+Quarantined items are written to `data/label_quality_quarantine.ndjson` as NDJSON
+records:
+
+```json
+{
+  "quarantined_at": "2026-06-27T12:00:00+00:00",
+  "batch_index": 94,
+  "label": 0,
+  "noise_score": 0.87,
+  "annotator_id": "analyst_alice",
+  "wallet": "GABC...",
+  "status": "quarantined"
+}
+```
+
+Operators must review quarantined items and re-annotate them via the normal
+annotation workflow.  Quarantined items are **never silently deleted** — the audit
+log is the source of truth.
+
+### Bootstrapping Problem
+
+`LabelQualityEstimator` needs a trained model to generate predicted probabilities,
+but the model was trained on potentially noisy labels.  Two mitigations:
+
+1. **Use the production model** (not the model-under-training) to generate
+   probabilities.  The production model was trained on a larger, presumably cleaner
+   dataset.
+2. **Iterative refinement**: after the first clean-label retrain, re-run the
+   estimator with the new model to catch any remaining noise.
+
+### Usage Example
+
+```python
+from detection.active_learning.label_quality_estimator import LabelQualityEstimator
+from detection.model_inference import RiskScorer
+
+scorer = RiskScorer()  # production model used for out-of-sample probs
+
+estimator = LabelQualityEstimator(
+    model=scorer.models["xgb"],  # or any model with predict_proba
+    noise_threshold=0.10,
+    annotator_alert_threshold=0.20,
+)
+
+result = estimator.evaluate_batch(
+    features=feature_matrix,
+    labels=labels,
+    annotator_ids=annotator_ids,
+    wallet_ids=wallet_ids,
+)
+
+# Only add clean samples to the training set
+clean_X = feature_matrix.iloc[result["clean_indices"]]
+clean_y = labels[result["clean_indices"]]
+```
+
+### Testing
+
+```bash
+pytest tests/test_label_quality_estimator.py -v
+```
+
+Tests cover:
+- 7-of-10 mislabelled detection rate on a synthetic noisy batch
+- Per-annotator noise rate alert fires at > 20 %
+- Quarantine log contains `noise_score` and `annotator_id` for every quarantined item
+- Quarantined items are never silently deleted

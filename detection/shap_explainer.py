@@ -137,6 +137,79 @@ class ShapExplainer:
             private_values[feature] = float(value + rng.normal(0.0, sigma))
         return private_values
 
+    def compute_interaction_values(
+        self, model, X: pd.DataFrame, top_n: int = 5
+    ) -> list[dict]:
+        """Return the top `top_n` pairwise feature interactions by absolute mean
+        interaction value across all rows in `X`.
+
+        Uses ``shap.TreeExplainer.shap_interaction_values``, which implements the
+        Shapley interaction index (Lundberg et al., 2018).
+
+        **API compatibility notes:**
+        - XGBoost: ``TreeExplainer.shap_interaction_values`` returns an ndarray
+          shaped ``(n_samples, n_features, n_features)`` for regressors and binary
+          classifiers.  For multi-class XGBoost it returns a list of such arrays;
+          we take index ``[1]`` (positive class).
+        - sklearn RandomForest (binary): returns ``(n_samples, n_features, n_features,
+          n_classes)``; we select ``[:, :, :, 1]`` for the positive class.
+        - LightGBM: ``TreeExplainer`` supports interaction values via the same
+          ``shap_interaction_values`` call when ``feature_perturbation="tree_path_dependent"``
+          (the default).  The returned shape is ``(n_samples, n_features, n_features)``,
+          identical to XGBoost.  LightGBM does **not** support
+          ``feature_perturbation="interventional"`` for interaction values — if you
+          override the explainer's ``feature_perturbation``, you will receive a
+          ``NotImplementedError``.
+
+        Raises ``RuntimeError`` if ``config.SHAP_INTERACTIONS_ENABLED`` is False.
+
+        Returns a list of dicts::
+
+            [{"feature_a": str, "feature_b": str, "interaction": float}, ...]
+        """
+        if not config.SHAP_INTERACTIONS_ENABLED:
+            raise RuntimeError(
+                "SHAP interaction values are disabled. "
+                "Set SHAP_INTERACTIONS_ENABLED=true to enable them."
+            )
+
+        feature_cols = [c for c in X.columns if c not in FEATURE_COLUMNS_EXCLUDE]
+        X_features = X[feature_cols].astype(float)
+
+        explainer = self._get_explainer(model)
+        interaction_values = explainer.shap_interaction_values(X_features)
+
+        # Normalise the output shape to (n_samples, n_features, n_features):
+        #
+        # XGBoost binary/regressor:  ndarray (n, d, d)  — no change needed
+        # sklearn RF binary:         ndarray (n, d, d, n_classes)  — take [:, :, :, 1]
+        # Multi-class list (XGBoost): list of (n, d, d) arrays — take index [1]
+        # LightGBM binary:           ndarray (n, d, d)  — no change needed
+        #   (LightGBM does NOT support feature_perturbation="interventional")
+        if isinstance(interaction_values, list):
+            interaction_values = interaction_values[1]
+        elif interaction_values.ndim == 4:
+            # sklearn RF: (n, d, d, n_classes) — select positive class
+            interaction_values = interaction_values[:, :, :, 1]
+
+        # interaction_values: (n_samples, n_features, n_features)
+        # Mean absolute value across samples; zero out diagonal (main effects)
+        mean_abs = np.abs(interaction_values).mean(axis=0)
+        np.fill_diagonal(mean_abs, 0.0)
+
+        n = len(feature_cols)
+        # Collect upper-triangle pairs only (symmetric matrix)
+        pairs = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                pairs.append((feature_cols[i], feature_cols[j], float(mean_abs[i, j])))
+
+        pairs.sort(key=lambda p: p[2], reverse=True)
+        return [
+            {"feature_a": fa, "feature_b": fb, "interaction": v}
+            for fa, fb, v in pairs[:top_n]
+        ]
+
     def explain_ensemble(self, feature_row: pd.Series, models: dict, top_n: int = 5) -> list[dict]:
         """Aggregate per-model SHAP contributions across an ensemble into a
         single ranked list.
@@ -172,3 +245,20 @@ class ShapExplainer:
             {"feature": name, "contribution": float(value), "value": float(raw)}
             for name, value, raw in contributions
         ]
+
+
+def format_top_interactions(interactions: list[dict]) -> list[str]:
+    """Format a list of interaction dicts (from ``ShapExplainer.compute_interaction_values``)
+    into human-readable strings.
+
+    Each output string has the form::
+
+        "feature_a x feature_b contributes X.XXXX points to the score"
+
+    Exactly ``len(interactions)`` strings are returned; callers should pass the
+    top-N list they want formatted.
+    """
+    return [
+        f"{item['feature_a']} x {item['feature_b']} contributes {item['interaction']:.4f} points to the score"
+        for item in interactions
+    ]

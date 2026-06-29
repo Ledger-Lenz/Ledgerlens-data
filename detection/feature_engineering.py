@@ -16,6 +16,7 @@ buffered into a DataFrame) for a single wallet.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import networkx as nx
@@ -23,6 +24,8 @@ import numpy as np
 import pandas as pd
 
 from config import config
+
+logger = logging.getLogger(__name__)
 from detection.benford_engine import (
     BenfordMetrics,
     compute_benford_metrics_for_windows,
@@ -149,6 +152,13 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "Standard deviation of per-pair Benford MAD scores. Low values mean "
         "Benford non-conformity is equally distributed across all pairs — "
         "consistent with a systematic automated trading pattern."
+    ),
+    # Cross-chain features
+    "solana_linked_wash_score": (
+        "Risk score of a linked Solana address (via Wormhole bridge) if found. "
+        "If the Stellar wallet has a linked Solana address and that address's "
+        "Solana-chain risk score is available (from external provider, cached), "
+        "this feature surfaces that signal. Value [0, 100]; 0 if no link found."
     ),
 }
 
@@ -839,6 +849,58 @@ def compute_graph_embedding_features(
         return {f"gnn_{i}": float(embedding[i]) for i in range(len(embedding))}
     except Exception:
         return zero_features
+
+
+def compute_solana_linked_features(
+    wallet: str,
+    identity_graph=None,
+    solana_risk_cache: dict[str, float] | None = None,
+) -> dict:
+    """Compute features based on linked Solana addresses via Wormhole bridge.
+
+    Queries the identity graph to find Solana addresses linked to a Stellar
+    wallet via Wormhole bridge transactions. If found and a cached risk score
+    is available for the Solana address, surfaces that signal.
+
+    Args:
+        wallet: Stellar account id to score.
+        identity_graph: IdentityGraph instance (from detection.cross_chain.identity_graph).
+            If None, returns zero features.
+        solana_risk_cache: Optional cache mapping Solana address -> risk_score.
+            Risk scores should be in [0, 100]. If None or address not in cache,
+            returns 0.0.
+
+    Returns:
+        A dictionary with:
+        - ``solana_linked_wash_score``: highest risk score among linked Solana
+          addresses, or 0.0 if none found.
+
+    Raises:
+        Any exceptions from the identity graph are caught and logged.
+    """
+    if identity_graph is None or solana_risk_cache is None:
+        return {"solana_linked_wash_score": 0.0}
+
+    try:
+        # Resolve Stellar wallet to linked Solana addresses
+        component = identity_graph.get_connected_component(wallet)
+        linked_sol_addresses = [node["address"] for node in component.get("sol", [])]
+
+        if not linked_sol_addresses:
+            return {"solana_linked_wash_score": 0.0}
+
+        # Find max risk score among linked Solana addresses
+        max_risk_score = 0.0
+        for sol_addr in linked_sol_addresses:
+            if sol_addr in solana_risk_cache:
+                risk = solana_risk_cache[sol_addr]
+                max_risk_score = max(max_risk_score, float(risk))
+
+        return {"solana_linked_wash_score": max_risk_score}
+
+    except Exception as exc:
+        logger.error("Failed to compute Solana linked features for %s: %s", wallet, exc)
+        return {"solana_linked_wash_score": 0.0}
 
 
 def build_feature_vector(

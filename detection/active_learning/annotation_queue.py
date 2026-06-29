@@ -150,6 +150,8 @@ class AnnotationQueue:
         label: int,
         annotator_id: str,
         notes: str = "",
+        quarantine: bool = False,
+        quarantine_reason: str = "",
     ) -> None:
         """Record an analyst verdict for *wallet*.
 
@@ -157,6 +159,14 @@ class AnnotationQueue:
         requirement) or *label* is not 0 or 1.
 
         Idempotent: calling again with the same wallet updates the record.
+
+        Args:
+            wallet: Wallet ID
+            label: 0 (clean) or 1 (wash trading)
+            annotator_id: Analyst ID (non-empty)
+            notes: Optional annotation notes
+            quarantine: If True, mark as quarantined (default False)
+            quarantine_reason: Reason for quarantine (e.g., "backdoor_ac_detected")
         """
         if not annotator_id:
             raise ValueError("annotator_id must be a non-empty string")
@@ -177,6 +187,8 @@ class AnnotationQueue:
                         "annotated_at": annotated_at,
                         "status": "annotated",
                         "annotation_hmac": mac,
+                        "quarantine": quarantine,
+                        "quarantine_reason": quarantine_reason if quarantine else "",
                     }
                 )
                 _atomic_write(self.queue_path, queue)
@@ -196,6 +208,8 @@ class AnnotationQueue:
                 "notes": notes,
                 "annotated_at": annotated_at,
                 "annotation_hmac": mac,
+                "quarantine": quarantine,
+                "quarantine_reason": quarantine_reason if quarantine else "",
             }
         )
         _atomic_write(self.queue_path, queue)
@@ -428,9 +442,24 @@ class AnnotationQueue:
         queue = _load_queue(self.queue_path)
         return [item["wallet"] for item in queue if item.get("status") == "skipped"]
 
-    # ------------------------------------------------------------------
-    # Export
-    # ------------------------------------------------------------------
+    def quarantined_samples(self) -> list[dict]:
+        """Return all quarantined annotation records."""
+        queue = _load_queue(self.queue_path)
+        return [
+            item
+            for item in queue
+            if item.get("quarantine") and item.get("status") == "annotated"
+        ]
+
+    def dismiss_quarantine(self, wallet: str) -> None:
+        """Remove quarantine flag from a wallet (operator override)."""
+        queue = _load_queue(self.queue_path)
+        for item in queue:
+            if item["wallet"] == wallet:
+                item["quarantine"] = False
+                item["quarantine_reason"] = ""
+                break
+        _atomic_write(self.queue_path, queue)
 
     def export_labelled(self, output_path: str) -> pd.DataFrame:
         """Export verified annotated rows to *output_path* as parquet.

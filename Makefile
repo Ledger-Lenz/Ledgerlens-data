@@ -1,3 +1,4 @@
+.PHONY: install lint format test run scale-workers
 .PHONY: install lint format test run typecheck
 
 VENV_BIN := $(abspath .venv/bin)
@@ -31,4 +32,12 @@ test:
 	$(PYTEST) -q
 
 run:
+	python run_pipeline.py
+
+scale-workers:
+	@if [ -z "$(N)" ]; then \
+		echo "Error: N is required. Usage: make scale-workers N=4"; \
+		exit 1; \
+	fi
+	python -m scripts.kafka_workers --num-workers $(N)
 	$(PYTHON) run_pipeline.py
