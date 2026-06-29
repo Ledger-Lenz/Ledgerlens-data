@@ -59,6 +59,22 @@ class RiskScoreRecord(Base):
         return result
 
 
+class EnsembleWeightRecord(Base):
+    """Persists per-model dynamic weight adjustment history (issue #268)."""
+
+    __tablename__ = "ensemble_weight_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+    )
+    model_name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    weight: Mapped[float] = mapped_column(nullable=False)
+    fp_rate: Mapped[float] = mapped_column(nullable=False)
+    observation_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_systemic_reset: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+
 class ShapQueryCount(Base):
     """Per-wallet SHAP explanation query counter used for Rényi DP composition.
 

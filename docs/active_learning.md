@@ -178,3 +178,120 @@ All settings are controlled via environment variables (see `.env.example`):
 make test     # includes test_query_strategies, test_annotation_queue, test_incremental_trainer
 make lint
 ```
+
+---
+
+## Label Quality Estimation
+
+### Motivation
+
+Human annotators make errors, particularly on borderline wallets where wash-trading
+patterns are ambiguous.  Noisy labels cause model underfitting and reduce detection
+performance.  `LabelQualityEstimator` (in
+`detection/active_learning/label_quality_estimator.py`) runs **confident learning**
+([Northcutt et al., 2021](https://jair.org/index.php/jair/article/view/12125)) on
+each new annotation batch before it reaches the training set.
+
+### How It Works
+
+1. The **production model** generates out-of-sample predicted probabilities for
+   each sample in the batch.
+2. `cleanlab.filter.find_label_issues` computes a per-sample **noise score** using
+   class-conditional confidence matrices.  Class-conditional estimation handles
+   severe class imbalance (typical in wash-trade datasets).
+3. The top `LABEL_QUALITY_NOISE_THRESHOLD` percent (default **10 %**) of flagged
+   samples are **quarantined** — they are withheld from the training set and logged
+   for re-annotation.
+4. Per-annotator noise rates are tracked cumulatively; when an annotator's rate
+   exceeds `ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD` (default **20 %**) a structured
+   `WARNING` log is emitted.
+
+```
+New annotation batch
+        │
+        ▼
+LabelQualityEstimator.evaluate_batch()
+        │
+        ├─ cleanlab: find_label_issues()
+        │
+        ├─ top 10% noisy → quarantined   ──► data/label_quality_quarantine.ndjson
+        │
+        └─ remainder → clean_indices     ──► IncrementalTrainer
+```
+
+### Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `LABEL_QUALITY_NOISE_THRESHOLD` | `0.10` | Fraction of batch to quarantine |
+| `ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD` | `0.20` | Alert threshold for per-annotator noise rate |
+
+### Re-annotation Workflow
+
+Quarantined items are written to `data/label_quality_quarantine.ndjson` as NDJSON
+records:
+
+```json
+{
+  "quarantined_at": "2026-06-27T12:00:00+00:00",
+  "batch_index": 94,
+  "label": 0,
+  "noise_score": 0.87,
+  "annotator_id": "analyst_alice",
+  "wallet": "GABC...",
+  "status": "quarantined"
+}
+```
+
+Operators must review quarantined items and re-annotate them via the normal
+annotation workflow.  Quarantined items are **never silently deleted** — the audit
+log is the source of truth.
+
+### Bootstrapping Problem
+
+`LabelQualityEstimator` needs a trained model to generate predicted probabilities,
+but the model was trained on potentially noisy labels.  Two mitigations:
+
+1. **Use the production model** (not the model-under-training) to generate
+   probabilities.  The production model was trained on a larger, presumably cleaner
+   dataset.
+2. **Iterative refinement**: after the first clean-label retrain, re-run the
+   estimator with the new model to catch any remaining noise.
+
+### Usage Example
+
+```python
+from detection.active_learning.label_quality_estimator import LabelQualityEstimator
+from detection.model_inference import RiskScorer
+
+scorer = RiskScorer()  # production model used for out-of-sample probs
+
+estimator = LabelQualityEstimator(
+    model=scorer.models["xgb"],  # or any model with predict_proba
+    noise_threshold=0.10,
+    annotator_alert_threshold=0.20,
+)
+
+result = estimator.evaluate_batch(
+    features=feature_matrix,
+    labels=labels,
+    annotator_ids=annotator_ids,
+    wallet_ids=wallet_ids,
+)
+
+# Only add clean samples to the training set
+clean_X = feature_matrix.iloc[result["clean_indices"]]
+clean_y = labels[result["clean_indices"]]
+```
+
+### Testing
+
+```bash
+pytest tests/test_label_quality_estimator.py -v
+```
+
+Tests cover:
+- 7-of-10 mislabelled detection rate on a synthetic noisy batch
+- Per-annotator noise rate alert fires at > 20 %
+- Quarantine log contains `noise_score` and `annotator_id` for every quarantined item
+- Quarantined items are never silently deleted
