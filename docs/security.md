@@ -228,3 +228,93 @@ With model inversion defence:
   Delta = 11 points (includes noise) → cannot invert
   After 100 queries: 429 Too Many Requests → rate limited
 ```
+
+---
+
+## Membership Inference Attack Defence
+
+### Threat
+
+An adversary who can query the LedgerLens risk scoring API can determine with
+high accuracy whether a specific wallet was in the ensemble model's training
+set — a **membership inference attack**.  If successful, this reveals that
+LedgerLens *investigated* that wallet, which is sensitive operational
+intelligence even without the score itself.
+
+The loss-threshold attack (implemented in
+`detection/privacy/membership_inference.py`) demonstrates that an undefended
+model achieves an attack success rate > 60 % on a balanced member/non-member
+test set (> 10 percentage points above the 50 % random-guess baseline).
+
+### Defences applied
+
+Three complementary defences are implemented in
+`detection/privacy/membership_inference.py` and combined in
+`MembershipInferenceDefender`:
+
+#### 1. Prediction smoothing
+
+`PredictionSmoother` adds calibrated Gaussian noise (σ configurable, default
+0.3) to raw model logits before they influence the output score.  This
+narrows the confidence gap between member and non-member predictions.
+The noise level is calibrated so that AUC degrades by at most 3 percentage
+points.
+
+#### 2. Early stopping
+
+`suggest_early_stopping_epochs` measures the per-epoch gap between training
+loss and validation loss.  When the gap first exceeds `gap_threshold` (default
+0.05), it returns the recommended stopping epoch.  Stopping at or before this
+point prevents the overfitting that inflates membership-inference advantage.
+
+Use during model training:
+
+```python
+from detection.privacy.membership_inference import suggest_early_stopping_epochs
+
+rec = suggest_early_stopping_epochs(train_losses, val_losses, gap_threshold=0.05)
+print(f"Recommended stopping epoch: {rec.recommended_epoch}")
+```
+
+#### 3. Output perturbation
+
+`apply_output_perturbation` adds Laplace noise calibrated to the DP epsilon
+budget (reusing `detection.differential_privacy.laplace_scale`).  With the
+default `epsilon=2.0` and `sensitivity=1.0`, the scale parameter is 0.5.
+This bounds the membership-inference advantage under the Laplace mechanism.
+
+### Post-defence target
+
+After applying all three defences, attack success rate must be < 0.55
+(< 5 percentage points above the 50 % random baseline).
+
+### Auditing
+
+Run the membership inference auditor to verify the target is met:
+
+```bash
+python -m scripts.audit_membership_inference \
+    --data-path data/synthetic_dataset.parquet \
+    --epsilon 2.0 \
+    --output reports/mi_audit.json
+```
+
+The auditor trains a shadow model, measures the undefended attack success
+rate, applies all defences, and re-measures.  It exits with code 0 if the
+post-defence advantage target is met and code 1 otherwise.
+
+**The auditor never reports which specific wallets are in the training set;
+it reports only aggregate attack success rates.**
+
+### Residual privacy risk
+
+The defences reduce but do not eliminate membership inference risk.  Residual
+risk remains proportional to the training-set size and the model's capacity.
+For wallets with extreme feature values (outliers), the attack may still succeed
+at slightly above the 5 pp target.  Additional mitigation options include:
+
+- Reducing model capacity (fewer layers, lower depth).
+- Applying Opacus DP-SGD training (see `detection/privacy/dp_training.py`)
+  with a tighter epsilon budget.
+- Periodic model replacement that removes old training members from the active
+  model's knowledge.
