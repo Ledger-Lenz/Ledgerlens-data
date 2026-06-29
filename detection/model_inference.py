@@ -39,6 +39,7 @@ import pandas as pd
 
 from config import config
 from detection.conformal import ConformalCalibrator
+from detection.differential_privacy import laplace_scale, add_laplace_noise
 from detection.list_override import ListOverride
 from detection.model_training import (
     FEATURE_COLUMNS_EXCLUDE,
