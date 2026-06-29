@@ -818,6 +818,15 @@ We're actively looking for collaborators with experience in:
 - Stellar Development Foundation (2024) *Horizon API Documentation*. Available at: https://developers.stellar.org/api/horizon
 - Stellar Development Foundation (2024) *Soroban Smart Contract Documentation*. Available at: https://soroban.stellar.org/docs
 
+## Resources
+
+| Resource | Description |
+|----------|-------------|
+| [**`notebooks/benford_explainer.ipynb`**](notebooks/benford_explainer.ipynb) | Interactive Benford's Law explainer — visualises digit distributions, chi-square, Z-scores, and MAD on synthetic Stellar DEX trade data; shows how a wash-trade ring distorts the distribution over time |
+| [`detection/benford_engine.py`](detection/benford_engine.py) | Production Benford metrics engine (`chi_square_statistic`, `z_scores`, `mad_score`) |
+| [`docs/drift_detection.md`](docs/drift_detection.md) | PSI-based feature drift detection methodology |
+| [`docs/backtesting.md`](docs/backtesting.md) | Historical backtesting framework |
+
 ## License
 
 MIT
