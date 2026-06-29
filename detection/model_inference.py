@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from config import config
+from detection.conformal import ConformalCalibrator
 from detection.list_override import ListOverride
 from detection.model_training import (
     FEATURE_COLUMNS_EXCLUDE,
@@ -132,10 +133,47 @@ class RiskScorer:
         self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+        self.calibrators: dict[str, ConformalCalibrator] = {}
+        self._load_calibrators()
         from detection.meta_learner import LeafEmbeddingExtractor
 
         self.extractor = LeafEmbeddingExtractor(self.models)
         self.maml_adapter, self.proto_classifier = self._load_meta_learners()
+
+    def _load_calibrators(self) -> None:
+        """Load conformal calibration artifacts for each model.
+
+        Missing artifacts are logged as warnings but do not crash — a
+        maximally conservative interval is used as fallback.
+        """
+        from detection.conformal import CalibrationIntegrityError
+
+        for name in MODEL_REGISTRY:
+            path = os.path.join(self.model_dir, f"{name}_conformal.json")
+            try:
+                calibrator = ConformalCalibrator.load(path)
+                self.calibrators[name] = calibrator
+                logger.info("Loaded conformal calibration for %s", name)
+            except FileNotFoundError:
+                logger.warning(
+                    "No conformal calibration artifact for %s at %s — "
+                    "uncertainty scoring will use maximally conservative fallback",
+                    name,
+                    path,
+                )
+            except CalibrationIntegrityError:
+                logger.warning(
+                    "Conformal calibration artifact for %s failed integrity check — "
+                    "uncertainty scoring will use maximally conservative fallback",
+                    name,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to load conformal calibration for %s — "
+                    "uncertainty scoring will use maximally conservative fallback",
+                    name,
+                    exc_info=True,
+                )
 
     def _load_meta_learners(self):
         maml = None
@@ -332,6 +370,73 @@ class RiskScorer:
         if diverged:
             result["bft_divergence"] = True
         return result
+
+    def score_with_uncertainty(self, feature_row: pd.Series) -> dict:
+        """Compute risk score with conformal prediction uncertainty bounds.
+
+        Returns the existing score dict plus:
+        ``score_lower``, ``score_upper``, ``prediction_set``, ``coverage_guarantee``.
+
+        Falls back to maximally conservative bounds when calibration artifacts
+        are not available.
+        """
+        base_score = self.score(feature_row)
+
+        if not self.calibrators or not self.models:
+            return {
+                **base_score,
+                "score_lower": 0.0,
+                "score_upper": 100.0,
+                "prediction_set": [],
+                "coverage_guarantee": 1.0,
+            }
+
+        feature_cols = [c for c in feature_row.index if c not in FEATURE_COLUMNS_EXCLUDE]
+        X = feature_row[feature_cols].to_frame().T.astype(float)
+
+        lowers: list[float] = []
+        uppers: list[float] = []
+        for name, model in self.models.items():
+            calibrator = self.calibrators.get(name)
+            if calibrator is None:
+                lowers.append(0.0)
+                uppers.append(100.0)
+                continue
+            try:
+                intervals = calibrator.predict_with_interval(model, X)
+                lowers.append(intervals[0]["lower"])
+                uppers.append(intervals[0]["upper"])
+            except Exception:
+                lowers.append(0.0)
+                uppers.append(100.0)
+
+        score_lower = max(0.0, min(lowers))
+        score_upper = min(100.0, max(uppers))
+
+        coverage_guarantee = 1.0
+        if self.calibrators:
+            coverage_guarantee = 1.0 - next(iter(self.calibrators.values())).alpha
+
+        prediction_set: list[int] = []
+        for name, model in self.models.items():
+            calibrator = self.calibrators.get(name)
+            if calibrator is None:
+                continue
+            try:
+                sets = calibrator.predict_set(model, X)
+                if sets:
+                    prediction_set = sets[0].get("prediction_set", [])
+                    break
+            except Exception:
+                continue
+
+        return {
+            **base_score,
+            "score_lower": score_lower,
+            "score_upper": score_upper,
+            "prediction_set": prediction_set,
+            "coverage_guarantee": coverage_guarantee,
+        }
 
     def score_continuous(self, feature_row: pd.Series) -> float:
         """Continuous ensemble risk score in `[0, 100]` (unrounded).

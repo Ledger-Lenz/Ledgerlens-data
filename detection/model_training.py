@@ -36,6 +36,7 @@ from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 from config import config
+from detection.conformal import ConformalCalibrator
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -221,6 +222,19 @@ def train_models(
         X_train, y_train = _adversarial_augment(X_train, y_train, ratio, random_state)
         logger.info("Adversarial augmentation: training set expanded to %d rows", len(X_train))
 
+    # Reserve a calibration split (10% of training data, stratified by label)
+    # This is separate from the test split and is never used during model training.
+    cal_size = max(1, int(len(X_train) * 0.1))
+    X_cal, X_train, y_cal, y_train = train_test_split(
+        X_train, y_train, test_size=len(X_train) - cal_size,
+        random_state=random_state, stratify=y_train,
+    )
+    logger.info(
+        "Reserved calibration split: %d rows (indices 0..%d) — stratified by label",
+        cal_size,
+        cal_size - 1,
+    )
+
     smote = SMOTE(random_state=random_state)
     X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
 
@@ -247,6 +261,23 @@ def train_models(
         if adversarial_augmentation:
             metrics["auc_roc_adversarial"] = float(roc_auc_score(y_test, probs_adv))
 
+        calibrator = ConformalCalibrator(alpha=0.10, random_state=random_state)
+        calibrator.calibrate(model, X_cal, y_cal)
+        # Measure empirical coverage on the calibration split
+        cal_results = calibrator.predict_set(model, X_cal)
+        cal_covered = sum(
+            1 for i, r in enumerate(cal_results) if int(y_cal.iloc[i]) in r["prediction_set"]
+        )
+        empirical_coverage = cal_covered / len(y_cal) if len(y_cal) > 0 else 0.0
+        metrics["conformal_empirical_coverage"] = float(round(empirical_coverage, 4))
+        metrics["conformal_q_hat"] = float(round(calibrator.q_hat, 6)) if calibrator.q_hat is not None else 0.0
+        metrics["calibration_split_size"] = len(X_cal)
+        metrics["calibration_split_index_range"] = f"0..{len(X_cal) - 1}"
+
+        # Save per-model calibration artifact
+        cal_artifact_path = os.path.join(config.MODEL_DIR, f"{name}_conformal.json")
+        calibrator.save(cal_artifact_path)
+
         results[name] = {
             "model": model,
             "metrics": metrics,
@@ -256,8 +287,11 @@ def train_models(
         "results": results,
         "feature_columns": list(X.columns),
         "feature_distributions": compute_feature_distributions(X),
+        "X_cal": X_cal,
+        "y_cal": y_cal,
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "n_cal": len(X_cal),
         "X_test": X_test,
         "y_test": y_test,
     }

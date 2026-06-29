@@ -146,7 +146,14 @@ class StreamingScorer:
         try:
             import time
             t0 = time.time()
-            res = self._risk_scorer.score(feature_row)
+
+            # Use score_with_uncertainty when calibration artifacts are available;
+            # fall back to score() otherwise.
+            if self._risk_scorer.calibrators:
+                res = self._risk_scorer.score_with_uncertainty(feature_row)
+            else:
+                res = self._risk_scorer.score(feature_row)
+
             latency_ms = (time.time() - t0) * 1000
             model_version = self._risk_scorer.metadata.get("model_version", "unknown") if self._risk_scorer.metadata else "unknown"
             

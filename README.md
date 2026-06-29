@@ -556,12 +556,32 @@ pub struct RiskScore {
     pub ml_flag: bool,       // True if ML classifier flagged
     pub timestamp: u64,      // Ledger timestamp of last update
     pub confidence: u32,     // Model confidence 0-100
+    pub score_lower: u32,    // Conformal prediction lower bound (×100)
+    pub score_upper: u32,    // Conformal prediction upper bound (×100)
+    pub coverage_guarantee: u32,  // Coverage probability as percentage (e.g. 90)
 }
 ```
 
-Produced in this repo by `detection/model_inference.py::RiskScorer.score()`.
+Produced in this repo by `detection/model_inference.py::RiskScorer.score()`
+(uncertainty fields via `RiskScorer.score_with_uncertainty()`).
 Mirrors `ledgerlens-contract`'s `submit_score` payload and
 `ledgerlens-api`'s `/score/{wallet}/{pair}` response.
+
+##### Uncertainty Fields
+
+Every risk score now includes Conformal Prediction intervals:
+
+| Field | Type | Description |
+|---|---|---|
+| `score_lower` | float | Lower bound of the prediction interval (0–100) |
+| `score_upper` | float | Upper bound of the prediction interval (0–100) |
+| `coverage_guarantee` | float | Probability the true score lies in the interval (default 0.90) |
+| `prediction_set` | list[int] | Set of plausible class labels (classification only) |
+
+When calibration artifacts are not available, maximally conservative bounds
+(`score_lower=0.0`, `score_upper=100.0`, `coverage_guarantee=1.0`) are
+returned. See [`docs/uncertainty_quantification.md`](docs/uncertainty_quantification.md)
+for the full methodology, fallback behaviour, and artifact integrity model.
 
 **`ring_id`** (API/storage only, not on-chain): each persisted `RiskScore`
 record additionally carries a nullable `ring_id: str | None` — a stable
