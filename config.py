@@ -43,6 +43,15 @@ class Config:
     LEDGERLENS_CONTRACT_ID: str = os.getenv("LEDGERLENS_CONTRACT_ID", "")
     LEDGERLENS_SUBMITTER_SECRET: str = os.getenv("LEDGERLENS_SUBMITTER_SECRET", "")
 
+    # ZK proof batching
+    ZK_BATCH_SIZE: int = int(os.getenv("ZK_BATCH_SIZE", "10"))
+    ZK_BATCH_TIMEOUT_SECONDS: int = int(os.getenv("ZK_BATCH_TIMEOUT_SECONDS", "300"))
+
+    # Circuit breaker defaults
+    CB_FAILURE_THRESHOLD: int = int(os.getenv("CB_FAILURE_THRESHOLD", "5"))
+    CB_TIMEOUT_SECONDS: int = int(os.getenv("CB_TIMEOUT_SECONDS", "60"))
+    CB_SUCCESS_THRESHOLD: int = int(os.getenv("CB_SUCCESS_THRESHOLD", "2"))
+
     # Real-time streaming / alerting
     ALERT_CHANNEL: str = os.getenv("ALERT_CHANNEL", "stdout")
     ALERT_WEBHOOK_URL: str | None = os.getenv("ALERT_WEBHOOK_URL")

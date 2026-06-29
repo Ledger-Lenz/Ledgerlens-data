@@ -9,6 +9,17 @@ Reconnection on Horizon SSE failures is handled at two levels:
   2. _stream_pair() restarts the generator if stream_trades() raises after
      exhausting its own retries.
 
+Circuit breakers
+----------------
+Pass ``circuit_breakers`` to wrap the model-inference call with independent
+per-component ``CircuitBreaker`` instances.  Supported keys:
+  - ``"inference"``  — wraps ``scorer.score_wallet()``
+  - ``"db_write"``   — wraps ``dispatcher.dispatch()``
+  - ``"benford"``    — wraps any explicit Benford computation (future extension)
+
+When a circuit is OPEN the pipeline falls back to the last cached score for
+the wallet-pair so alert delivery can continue uninterrupted.
+
 Shutdown
 --------
 Call pipeline.run() from the main thread.  SIGINT (Ctrl-C) sets the internal
@@ -26,6 +37,7 @@ from config import config
 from ingestion.horizon_streamer import stream_trades
 from streaming.alert_dispatcher import AlertDispatcher
 from streaming.feature_buffer import FeatureBuffer, StreamingScorer
+from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +52,7 @@ class StreamingPipeline:
         scorer: StreamingScorer,
         dispatcher: AlertDispatcher,
         pairs: list[tuple[str, str]] | None = None,
+        circuit_breakers: dict[str, CircuitBreaker] | None = None,
     ):
         self._buffer = buffer
         self._scorer = scorer
@@ -47,6 +60,9 @@ class StreamingPipeline:
         self._pairs = list(pairs) if pairs is not None else list(config.WATCHED_ASSET_PAIRS)
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
+        self._circuit_breakers: dict[str, CircuitBreaker] = circuit_breakers or {}
+        # Wallet → last successfully computed score (used as fallback when OPEN)
+        self._score_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,6 +107,33 @@ class StreamingPipeline:
     # Internal
     # ------------------------------------------------------------------
 
+    def _score_wallet_with_cb(self, wallet: str) -> dict | None:
+        cb = self._circuit_breakers.get("inference")
+        if cb is None:
+            score = self._scorer.score_wallet(wallet)
+        else:
+            try:
+                score = cb.call(self._scorer.score_wallet, wallet)
+            except CircuitOpenError:
+                score = self._score_cache.get(wallet)
+                if score is not None:
+                    logger.debug(
+                        "Inference circuit OPEN — serving cached score for %s", wallet
+                    )
+        if score is not None:
+            self._score_cache[wallet] = score
+        return score
+
+    def _dispatch_with_cb(self, wallet: str, score: dict, pair_id: str) -> None:
+        cb = self._circuit_breakers.get("db_write")
+        if cb is None:
+            self._dispatcher.dispatch(wallet, score, pair_id)
+        else:
+            try:
+                cb.call(self._dispatcher.dispatch, wallet, score, pair_id)
+            except CircuitOpenError:
+                logger.debug("DB-write circuit OPEN — alert for %s suppressed", wallet)
+
     def _build_sdk_pairs(self) -> list[tuple[SdkAsset, SdkAsset]]:
         xlm = SdkAsset.native()
         pairs = []
@@ -114,9 +157,9 @@ class StreamingPipeline:
                     self._buffer.update(trade)
                     pair_id = trade.base_asset.pair_id(trade.counter_asset)
                     for wallet in (trade.base_account, trade.counter_account):
-                        score = self._scorer.score_wallet(wallet)
+                        score = self._score_wallet_with_cb(wallet)
                         if score is not None:
-                            self._dispatcher.dispatch(wallet, score, pair_id)
+                            self._dispatch_with_cb(wallet, score, pair_id)
             except Exception as exc:
                 if self._stop_event.is_set():
                     return

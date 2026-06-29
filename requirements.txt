@@ -25,6 +25,14 @@ requests>=2.31.0
 # WebSocket server (streaming/ws_server.py)
 websockets>=12.0
 
+# Cryptography (mTLS / certificate management)
+cryptography>=42.0.0
+
+# Federated coordinator API
+fastapi>=0.110.0
+uvicorn>=0.27.0
+httpx>=0.27.0
+
 # Testing
 pytest>=8.0.0
 pytest-asyncio>=0.23.0

@@ -216,3 +216,66 @@ All threads are `daemon=True` so they are automatically killed if the main proce
 - The URL is never written to logs.
 - The WebSocket server binds to `127.0.0.1` by default; opt-in is required for external binding.
 - `_clients` is mutated only inside the asyncio event loop, preventing data races.
+
+---
+
+## Circuit Breaker Pattern
+
+`StreamingPipeline` supports optional per-component circuit breakers to prevent
+backpressure from a slow downstream service from stalling the entire pipeline.
+
+### States
+
+```
+          failure_threshold consecutive failures
+CLOSED ─────────────────────────────────────────► OPEN
+  ▲                                                 │
+  │  success_threshold consecutive successes        │ timeout_seconds elapsed
+  │                                                 ▼
+  └───────────────────────────────────────── HALF_OPEN
+```
+
+| State | Behaviour |
+|-------|-----------|
+| **CLOSED** | All calls pass through normally. Consecutive failure count resets on any success. |
+| **OPEN** | All calls are rejected immediately with `CircuitOpenError`. The pipeline falls back to the last cached score for the wallet-pair. |
+| **HALF_OPEN** | Calls are allowed through as recovery probes. Two consecutive successes close the circuit; any failure re-opens it. |
+
+### Configuration
+
+| Parameter | Default | Env var |
+|-----------|---------|---------|
+| `failure_threshold` | 5 | `CB_FAILURE_THRESHOLD` |
+| `timeout_seconds` | 60 | `CB_TIMEOUT_SECONDS` |
+| `success_threshold` | 2 | `CB_SUCCESS_THRESHOLD` |
+
+### Supported components
+
+| Circuit key | Protected call | Fallback |
+|-------------|---------------|----------|
+| `"inference"` | `scorer.score_wallet()` (Benford + ML inference) | Last cached score |
+| `"db_write"` | `dispatcher.dispatch()` | Alert suppressed |
+
+### Prometheus monitoring
+
+When a circuit opens, the `ledgerlens_circuit_open` gauge is set to 1 (labelled
+by `component`); it returns to 0 on recovery.  Without `prometheus_client`
+installed the gauge is tracked in-process via `utils.circuit_breaker.get_open_gauges()`.
+
+### Wiring up circuit breakers
+
+```python
+from utils.circuit_breaker import CircuitBreaker
+from streaming.pipeline import StreamingPipeline
+
+cbs = {
+    "inference": CircuitBreaker("inference", failure_threshold=5, timeout_seconds=60),
+    "db_write":  CircuitBreaker("db_write",  failure_threshold=5, timeout_seconds=60),
+}
+pipeline = StreamingPipeline(buffer, scorer, dispatcher, circuit_breakers=cbs)
+```
+
+### Error messages
+
+`CircuitOpenError` messages never include internal stack traces or database
+connection strings — they contain only the component name.
