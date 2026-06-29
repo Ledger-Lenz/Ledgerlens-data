@@ -203,6 +203,7 @@ class RiskScorer:
 
         self.extractor = LeafEmbeddingExtractor(self.models)
         self.maml_adapter, self.proto_classifier = self._load_meta_learners()
+        self.seq_model = self._load_seq_model()
 
     def _load_calibrators(self) -> None:
         """Load conformal calibration artifacts for each model.
@@ -333,6 +334,32 @@ class RiskScorer:
                 data = json.load(f)
             return data.get("selected_features")
         return None
+
+    def _load_seq_model(self):
+        """Load the transformer sequence model if enabled and available.
+
+        Returns the model in eval mode, or ``None`` when the feature is
+        disabled (``SEQ_MODEL_ENABLED=false``) or before the first training
+        run (artifact absent).  Never raises — a missing artifact is a
+        normal pre-training state.
+        """
+        if not config.SEQ_MODEL_ENABLED:
+            return None
+        try:
+            from detection.trade_sequence_transformer import TradeSequenceTransformer
+
+            model = TradeSequenceTransformer.load(
+                model_dir=self.model_dir,
+                verify_integrity=True,
+            )
+            model.eval()
+            return model
+        except Exception as exc:
+            logger.info(
+                "Sequence model not loaded (this is expected before first training run): %s",
+                exc,
+            )
+            return None
 
     def _ensemble_probabilities(self, feature_row: pd.Series) -> list[float]:
         """Per-model wash-trade probabilities for a single feature row.

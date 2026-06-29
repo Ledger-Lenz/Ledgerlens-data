@@ -692,3 +692,136 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 | `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
 | `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
 | `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |
+
+---
+
+## Redis Feature Store — #183
+
+### Motivation
+
+The streaming scorer calls `buffer.get_feature_row(wallet)` on every score request, which rebuilds all 37+ features from raw trade data.  For high-frequency pairs (1 000+ trades/min), this recomputation dominates latency.  The Redis feature store caches precomputed feature vectors keyed by `(wallet_id, pair_id)` so the scorer can serve them in **< 1 ms** on a cache hit.
+
+### Architecture
+
+```
+New trade event arrives (Horizon SSE / Kafka)
+          │
+          ▼
+FeatureBuffer.update(trade)
+          │
+          ├──→ StreamingScorer.score_wallet()
+          │         │
+          │         ▼
+          │    RedisFeatureStore.get_or_compute(
+          │        wallet, pair,
+          │        compute_fn=buffer.get_feature_row
+          │    )
+          │         │
+          │     hit ├──→ return cached features  (<1 ms)
+          │         │
+          │    miss └──→ compute features (≤50 ms)
+          │                 │
+          │                 └──→ store.put(features, ttl=window_ttl)
+          │
+          └──→ FeatureStoreWorker.submit_trade_event(wallet, pair)
+                    │  (non-blocking queue)
+                    │
+                    ▼
+               Background thread
+               buffer.get_feature_row(wallet)
+               store.put(features, window_hours=1)
+```
+
+### Key schema
+
+```
+feat:{sha256(wallet_id)[:16]}:{pair_id}
+```
+
+Value: msgpack-encoded `{"v": 1, "features": {...}}`.
+
+The wallet address is hashed to avoid embedding 56-char Stellar keys in Redis key space.  16 hex chars (64 bits) provides negligible collision probability across millions of wallets.
+
+### Serialisation: msgpack only
+
+All feature vectors are serialised with [msgpack](https://msgpack.org/), never pickle.  This prevents deserialisation of arbitrary Python objects from a compromised Redis instance.  The `_validate_features()` helper rejects any value whose type is not in `{int, float, str, bool, list, dict, None}` before the bytes reach Redis.
+
+### Per-window TTLs
+
+Feature vectors are expired automatically:
+
+| Window | Default TTL |
+|---|---|
+| 1 h | 3 600 s (1 h) |
+| 4 h | 14 400 s (4 h) |
+| 24 h | 86 400 s (24 h) |
+| 168 h (7 d) | 604 800 s (7 d) |
+| 720 h (30 d) | 2 592 000 s (30 d) |
+
+Configured via `FEATURE_STORE_WINDOW_TTLS` (see below).
+
+### Failover behaviour
+
+When Redis is unavailable:
+- `get()` returns `None` → scorer falls back to direct recomputation (same behaviour as pre-store).
+- `put()` returns `False` silently (no exception).
+- A `ledgerlens_feature_store_fallback_total` Prometheus counter is incremented.
+
+Set `FEATURE_STORE_FALLBACK_ENABLED=false` to disable the fallback and surface errors directly (useful for debugging Redis connectivity issues).
+
+### Background refresh worker
+
+`streaming/feature_store_worker.py` runs a daemon thread that:
+1. Receives `(wallet_id, pair_id)` refresh tasks via an internal `queue.Queue`.
+2. Rebuilds the feature row from `FeatureBuffer`.
+3. Writes it to Redis with the 1 h TTL.
+
+The queue is capped at 1 000 items.  When full, new tasks are dropped silently — the scorer's fallback handles the miss.  This prevents a slow Redis from backpressuring the ingestion path.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `FEATURE_STORE_REDIS_URL` | `redis://localhost:6379/1` | Redis connection URL (overrides `REDIS_URL` for the feature store) |
+| `FEATURE_STORE_REDIS_TLS` | `false` | Enable TLS (`rediss://` URL implies TLS) |
+| `FEATURE_STORE_REDIS_TLS_CA_CERT` | — | Path to CA cert for TLS verification |
+| `FEATURE_STORE_REDIS_POOL_SIZE` | `10` | Max connections in the pool |
+| `FEATURE_STORE_WINDOW_TTLS` | `1:3600,4:14400,24:86400,168:604800,720:2592000` | Per-window TTLs (hours:seconds, comma-separated) |
+| `FEATURE_STORE_FALLBACK_ENABLED` | `true` | Fall back to direct computation when Redis is down |
+
+### TLS configuration
+
+```bash
+# Encrypted connection to a managed Redis (AWS ElastiCache, Redis Cloud, etc.)
+FEATURE_STORE_REDIS_URL=rediss://your-redis.cache.amazonaws.com:6380/1
+FEATURE_STORE_REDIS_TLS=true
+FEATURE_STORE_REDIS_TLS_CA_CERT=/etc/ssl/certs/ca-certificates.crt
+```
+
+### Prometheus metrics
+
+| Metric | Labels | Description |
+|---|---|---|
+| `ledgerlens_feature_cache_hits_total` | `store` | Cache hits |
+| `ledgerlens_feature_cache_misses_total` | `store` | Cache misses |
+| `ledgerlens_feature_store_fallback_total` | `store` | Redis fallback events |
+| `ledgerlens_feature_store_refreshed_total` | — | Background refreshes written |
+| `ledgerlens_feature_store_refresh_errors_total` | — | Background refresh errors |
+
+### Local development with Docker Compose
+
+A Redis service is included in `docker-compose.yml`.  Start it with:
+
+```bash
+docker-compose up redis
+```
+
+The default `FEATURE_STORE_REDIS_URL=redis://localhost:6379/1` connects to this instance.
+
+### Testing
+
+Unit tests use [fakeredis](https://github.com/cunla/fakeredis-py) — no live Redis required:
+
+```bash
+pytest tests/test_redis_feature_store.py -v
+```
