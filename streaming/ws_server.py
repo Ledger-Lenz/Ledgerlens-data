@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from config import config
 from streaming.pubsub_router import PubSubRouter
+from streaming.ws_abuse_detector import AbuseDetector, AbuseVerdict
 from streaming.ws_auth import JWTAuthenticator
 from utils.logging import get_logger
 
@@ -239,6 +240,7 @@ _replay_buffer = ReplayBuffer(config.WS_REPLAY_BUFFER_SIZE)
 _router = PubSubRouter()
 _auth: JWTAuthenticator | None = None
 _loop: asyncio.AbstractEventLoop | None = None
+_abuse_detector = AbuseDetector()
 
 
 def _get_auth() -> JWTAuthenticator:
@@ -395,6 +397,7 @@ async def _handler(websocket) -> None:
 
         if client_id:
             _router.disconnect(client_id)
+            _abuse_detector.reset(client_id)
             with _clients_lock:
                 _clients.pop(client_id, None)
                 ws_connected_clients.set(len(_clients))
@@ -447,6 +450,23 @@ async def _process_inbound(websocket, client_id: str, permissions: set[str]) -> 
             try:
                 payload = json.loads(message_str)
                 msg_type = payload.get("type")
+
+                # Abuse detection: check rate-limit and wallet-targeting
+                # Use the channel from a subscribe payload if present, else "unknown"
+                check_channel = ""
+                if msg_type == "subscribe":
+                    channels_val = payload.get("channels", [])
+                    check_channel = channels_val[0] if channels_val else ""
+                verdict = _abuse_detector.record(client_id, check_channel)
+                if verdict.blocked:
+                    error = ErrorMessage(
+                        code=verdict.reason,
+                        message="Connection blocked due to abuse detection.",
+                        retry_after_ms=verdict.retry_after_seconds * 1000,
+                    )
+                    await websocket.send(error.model_dump_json())
+                    await websocket.close(code=1008, reason=verdict.reason)
+                    return
 
                 if msg_type == "subscribe":
                     await _handle_subscribe(websocket, client_id, permissions, payload)

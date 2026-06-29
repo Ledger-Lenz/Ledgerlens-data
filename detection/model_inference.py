@@ -30,6 +30,7 @@ import json
 import math
 import os
 import statistics
+import time
 from typing import Any, cast
 
 import joblib
@@ -149,6 +150,47 @@ def _benford_flag(feature_row: pd.Series) -> bool:
     return bool(
         benford_mad_cols and (feature_row[benford_mad_cols] > BENFORD_MAD_FLAG_THRESHOLD).any()
     )
+
+
+def _apply_output_perturbation(
+    score: int, caller_id: str = "internal", timestamp_bucket: int | None = None
+) -> int:
+    """Apply Laplace output perturbation to defend against model inversion (Issue #264).
+
+    The random seed is derived from (caller_id, timestamp_bucket) to ensure:
+    - Different results for identical queries (prevents averaging attacks)
+    - Reproducibility within the same time bucket (for testing)
+
+    Args:
+        score: The clean 0-100 risk score
+        caller_id: Caller identifier (default "internal" skips perturbation)
+        timestamp_bucket: Timestamp divided by a bucketing interval (e.g. 60s)
+
+    Returns:
+        Perturbed score, rounded to SCORE_ROUNDING_GRANULARITY
+    """
+    # Internal pipeline calls use caller_id="internal" and skip perturbation
+    if caller_id == "internal":
+        return score
+
+    # Derive seed from (caller_id, timestamp_bucket) for seeded randomness
+    if timestamp_bucket is None:
+        timestamp_bucket = int(time.time())
+
+    seed_str = f"{caller_id}:{timestamp_bucket}"
+    seed = int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16) % (2**31 - 1)
+    rng = np.random.Generator(np.random.PCG64(seed))
+
+    # Compute Laplace scale: sensitivity / epsilon
+    # Sensitivity is the max score change from one trade, bounded by 100
+    sensitivity = 100.0
+    scale = laplace_scale(sensitivity, config.MODEL_INVERSION_DP_EPSILON)
+
+    # Add noise and round
+    perturbed = add_laplace_noise(float(score), scale, rng)
+    perturbed = np.clip(perturbed, 0.0, 100.0)
+    rounded = int(round(perturbed / config.SCORE_ROUNDING_GRANULARITY)) * config.SCORE_ROUNDING_GRANULARITY
+    return rounded
 
 
 class RiskScorer:
@@ -287,6 +329,16 @@ class RiskScorer:
                 models[name] = model
         return models
 
+    def _load_selected_features(self) -> list[str] | None:
+        if not config.FEATURE_SELECTION_ENABLED:
+            return None
+        path = config.FEATURE_SELECTION_PATH
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            return data.get("selected_features")
+        return None
+
     def _ensemble_probabilities(self, feature_row: pd.Series) -> list[float]:
         """Per-model wash-trade probabilities for a single feature row.
 
@@ -300,7 +352,11 @@ class RiskScorer:
 
         feature_cols = [c for c in feature_row.index if c not in FEATURE_COLUMNS_EXCLUDE]
 
-        if self.metadata:
+        # Apply feature selection filter when enabled
+        if self.selected_features is not None:
+            feature_cols = [c for c in feature_cols if c in self.selected_features]
+
+        if self.metadata and self.selected_features is None:
             current_hash = compute_feature_schema_hash(feature_cols)
             expected_hash = self.metadata["feature_schema_hash"]
 
@@ -350,6 +406,11 @@ class RiskScorer:
 
         Returns a dict matching the on-chain `RiskScore` shape:
             {score, benford_flag, ml_flag, confidence}
+
+        Args:
+            feature_row: Feature matrix row for the wallet/pair
+            caller_id: Caller identifier (e.g. "api.user123", "internal"). 
+                      "internal" skips output perturbation; external callers get Laplace noise.
         """
         override = self._check_override(feature_row)
         if override is not None:
@@ -383,8 +444,10 @@ class RiskScorer:
                 self.weights.get(name, 0.0) * prob
                 for name, prob in zip(self.models, probs, strict=True)
             )
+            clean_score = int(round(avg_prob * 100))
+            perturbed_score = _apply_output_perturbation(clean_score, caller_id)
             return {
-                "score": int(round(avg_prob * 100)),
+                "score": perturbed_score,
                 "benford_flag": _benford_flag(feature_row),
                 "ml_flag": bool(avg_prob >= ML_FLAG_THRESHOLD),
                 "confidence": _confidence_from_probs(probs, avg_prob),
@@ -413,8 +476,9 @@ class RiskScorer:
             return result
 
         avg_prob = final_score / 100.0
+        perturbed_score = _apply_output_perturbation(int(round(final_score)), caller_id)
         result = {
-            "score": int(round(final_score)),
+            "score": perturbed_score,
             "benford_flag": _benford_flag(feature_row),
             "ml_flag": bool(avg_prob >= ML_FLAG_THRESHOLD),
             "confidence": _confidence_from_probs(probs, avg_prob),

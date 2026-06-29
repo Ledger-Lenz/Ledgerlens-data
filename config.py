@@ -63,6 +63,11 @@ class Config:
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
     )
 
+    # Silence window for correlated alert deduplication (alerts/deduplicator.py).
+    ALERT_DEDUP_WINDOW_SECONDS: int = min(
+        300, max(5, int(os.getenv("ALERT_DEDUP_WINDOW_SECONDS", "60")))
+    )
+
     RISK_SCORE_FLAG_THRESHOLD: int = int(os.getenv("RISK_SCORE_FLAG_THRESHOLD", "70"))
     # Set to a non-zero integer to pin the alert threshold and disable the RL agent.
     # E.g. THRESHOLD_RL_PINNED=75 → agent is bypassed, threshold is fixed at 75.
@@ -96,6 +101,11 @@ class Config:
     # Fire an alert when any feature PSI exceeds this value.
     DRIFT_PSI_THRESHOLD: float = float(os.getenv("DRIFT_PSI_THRESHOLD", "0.2"))
 
+    # Sliding window covariance shift detection (MMD)
+    DRIFT_REFERENCE_WINDOW_HOURS: int = int(os.getenv("DRIFT_REFERENCE_WINDOW_HOURS", "168"))
+    DRIFT_TEST_WINDOW_HOURS: int = int(os.getenv("DRIFT_TEST_WINDOW_HOURS", "1"))
+    DRIFT_CHECK_INTERVAL_MINUTES: int = int(os.getenv("DRIFT_CHECK_INTERVAL_MINUTES", "30"))
+
     # Forensic reporting
     REPORT_CONCURRENCY: int = int(os.getenv("REPORT_CONCURRENCY", "4"))
     # SHAP interaction values are O(n * d^2) — disable by default.
@@ -107,6 +117,11 @@ class Config:
     WASH_RING_RESOLUTION: float = float(os.getenv("WASH_RING_RESOLUTION", "1.0"))
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
+
+    # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
+    HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
+    HORIZON_MAX_RETRIES: int = int(os.getenv("HORIZON_MAX_RETRIES", "5"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # Real-time streaming / alerting
     # STREAMING_BACKEND selects the ingestion transport:
@@ -144,6 +159,12 @@ class Config:
     WS_REPLAY_BUFFER_SIZE: int = int(os.getenv("WS_REPLAY_BUFFER_SIZE", "1000"))
     WS_RATE_LIMIT_MSGS_PER_SECOND: int = int(os.getenv("WS_RATE_LIMIT_MSGS_PER_SECOND", "100"))
 
+    # WebSocket abuse detection (issue #223)
+    WS_ABUSE_MAX_REQUESTS_PER_MINUTE: int = int(os.getenv("WS_ABUSE_MAX_REQUESTS_PER_MINUTE", "300"))
+    WS_ABUSE_MAX_DISTINCT_WALLETS: int = int(os.getenv("WS_ABUSE_MAX_DISTINCT_WALLETS", "50"))
+    WS_ABUSE_WALLET_WINDOW_SECONDS: int = int(os.getenv("WS_ABUSE_WALLET_WINDOW_SECONDS", "60"))
+    WS_ABUSE_BLOCK_DURATION_SECONDS: int = int(os.getenv("WS_ABUSE_BLOCK_DURATION_SECONDS", "300"))
+
     # Differentially private neural training (DP-SGD via Opacus)
     DP_TARGET_EPSILON: float = float(os.getenv("DP_TARGET_EPSILON", "8.0"))
     DP_TARGET_DELTA: float = float(os.getenv("DP_TARGET_DELTA", "1e-5"))
@@ -166,9 +187,26 @@ class Config:
     BENFORD_CI_ENABLED: bool = os.getenv("BENFORD_CI_ENABLED", "false").lower() == "true"
     BRIDGE_ROUNDTRIP_WINDOW_HOURS: int = int(os.getenv("BRIDGE_ROUNDTRIP_WINDOW_HOURS", "72"))
 
+    # Differential privacy for SHAP explanations (model inversion defence)
+    DP_EPSILON: float = float(os.getenv("DP_EPSILON", "1.0"))
+    DP_DELTA: float = float(os.getenv("DP_DELTA", "1e-5"))
+    DP_RENYI_QUERY_THRESHOLD: int = int(os.getenv("DP_RENYI_QUERY_THRESHOLD", "100"))
+    DP_RENYI_NOISE_MULTIPLIER: float = float(os.getenv("DP_RENYI_NOISE_MULTIPLIER", "3.0"))
+    DP_DEFAULT_SENSITIVITY: float = float(os.getenv("DP_DEFAULT_SENSITIVITY", "0.05"))
+    SHAP_SENSITIVITY_PATH: str = os.getenv("SHAP_SENSITIVITY_PATH", "models/shap_sensitivity.json")
+
+    # Model inversion attack defence
+    MODEL_INVERSION_QUERY_LIMIT: int = int(os.getenv("MODEL_INVERSION_QUERY_LIMIT", "100"))
+    MODEL_INVERSION_DP_EPSILON: float = float(os.getenv("MODEL_INVERSION_DP_EPSILON", "1.0"))
+    SCORE_ROUNDING_GRANULARITY: int = int(os.getenv("SCORE_ROUNDING_GRANULARITY", "1"))
+
     # Graph Neural Network encoder (detection/gnn_encoder.py)
     GNN_EMBEDDING_DIM: int = int(os.getenv("GNN_EMBEDDING_DIM", "32"))
     GNN_HIDDEN_DIM: int = int(os.getenv("GNN_HIDDEN_DIM", "64"))
+
+    # Feature selection
+    FEATURE_SELECTION_ENABLED: bool = os.getenv("FEATURE_SELECTION_ENABLED", "").lower() in ("1", "true", "yes")
+    FEATURE_SELECTION_PATH: str = os.getenv("FEATURE_SELECTION_PATH", "models/selected_features.json")
 
     # Annotation integrity
     ANNOTATION_HMAC_SECRET: str = os.getenv("ANNOTATION_HMAC_SECRET", "")
@@ -248,7 +286,7 @@ class Config:
             filename = os.path.basename(filepath)
             asset_key = filename[:-len("_benford_windows.json")]
             try:
-                with open(filepath, "r") as f:
+                with open(filepath) as f:
                     data = json.load(f)
                     if isinstance(data, dict) and "asset" in data and "windows" in data:
                         cls.ASSET_BENFORD_WINDOWS[data["asset"]] = [int(w) for w in data["windows"]]
@@ -266,3 +304,11 @@ class Config:
 
 config = Config()
 Config.load_asset_benford_windows()
+
+# Validate security parameters
+if config.MODEL_INVERSION_QUERY_LIMIT <= 0:
+    raise ValueError(f"MODEL_INVERSION_QUERY_LIMIT must be > 0, got {config.MODEL_INVERSION_QUERY_LIMIT}")
+if config.MODEL_INVERSION_DP_EPSILON <= 0:
+    raise ValueError(f"MODEL_INVERSION_DP_EPSILON must be > 0, got {config.MODEL_INVERSION_DP_EPSILON}")
+if config.SCORE_ROUNDING_GRANULARITY <= 0:
+    raise ValueError(f"SCORE_ROUNDING_GRANULARITY must be > 0, got {config.SCORE_ROUNDING_GRANULARITY}")

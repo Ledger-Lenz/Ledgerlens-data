@@ -5,6 +5,10 @@ data ingestion and fraud-detection layer — see the README's
 [Organization Map](README.md#organization-map) for how it fits with the
 other LedgerLens repos.
 
+## Security
+
+Before implementing changes that touch API endpoints, model loading, training data, or database persistence, review the [Security Threat Model](docs/security_threat_model.md) for STRIDE analysis and attack surface identification. High-risk components may require security architect review.
+
 ## Development setup
 
 ```bash
@@ -70,6 +74,18 @@ schedule (Sundays 03:00 UTC) and on manual `workflow_dispatch` — it does
   out in the PR description so consuming repos (`ledgerlens-core`,
   `ledgerlens-api`, `ledgerlens-contract`, `ledgerlens-dashboard`) can be
   updated.
+
+## Security
+
+See [`docs/security_threat_model.md`](docs/security_threat_model.md) for the comprehensive STRIDE-based threat model. Key mitigations:
+
+- **Model integrity:** Ed25519 signatures on `metrics.json`; SHA-256 verification of `.joblib` files
+- **Label poisoning:** HMAC-SHA256 on annotations; baseline distribution tracking
+- **Model inversion:** Gaussian-mechanism DP on SHAP explanations; per-wallet query budgeting
+- **Byzantine robustness:** Trimmed-mean ensemble voting
+- **Credential security:** Never commit signing keys or API credentials to version control
+
+All security-relevant PRs must reference the threat model and document which mitigations are affected.
 
 ## Code style
 

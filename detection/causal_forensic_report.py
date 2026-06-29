@@ -48,6 +48,7 @@ class CausalForensicReport:
     shap_explanations: list[dict] = field(default_factory=list)
     causal_attribution: CausalAttribution | None = None
     propagation_path: PropagationPath | None = None
+    sensitivity_results: list[dict] = field(default_factory=list)
 
 
 class CausalForensicReportGenerator:
@@ -180,6 +181,32 @@ class CausalForensicReportGenerator:
                     ],
                 )
 
+        sensitivity_results: list[dict] = []
+        if causal and causal_attribution is not None:
+            from detection.causal_sensitivity import analyse_attribution
+
+            base_rr = risk_score.get("score", 50) / 50.0 if risk_score.get("score", 0) > 0 else 1.0
+            cf_rr = (
+                causal_attribution.counterfactual_score / 50.0
+                if causal_attribution.counterfactual_score > 0
+                else 1.0
+            )
+            for label, rr in [
+                ("overall score vs counterfactual", base_rr / max(cf_rr, 0.01)),
+                ("interventional wash-trade removal", base_rr / max(causal_attribution.interventional_score_if_no_wash / 50.0, 0.01)),
+            ]:
+                try:
+                    sr = analyse_attribution(label, rr)
+                    sensitivity_results.append({
+                        "label": sr.attribution_label,
+                        "risk_ratio": sr.risk_ratio,
+                        "evalue": sr.evalue,
+                        "low_confidence": sr.low_confidence,
+                        "interpretation": sr.interpretation,
+                    })
+                except Exception:  # noqa: BLE001
+                    pass
+
         return CausalForensicReport(
             wallet=wallet,
             asset_pair=asset_pair,
@@ -187,4 +214,5 @@ class CausalForensicReportGenerator:
             shap_explanations=shap_explanations,
             causal_attribution=causal_attribution,
             propagation_path=propagation_path,
+            sensitivity_results=sensitivity_results,
         )

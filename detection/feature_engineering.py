@@ -160,6 +160,29 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "Solana-chain risk score is available (from external provider, cached), "
         "this feature surfaces that signal. Value [0, 100]; 0 if no link found."
     ),
+    # Temporal KGE features
+    "temporal_kge_collab_score": (
+        "Predicted collaboration likelihood from temporal knowledge graph embedding. "
+        "TComplEx model scores likelihood of future trading relationships based on "
+        "temporal patterns of co-trading with common counterparties. Values near 1.0 "
+        "indicate predicted imminent collaboration (wash trade signal)."
+    ),
+    # Bot fingerprint features
+    "bot_trust_line_latency": (
+        "Time in seconds from account creation to first trust line. Bots rapidly "
+        "create trust lines for multiple assets within seconds; humans typically "
+        "create them on-demand over hours/days. Values <60s are strong bot signal."
+    ),
+    "bot_interval_regularity": (
+        "Coefficient of variation (population std / mean) of inter-trade intervals. "
+        "Bots trade with mechanical regularity (CV<0.1); humans have irregular patterns (CV>0.3). "
+        "Returns None (mapped to 0.0 for feature matrix) if fewer than 5 trades."
+    ),
+    "bot_op_entropy": (
+        "Shannon entropy of Horizon operation type distribution (in bits). Bots cluster "
+        "specific operations (low entropy); humans diversify (high entropy). Values <1.5 "
+        "indicate bot-like clustering."
+    ),
 }
 
 
@@ -913,6 +936,111 @@ def compute_solana_linked_features(
         return {"solana_linked_wash_score": 0.0}
 
 
+def compute_temporal_kge_features(
+    wallet: str,
+    counterparties: list[str] | None = None,
+    kge_encoder=None,
+) -> dict:
+    """Compute temporal KGE collaboration prediction features.
+
+    Uses the trained TComplEx model to predict likelihood of future
+    collaboration with known counterparties based on temporal trading patterns.
+
+    Args:
+        wallet: Stellar account ID to analyze.
+        counterparties: List of wallet IDs to score against (typically the
+            wallet's historical trading partners). When None or empty, returns
+            zero-valued feature.
+        kge_encoder: TemporalKGEncoder instance (optional). When provided,
+            computes collaboration scores; when None, returns 0.0.
+
+    Returns:
+        A dictionary with:
+
+        - ``temporal_kge_collab_score``: Maximum predicted collaboration score
+          across all counterparties. Ranges [0.0, 1.0] where 1.0 indicates
+          high predicted likelihood of imminent trading relationship.
+    """
+    if not counterparties or not kge_encoder:
+        return {"temporal_kge_collab_score": 0.0}
+
+    try:
+        scores = []
+        for counterparty in counterparties:
+            score = kge_encoder.predict_collaboration_score(wallet, counterparty)
+            scores.append(score)
+
+        # Return maximum score (highest predicted collaboration risk)
+        max_score = max(scores) if scores else 0.0
+        return {"temporal_kge_collab_score": float(max_score)}
+
+    except Exception as e:
+        logger.warning(f"Temporal KGE prediction failed for {wallet}: {e}")
+        return {"temporal_kge_collab_score": 0.0}
+
+
+def compute_bot_fingerprint_features(
+    wallet: str,
+    wallet_trades: pd.DataFrame | None = None,
+    bot_fingerprint: object | None = None,
+) -> dict:
+    """Compute bot detection fingerprint features.
+
+    Extracts behavioral signatures from Horizon events and trade patterns
+    that distinguish bots from humans: trust line latency, trading regularity,
+    and operation clustering.
+
+    Args:
+        wallet: Stellar account ID.
+        wallet_trades: DataFrame of trades involving the wallet.
+        bot_fingerprint: BotFingerprint object from detection.bot_fingerprinter.
+            When None, returns zero-valued features.
+
+    Returns:
+        A dictionary with three bot detection features:
+        - bot_trust_line_latency: Seconds from account creation to first trust line
+        - bot_interval_regularity: Coefficient of variation of inter-trade intervals
+        - bot_op_entropy: Shannon entropy of operation type distribution
+    """
+    if not bot_fingerprint:
+        return {
+            "bot_trust_line_latency": 0.0,
+            "bot_interval_regularity": 0.0,
+            "bot_op_entropy": 0.0,
+        }
+
+    try:
+        # Import here to avoid circular dependency
+        from ingestion.data_models import BotFingerprint
+
+        if not isinstance(bot_fingerprint, BotFingerprint):
+            return {
+                "bot_trust_line_latency": 0.0,
+                "bot_interval_regularity": 0.0,
+                "bot_op_entropy": 0.0,
+            }
+
+        features = {
+            "bot_trust_line_latency": float(
+                bot_fingerprint.trust_line_creation_latency_seconds or 0.0
+            ),
+            "bot_interval_regularity": float(
+                bot_fingerprint.inter_trade_interval_cv or 0.0
+            ),
+            "bot_op_entropy": float(bot_fingerprint.account_management_cluster_score),
+        }
+
+        return features
+
+    except Exception as e:
+        logger.warning(f"Bot fingerprint computation failed for {wallet}: {e}")
+        return {
+            "bot_trust_line_latency": 0.0,
+            "bot_interval_regularity": 0.0,
+            "bot_op_entropy": 0.0,
+        }
+
+
 def build_feature_vector(
     wallet: str,
     wallet_trades: pd.DataFrame,
@@ -926,6 +1054,9 @@ def build_feature_vector(
     pair_benford_sketches: dict | None = None,
     community_map: dict[str, int] | None = None,
     ring_stats: dict[int, dict] | None = None,
+    path_flows: list | None = None,
+    kge_encoder=None,
+    wallet_counterparties: list[str] | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -936,7 +1067,11 @@ def build_feature_vector(
     output of `detection.wallet_graph.build_funding_graph`, used for the
     wallet graph features. `all_pairs_df` (optional) enables cross-asset
     coordination features. `amm_trades` (optional) enables cross-venue
-    coordination features.
+    coordination features. `path_flows` (optional) is a list of
+    ReconstructedPathFlow dicts from `ingestion.payment_path_analyzer`,
+    used to compute payment path analysis features. `kge_encoder` (optional)
+    is a TemporalKGEncoder instance; when provided along with
+    `wallet_counterparties`, computes temporal KGE collaboration scores.
     """
     reference_time = (
         pd.to_datetime(wallet_trades["ledger_close_time"], utc=True).max()
@@ -959,7 +1094,10 @@ def build_feature_vector(
                 wallet, all_pairs_df, pair_benford_sketches=pair_benford_sketches
             )
         )
+    features.update(compute_payment_path_features(wallet, path_flows))
+    features.update(compute_temporal_kge_features(wallet, wallet_counterparties, kge_encoder))
     features.update(compute_hardening_features(wallet_trades))
+    features.update(compute_ts_decomposition_features(wallet_trades))
     if amm_trades is not None:
         features.update(compute_cross_venue_features(wallet, wallet_trades, amm_trades))
     features["bridge_round_trip_ratio"] = 0.0  # populated by callers that supply bridge tx data
