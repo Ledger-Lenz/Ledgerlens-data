@@ -341,3 +341,123 @@ Security note: `top_interactions` is an internal forensic report field. It is
 | `LEDGERLENS_CONTRACT_ID` | _(required for anchoring)_ | Contract ID of the `ledgerlens-score` Soroban contract. |
 | `LEDGERLENS_SUBMITTER_SECRET` | _(required for anchoring)_ | Secret key of the service account authorised to anchor reports. |
 | `SHAP_INTERACTIONS_ENABLED` | `false` | Enable SHAP pairwise interaction values in forensic reports (O(n·d²) cost). |
+
+---
+
+## Counterfactual Explanations (Issue #193)
+
+### What Are Counterfactuals?
+
+SHAP tells an investigator *what features drove the score*. Counterfactuals
+answer a different question:
+
+> **"What is the minimal change to this wallet's observable behaviour that
+> would reduce the risk score below the flag threshold (70)?"**
+
+For example: "Reduce counterparty concentration from 0.87 to 0.45 — trade
+with at least 3 distinct counterparties in the next 24 hours."
+
+### Generating Counterfactuals
+
+Use `CounterfactualExplainer` from `detection/counterfactual_explainer.py`:
+
+```python
+from detection.counterfactual_explainer import CounterfactualExplainer
+from detection.model_inference import RiskScorer
+import pandas as pd
+
+scorer = RiskScorer()
+X_train = pd.read_parquet("data/synthetic_dataset.parquet").drop(columns=["label", "wallet"])
+
+explainer = CounterfactualExplainer(
+    scorer,
+    X_train,
+    flag_threshold=70.0,   # score threshold to drop below
+    n_cfs=5,               # max diverse counterfactuals
+    timeout_seconds=10.0,  # hard time limit per wallet
+)
+
+feature_row = ...  # pd.Series of feature values for the wallet
+result = explainer.explain(feature_row, wallet="GABC...")
+
+for cf in result.counterfactuals:
+    print(f"CF {cf.cf_index}: predicted score {cf.predicted_score:.1f}")
+    for action in cf.actions:
+        print(f"  {action.interpretation}")
+```
+
+### Counterfactual Result Schema
+
+```json
+{
+  "wallet": "GABC...",
+  "original_score": 87.0,
+  "flag_threshold": 70.0,
+  "n_requested": 5,
+  "n_found": 3,
+  "generation_time_seconds": 2.4,
+  "timed_out": false,
+  "counterfactuals": [
+    {
+      "cf_index": 0,
+      "predicted_score": 62.1,
+      "actions": [
+        {
+          "feature": "counterparty_concentration_ratio",
+          "original_value": 0.87,
+          "counterfactual_value": 0.45,
+          "delta": -0.42,
+          "interpretation": "Reduce counterparty concentration from 0.87 to 0.45 — trade with at least 2 distinct counterparties in the next 24 h."
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Feature Constraints
+
+The counterfactual generator enforces the following constraints:
+
+| Constraint | Features affected |
+|---|---|
+| **Immutable** (never modified) | `account_age_days`, `network_centrality`, `in_wash_trading_ring`, `ring_size`, `ring_internal_density` |
+| **Non-negative** (lower bound 0) | All Benford metrics, rate features, clustering features |
+| **Bounded** (training percentiles) | All mutable features: [1st, 99th] percentile of training distribution |
+
+### Limitations
+
+Counterfactuals describe **achievable scores**, not necessarily achievable
+on-chain behaviour:
+
+- A counterfactual may suggest reducing `benford_mad_24h` from 0.025 to 0.005.
+  This is mathematically achievable, but may require the wallet to fundamentally
+  change its trading strategy over many days.
+- Counterfactuals are computed relative to the current model. If the model is
+  retrained, counterfactuals may change even if the wallet's behaviour does not.
+- Immutable features (account age) cannot decrease. If a wallet's high score is
+  primarily driven by a young account age, counterfactuals may not be able to
+  reduce the score below the threshold.
+- Counterfactuals are generated independently and do not guarantee simultaneous
+  achievability (e.g. CF 1 may contradict CF 2).
+
+### Integration with Forensic Reports
+
+Counterfactuals are included in the forensic report Markdown template when
+`ForensicReport.counterfactual_result` is set. They appear in a dedicated
+"Counterfactual Explanations" section listing each CF's predicted score and
+the required on-chain actions.
+
+To generate a report with counterfactuals:
+
+```python
+from detection.forensic_report import ForensicReport
+from detection.counterfactual_explainer import CounterfactualExplainer
+
+cf_result = explainer.explain(feature_row, wallet=wallet)
+report = ForensicReport(
+    ...,
+    counterfactual_result=cf_result,
+)
+print(report.to_markdown())
+```

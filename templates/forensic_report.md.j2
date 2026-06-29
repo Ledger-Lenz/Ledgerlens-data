@@ -105,7 +105,38 @@ Each trade can be independently verified via the Horizon URL.
 
 ---
 
+{% if report.counterfactual_result and report.counterfactual_result.counterfactuals %}
+## Counterfactual Explanations
+
+> **What would need to change for this wallet's score to drop below the flag threshold?**
+>
+> The following counterfactuals show the minimal changes to observable on-chain
+> behaviour that would reduce the risk score below {{ report.counterfactual_result.flag_threshold | int }}.
+> These describe *achievable* scores, not necessarily achievable on-chain behaviour — an
+> investigator should assess whether the proposed changes are realistic given the wallet's
+> trading context.
+
+| | Original Score | CF Score | Actions Required |
+|---|---|---|---|
+{% for cf in report.counterfactual_result.counterfactuals -%}
+| CF {{ loop.index }} | {{ "%.1f" | format(report.counterfactual_result.original_score) }} | {{ "%.1f" | format(cf.predicted_score) }} | {{ cf.actions | length }} feature(s) changed |
+{% endfor %}
+
+{% for cf in report.counterfactual_result.counterfactuals %}
+### Counterfactual {{ loop.index }} (predicted score: {{ "%.1f" | format(cf.predicted_score) }})
+
+| Feature | Current Value | Required Value | Change | On-Chain Action |
+|---|---|---|---|---|
+{% for a in cf.actions -%}
+| `{{ a.feature }}` | {{ "%.4g" | format(a.original_value) }} | {{ "%.4g" | format(a.counterfactual_value) }} | {{ "%+.4g" | format(a.delta) }} | {{ a.interpretation }} |
+{% endfor %}
+
+{% endfor %}
+---
+{% endif %}
+
 {% if report.top_interactions %}
+## Feature Interactions
 ## Feature Interactions
 
 The table below shows the strongest pairwise feature interactions identified by
