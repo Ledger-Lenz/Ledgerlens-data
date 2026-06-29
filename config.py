@@ -91,6 +91,11 @@ class Config:
     # Fire an alert when any feature PSI exceeds this value.
     DRIFT_PSI_THRESHOLD: float = float(os.getenv("DRIFT_PSI_THRESHOLD", "0.2"))
 
+    # Sliding window covariance shift detection (MMD)
+    DRIFT_REFERENCE_WINDOW_HOURS: int = int(os.getenv("DRIFT_REFERENCE_WINDOW_HOURS", "168"))
+    DRIFT_TEST_WINDOW_HOURS: int = int(os.getenv("DRIFT_TEST_WINDOW_HOURS", "1"))
+    DRIFT_CHECK_INTERVAL_MINUTES: int = int(os.getenv("DRIFT_CHECK_INTERVAL_MINUTES", "30"))
+
     # Forensic reporting
     REPORT_CONCURRENCY: int = int(os.getenv("REPORT_CONCURRENCY", "4"))
 
