@@ -26,6 +26,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from utils.tracing import get_tracer
+
+_tracer = get_tracer(__name__)
+
 
 @dataclass
 class BenfordMetrics:
@@ -380,10 +384,13 @@ def compute_benford_metrics_for_windows(
     ref = reference_time or timestamps.max()
 
     results = {}
-    for hours in windows_hours:
-        window_start = ref - pd.Timedelta(hours=hours)
-        window_df = df[(timestamps > window_start) & (timestamps <= ref)]
-        results[hours] = compute_benford_metrics(window_df[amount_col], asset_code=asset)
+    with _tracer.start_as_current_span("benford.computed") as span:
+        span.set_attribute("benford.windows_count", len(windows_hours))
+        span.set_attribute("benford.sample_size", len(df))
+        for hours in windows_hours:
+            window_start = ref - pd.Timedelta(hours=hours)
+            window_df = df[(timestamps > window_start) & (timestamps <= ref)]
+            results[hours] = compute_benford_metrics(window_df[amount_col], asset_code=asset)
 
     return results
 

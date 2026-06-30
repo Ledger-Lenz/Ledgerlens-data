@@ -228,3 +228,126 @@ With model inversion defence:
   Delta = 11 points (includes noise) → cannot invert
   After 100 queries: 429 Too Many Requests → rate limited
 ```
+
+---
+
+## Differential Privacy Budget Strategy (Issue #195)
+
+### Overview
+
+Every DP mechanism consumes part of the total privacy budget (epsilon, δ).
+Once the cumulative epsilon exceeds the configured cap, the DP guarantee becomes
+vacuous and the system must pause new training/inference queries until an
+authorised operator performs a budget rollover.
+
+LedgerLens tracks budget via `detection/privacy/budget_tracker.py`.
+
+### Composition theorem used
+
+Budget composition follows **Rényi Differential Privacy (RDP)** additive
+composition: the total epsilon at Rényi order α is the sum of individual
+epsilons at the same order.  This provides tight bounds for the Gaussian
+mechanism used by Opacus DP-SGD and is a valid upper bound for heterogeneous
+mechanisms.
+
+For tighter finite-data bounds, the **PRV (Privacy Random Variable) accountant**
+can be substituted; it achieves near-optimal composition at the cost of O(n²)
+computation over the number of training steps.  The RDP accountant is the
+current default because it is sufficient for LedgerLens's update frequency
+(daily retraining) and adds negligible overhead.
+
+### Budget tracking architecture
+
+| Mechanism | Epsilon source | Tracked separately |
+|---|---|---|
+| DP-SGD training round | `achieved_epsilon` from Opacus PrivacyEngine | Yes (`kind=training`) |
+| Inference-time DP query | Per-query sensitivity / noise ratio | Yes (`kind=inference`) |
+
+All consumption events are appended to the `dp_budget_events` database table
+using an **append-only log pattern** (INSERT only, no UPDATE/DELETE).  The table
+includes a SHA-256 hash chain (`prev_log_hash → log_hash`) so tampering with
+historical entries is detectable.
+
+### Alert threshold rationale
+
+`DP_BUDGET_ALERT_THRESHOLD` (default 10.0 epsilon units) gives the operations
+team time to act before the budget is fully exhausted.  At the default total of
+100.0 epsilon, the alert fires with 10 % of budget remaining — roughly the
+equivalent of one more full training run at the standard ε=8.0 target.
+
+### Budget rollover
+
+A budget rollover resets the cumulative epsilon to 0 for a new major model
+version.  It requires an explicit operator confirmation string
+(`CONFIRM_ROLLOVER_<version>`) to prevent accidental resets.  The old budget
+log is preserved in the database; a synthetic `rollover` event records the
+version transition.
+
+### Querying current budget
+
+```bash
+python scripts/query_privacy_budget.py
+python scripts/query_privacy_budget.py --json
+```
+
+---
+
+## Audit Trail Tamper Detection — Merkle Chain (Issue #196)
+
+### Design
+
+Every audit log entry (risk score computation, model decision, alert event) is
+committed to an in-memory Merkle chain implemented in `AuditMerkleChain` in
+`detection/audit_trail.py`.
+
+Each entry carries:
+- Its **sequential index** within the chain.
+- The **SHA-256 hash of the entry content** (canonical JSON).
+- The **previous Merkle root** (before this entry was appended).
+- The **new Merkle root** (after including this entry).
+
+The Merkle tree is a binary tree over leaf hashes `SHA-256("<index>:<content_hash>")`,
+with duplicate-last-leaf padding for odd-length layers.
+
+### Storage
+
+Merkle roots are written to a **separate** `audit_merkle_roots` database table,
+making root tampering independently detectable:
+
+- Tampering with an entry's content changes the leaf hash → the recomputed root
+  differs from the stored in-entry root.
+- Tampering with the stored in-entry root → the separate-table root differs.
+- Tampering with the separate-table root → the in-entry root differs.
+
+All three attack surfaces are caught by `verify_chain()`.
+
+### Security constraints
+
+- **SHA-256 exclusively** — MD5 and SHA-1 are not used anywhere in the chain.
+- The `audit_merkle_roots` table uses INSERT-only access at the application
+  level; the application user must not hold UPDATE or DELETE privileges on
+  this table.  Migration SQL:
+
+  ```sql
+  REVOKE UPDATE, DELETE ON audit_merkle_roots FROM ledgerlens_app;
+  ```
+
+- `verify_chain()` completes in O(n) time where n is the number of entries
+  being verified.
+
+### Crash recovery
+
+If the process crashes between writing the audit entry and updating the Merkle
+root, the entry exists without a corresponding root record.  On restart,
+`verify_chain()` will raise `TamperDetectedError` for the missing root.
+Operators should re-run verification from the last known-good index and replay
+the missing root insertion before resuming normal operation.
+
+### What a tamper detection event requires from the operator
+
+1. **Stop all writes** to the audit log immediately.
+2. Run `verify_chain(start_index=0)` to identify the first failing index.
+3. Compare the stored entry against backup copies of the audit log.
+4. Escalate to the security team if a discrepancy is confirmed.
+5. Do not resume normal operation until the root cause is identified and all
+   modified entries are restored from a trusted backup.

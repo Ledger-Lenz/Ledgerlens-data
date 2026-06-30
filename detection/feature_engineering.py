@@ -24,8 +24,10 @@ import numpy as np
 import pandas as pd
 
 from config import config
+from utils.tracing import get_tracer, hash_span_id
 
 logger = logging.getLogger(__name__)
+_tracer = get_tracer(__name__)
 from detection.benford_engine import (
     BenfordMetrics,
     compute_benford_metrics_for_windows,
@@ -1073,6 +1075,34 @@ def build_feature_vector(
     is a TemporalKGEncoder instance; when provided along with
     `wallet_counterparties`, computes temporal KGE collaboration scores.
     """
+    with _tracer.start_as_current_span("features.computed") as span:
+        span.set_attribute("wallet.id", hash_span_id(wallet))
+        span.set_attribute("trade.count", len(wallet_trades))
+        return _build_feature_vector_inner(
+            wallet, wallet_trades, activity, orderbook_events, funding_graph,
+            all_pairs_df, amm_trades, gnn_encoder, benford_metrics,
+            pair_benford_sketches, community_map, ring_stats, path_flows,
+            kge_encoder, wallet_counterparties,
+        )
+
+
+def _build_feature_vector_inner(
+    wallet: str,
+    wallet_trades,
+    activity=None,
+    orderbook_events=None,
+    funding_graph=None,
+    all_pairs_df=None,
+    amm_trades=None,
+    gnn_encoder=None,
+    benford_metrics=None,
+    pair_benford_sketches=None,
+    community_map=None,
+    ring_stats=None,
+    path_flows=None,
+    kge_encoder=None,
+    wallet_counterparties=None,
+):
     reference_time = (
         pd.to_datetime(wallet_trades["ledger_close_time"], utc=True).max()
         if not wallet_trades.empty

@@ -692,3 +692,100 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 | `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
 | `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
 | `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |
+
+---
+
+## Distributed Tracing with OpenTelemetry (Issue #198)
+
+### Overview
+
+LedgerLens instruments the full trade event pipeline with OpenTelemetry (OTel)
+spans so a single trade can be traced end-to-end from Horizon ingestion through
+to the stored risk score in Grafana Tempo or Jaeger.
+
+### Architecture
+
+```
+Stellar Horizon SSE
+       │
+       │  [span: trade_event.received]   ingestion/horizon_streamer.py
+       ▼
+Kafka message (W3C TraceContext headers injected)
+       │
+       │  [span: features.computed]      detection/feature_engineering.py
+       ▼
+       │  [span: benford.computed]       detection/benford_engine.py
+       ▼
+       │  [span: model.scored]           detection/model_inference.py
+       ▼
+       │  [span: score.stored]           detection/risk_score_store.py
+       ▼
+   risk_scores DB
+```
+
+All spans belong to the same trace thanks to W3C TraceContext propagation
+across the Kafka message boundary (see next section).
+
+### Kafka trace context propagation
+
+The producer side injects trace headers via `utils.tracing.inject_trace_context`:
+
+```python
+from utils.tracing import inject_trace_context
+headers: dict[str, str] = {}
+inject_trace_context(headers)
+producer.send(topic, value=payload, headers=list(headers.items()))
+```
+
+The consumer side extracts the context and uses it as the parent span:
+
+```python
+from utils.tracing import extract_trace_context, get_tracer
+ctx = extract_trace_context(dict(msg.headers))
+tracer = get_tracer(__name__)
+with tracer.start_as_current_span("features.computed", context=ctx):
+    ...
+```
+
+### Span attributes
+
+| Span | Key attributes |
+|---|---|
+| `trade_event.received` | `trade.id` (hashed), `trade.base_asset`, `trade.counter_asset` |
+| `features.computed` | `wallet.id` (hashed), `trade.count` |
+| `benford.computed` | `benford.windows_count`, `benford.sample_size` |
+| `model.scored` | `wallet.id` (hashed), `model.score` |
+| `score.stored` | `wallet.id` (hashed), `score.value` |
+
+**Security**: raw wallet addresses and trade amounts are never included in span
+attributes.  All wallet/trade identifiers are passed through
+`utils.tracing.hash_span_id()` (SHA-256, truncated to 16 hex chars) before
+being set as span attributes.
+
+### Sampling strategy
+
+The default sampling rate is **10 %** (`OTEL_SAMPLING_RATE=0.1`), set via
+`ParentBased(TraceIdRatioBased(rate))`.  This means:
+
+- A sampled parent span causes all child spans to be sampled (parent-based).
+- 10 % of root spans are selected by ratio sampling.
+
+For high-throughput production deployments, reduce to 1 % (`OTEL_SAMPLING_RATE=0.01`).
+For debugging, set to 100 % (`OTEL_SAMPLING_RATE=1.0`).
+
+### Querying traces in Grafana Tempo
+
+1. Open Grafana → Explore → select the Tempo data source.
+2. Search by `service.name = ledgerlens` and filter by span name or wallet hash.
+3. Use the trace ID returned in API responses (if propagated to HTTP headers)
+   to jump directly to the full trace waterfall.
+
+Alternatively, use Jaeger UI at `http://localhost:16686` (when running the
+local docker-compose stack with `OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317`).
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint |
+| `OTEL_SAMPLING_RATE` | `0.1` | Fraction of traces sampled (0.0–1.0) |

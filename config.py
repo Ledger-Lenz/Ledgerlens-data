@@ -171,6 +171,16 @@ class Config:
     DP_MAX_GRAD_NORM: float = float(os.getenv("DP_MAX_GRAD_NORM", "1.0"))
     DP_EPOCHS: int = int(os.getenv("DP_EPOCHS", "50"))
 
+    # DP privacy budget tracker (Issue #195)
+    # Total epsilon cap across all training rounds and inference queries.
+    DP_BUDGET_TOTAL_EPSILON: float = float(os.getenv("DP_BUDGET_TOTAL_EPSILON", "100.0"))
+    # Alert is fired when remaining epsilon drops below this value.
+    DP_BUDGET_ALERT_THRESHOLD: float = float(os.getenv("DP_BUDGET_ALERT_THRESHOLD", "10.0"))
+
+    # OpenTelemetry distributed tracing (Issue #198)
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    OTEL_SAMPLING_RATE: float = float(os.getenv("OTEL_SAMPLING_RATE", "0.1"))
+
     # Adversarial training augmentation
     ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))
 
