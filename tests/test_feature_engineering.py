@@ -16,6 +16,7 @@ from detection.feature_engineering import (
     compute_trade_pattern_features,
     compute_volume_timing_features,
 )
+from tests.factories import make_clean_trades
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -23,30 +24,9 @@ from detection.feature_engineering import (
 
 
 def _sample_trades() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "trade_id": "1",
-                "ledger_close_time": "2024-01-01T00:00:00Z",
-                "base_account": "A",
-                "counter_account": "B",
-                "base_asset": "USDC:issuer",
-                "counter_asset": "XLM:native",
-                "amount": 100.0,
-                "price": 0.1,
-            },
-            {
-                "trade_id": "2",
-                "ledger_close_time": "2024-01-01T00:01:00Z",
-                "base_account": "B",
-                "counter_account": "A",
-                "base_asset": "USDC:issuer",
-                "counter_asset": "XLM:native",
-                "amount": 100.0,
-                "price": 0.1,
-            },
-        ]
-    )
+    """Use factory to generate realistic sample trades."""
+    trades = make_clean_trades(n=2)
+    return pd.DataFrame(trades)
 
 
 # ---------------------------------------------------------------------------

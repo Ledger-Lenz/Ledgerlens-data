@@ -55,5 +55,40 @@ jobs:
               print("verify_chain check passed.")
           EOF
 
+      - name: Validate Grafana dashboard JSON schema (Issue #242)
+        run: |
+          python - <<'EOF'
+          import json, pathlib, sys
+
+          REQUIRED_KEYS = {"schemaVersion", "title", "panels"}
+          errors = []
+          for f in pathlib.Path("monitoring/grafana/dashboards").glob("*.json"):
+              try:
+                  data = json.loads(f.read_text())
+              except json.JSONDecodeError as e:
+                  errors.append(f"{f}: invalid JSON — {e}")
+                  continue
+              missing = REQUIRED_KEYS - data.keys()
+              if missing:
+                  errors.append(f"{f}: missing required keys {missing}")
+              if not isinstance(data.get("panels"), list):
+                  errors.append(f"{f}: 'panels' must be a list")
+
+          if errors:
+              print("Grafana dashboard validation failures:")
+              for e in errors:
+                  print(" ", e)
+              sys.exit(1)
+          else:
+              print(f"All Grafana dashboards valid ({len(list(pathlib.Path('monitoring/grafana/dashboards').glob('*.json')))} files).")
+          EOF
+
+      - name: Validate markdown links (Issue #263)
+        run: |
+          npm install -g markdown-link-check
+          markdown-link-check docs/security_threat_model.md
+          markdown-link-check docs/security.md
+          markdown-link-check CONTRIBUTING.md
+
       - name: Test
         run: pytest -q

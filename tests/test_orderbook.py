@@ -5,6 +5,7 @@ from detection.feature_engineering import (
     compute_trade_pattern_features,
 )
 from ingestion.orderbook_loader import _action_for_operation, _to_orderbook_event
+from tests.factories import make_clean_trades
 
 
 def test_action_for_operation_created():

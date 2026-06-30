@@ -21,6 +21,7 @@ import numpy as np
 from sklearn.linear_model import SGDClassifier
 
 from .crypto import generate_masks, mask_delta
+from .gradient_compression import ErrorFeedbackCompressor, TopKSparsifier, TopKPayload
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,10 @@ class FederatedParticipant:
     coordinator_url: str
     # sklearn estimator with coef_/intercept_ (SGDClassifier by default)
     model: Any = field(default_factory=lambda: SGDClassifier(loss="log_loss", max_iter=1))
+    # Gradient compressor — defaults to Top-1% sparsification with error feedback
+    compressor: ErrorFeedbackCompressor = field(
+        default_factory=lambda: ErrorFeedbackCompressor(TopKSparsifier(k_ratio=0.01))
+    )
 
     # ------------------------------------------------------------------ #
     # Weight helpers (flatten coef_ + intercept_ to a 1-D numpy vector)  #
@@ -91,11 +96,19 @@ class FederatedParticipant:
             self.local_train(X, y, epochs=epochs)
             delta = self.compute_delta(global_w)
 
-            # 3. Mask delta so coordinator cannot reconstruct individual update
+            # 2a. Compress gradient (with error-feedback memory correction)
+            payload = self.compressor.compress(delta)
+            if isinstance(payload, TopKPayload):
+                compressed_delta = TopKSparsifier.decompress(payload)
+            else:
+                from .gradient_compression import PowerSGDCompressor
+                compressed_delta = PowerSGDCompressor.decompress(payload)
+
+            # 3. Mask compressed delta
             all_ids = sorted(set(peers) | {self.participant_id})
-            masks = generate_masks(all_ids, delta.shape)
+            masks = generate_masks(all_ids, compressed_delta.shape)
             my_mask = masks[self.participant_id]
-            masked = mask_delta(delta, my_mask)
+            masked = mask_delta(compressed_delta, my_mask)
 
             # 4. Submit masked delta
             resp = await client.post(

@@ -7,6 +7,7 @@ from detection.feature_engineering import (
     build_feature_matrix,
     compute_cross_asset_features,
 )
+from tests.factories import make_clean_trades
 
 
 def test_cross_pair_synchrony_high_for_coordinated_trades():

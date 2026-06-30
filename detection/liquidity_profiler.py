@@ -1,5 +1,6 @@
 """Per-asset liquidity regime profiler for calibrated Benford scoring.
 
+
 Clusters assets into liquidity regimes using k-means on four observable
 features, then computes an empirical Benford baseline for each regime from
 known-clean trade data.  All downstream Benford metrics are expressed as
@@ -14,6 +15,12 @@ Nigrini, "Benford's Law" (2012), Chapter 5 — baseline calibration approach.
 
 from __future__ import annotations
 
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+
 import numpy as np
 import pandas as pd
 
@@ -26,6 +33,8 @@ from detection.benford_engine import (
 
 _FALLBACK_DIST: dict[int, float] = dict(BENFORD_EXPECTED)
 _N_REGIME_FEATURES = 4  # trades_per_hour, amount_cv, spread_bps, n_counterparties
+
+_BUILD_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "build_config.json")
 
 
 class AssetLiquidityProfiler:
@@ -213,3 +222,249 @@ class AssetLiquidityProfiler:
         observed = observed_distribution(amounts)
         deviations = [abs(observed[d] - baseline.get(d, 0.0)) for d in range(1, 10)]
         return float(sum(deviations) / len(deviations))
+
+
+# ---------------------------------------------------------------------------
+# Thin-market wash trade detection (issue #273)
+# ---------------------------------------------------------------------------
+
+_THIN_MARKET_DEFAULTS = {
+    "max_unique_traders_7d": 50,
+    "min_liquidity_depth_usd": 1000.0,
+    "min_amm_tvl_usd": 5000.0,
+    "benford_chi_square_threshold_multiplier": 3.0,
+    "alert_threshold": 60,
+    "classification_cache_seconds": 3600,
+}
+
+
+def _load_thin_market_config() -> dict:
+    try:
+        with open(_BUILD_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        raw = cfg.get("thin_market", {})
+        merged = dict(_THIN_MARKET_DEFAULTS)
+        merged.update(raw)
+        return merged
+    except Exception:
+        return dict(_THIN_MARKET_DEFAULTS)
+
+
+def _validate_thin_market_config(cfg: dict) -> None:
+    """Raise ValueError on startup if any threshold is not a positive number."""
+    numeric_keys = [
+        "max_unique_traders_7d",
+        "min_liquidity_depth_usd",
+        "min_amm_tvl_usd",
+        "benford_chi_square_threshold_multiplier",
+        "alert_threshold",
+        "classification_cache_seconds",
+    ]
+    for key in numeric_keys:
+        val = cfg.get(key)
+        if val is None or not isinstance(val, (int, float)) or val <= 0:
+            raise ValueError(
+                f"thin_market config '{key}' must be a positive number, got: {val!r}"
+            )
+
+
+@dataclass
+class ThinMarketClassification:
+    """Result of a thin-market classification for one asset pair."""
+
+    asset_pair: str
+    is_thin: bool
+    unique_traders_7d: int
+    liquidity_depth_usd: float
+    amm_tvl_usd: float
+    reason: str
+
+
+class ThinMarketDetector:
+    """Detect thin-market conditions and emit a calibrated wash-risk signal.
+
+    A pair is classified as thin market when ANY of the following holds:
+      - Fewer than ``max_unique_traders_7d`` unique traders in the last 7 days
+      - Liquidity depth below ``min_liquidity_depth_usd`` (USD equivalent)
+      - AMM pool TVL below ``min_amm_tvl_usd``
+
+    For thin-market pairs a calibrated ``thin_market_wash_risk`` composite
+    score is computed (0–100).  For liquid pairs the feature is ``float('nan')``
+    to avoid conflating thin and liquid market signals.
+
+    Classifications are cached for ``classification_cache_seconds`` (default
+    1 hour) to avoid per-request recomputation.
+
+    Security: thresholds are validated on startup; invalid config raises
+    ``ValueError`` immediately, preventing silent misconfiguration.
+    """
+
+    def __init__(self) -> None:
+        self._cfg = _load_thin_market_config()
+        _validate_thin_market_config(self._cfg)
+
+        self._cache: dict[str, tuple[float, ThinMarketClassification]] = {}
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def classify(
+        self,
+        asset_pair: str,
+        trades_7d: pd.DataFrame,
+        liquidity_depth_usd: float = 0.0,
+        amm_tvl_usd: float = 0.0,
+    ) -> ThinMarketClassification:
+        """Classify *asset_pair* as thin or liquid market.
+
+        Results are cached for ``classification_cache_seconds``.
+
+        Parameters
+        ----------
+        asset_pair:
+            Canonical ``CODE:ISSUER/CODE:ISSUER`` pair identifier.
+        trades_7d:
+            DataFrame of trades in the last 7 days.  Must contain at least
+            one of ``base_account`` or ``counter_account``.
+        liquidity_depth_usd:
+            Current order-book liquidity depth in USD equivalent.
+        amm_tvl_usd:
+            Current AMM pool TVL in USD equivalent.
+        """
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(asset_pair)
+            if cached and (now - cached[0]) < self._cfg["classification_cache_seconds"]:
+                return cached[1]
+
+        result = self._classify_uncached(asset_pair, trades_7d, liquidity_depth_usd, amm_tvl_usd)
+        with self._lock:
+            self._cache[asset_pair] = (now, result)
+        return result
+
+    def _classify_uncached(
+        self,
+        asset_pair: str,
+        trades_7d: pd.DataFrame,
+        liquidity_depth_usd: float,
+        amm_tvl_usd: float,
+    ) -> ThinMarketClassification:
+        unique_traders = self._count_unique_traders(trades_7d)
+        reasons = []
+
+        if unique_traders < self._cfg["max_unique_traders_7d"]:
+            reasons.append(f"only {unique_traders} unique traders in 7d")
+        if liquidity_depth_usd < self._cfg["min_liquidity_depth_usd"]:
+            reasons.append(f"depth=${liquidity_depth_usd:.0f} < ${self._cfg['min_liquidity_depth_usd']:.0f}")
+        if amm_tvl_usd < self._cfg["min_amm_tvl_usd"]:
+            reasons.append(f"TVL=${amm_tvl_usd:.0f} < ${self._cfg['min_amm_tvl_usd']:.0f}")
+
+        is_thin = bool(reasons)
+        return ThinMarketClassification(
+            asset_pair=asset_pair,
+            is_thin=is_thin,
+            unique_traders_7d=unique_traders,
+            liquidity_depth_usd=float(liquidity_depth_usd),
+            amm_tvl_usd=float(amm_tvl_usd),
+            reason="; ".join(reasons) if reasons else "liquid market",
+        )
+
+    @staticmethod
+    def _count_unique_traders(trades_7d: pd.DataFrame) -> int:
+        accounts: set = set()
+        for col in ("base_account", "counter_account"):
+            if col in trades_7d.columns:
+                accounts.update(trades_7d[col].dropna().unique())
+        return len(accounts)
+
+    def thin_market_wash_risk(
+        self,
+        asset_pair: str,
+        trades_7d: pd.DataFrame,
+        liquidity_depth_usd: float = 0.0,
+        amm_tvl_usd: float = 0.0,
+        round_trip_frequency: float = 0.0,
+    ) -> float:
+        """Compute the thin-market wash-risk composite score (0–100).
+
+        Returns ``float('nan')`` for liquid pairs to avoid conflating thin and
+        liquid market signals.  Only emit this feature for confirmed thin-market
+        pairs.
+
+        The composite score combines:
+          - Inverse liquidity score (higher = lower depth / TVL)
+          - Trader concentration (fewer unique traders → higher risk)
+          - Round-trip frequency (calibrated to thin-market base rates)
+        """
+        classification = self.classify(
+            asset_pair, trades_7d, liquidity_depth_usd, amm_tvl_usd
+        )
+        if not classification.is_thin:
+            return float("nan")
+
+        # Inverse-liquidity component (0–1, higher = lower liquidity)
+        depth_score = 1.0 - min(
+            liquidity_depth_usd / self._cfg["min_liquidity_depth_usd"], 1.0
+        )
+        tvl_score = 1.0 - min(amm_tvl_usd / self._cfg["min_amm_tvl_usd"], 1.0)
+        liquidity_component = 0.5 * depth_score + 0.5 * tvl_score
+
+        # Trader concentration (0–1, higher = fewer traders)
+        trader_component = 1.0 - min(
+            classification.unique_traders_7d / self._cfg["max_unique_traders_7d"], 1.0
+        )
+
+        # Round-trip frequency (thin-market calibrated: already suspicious at lower rates)
+        rt_component = min(round_trip_frequency * 2.0, 1.0)
+
+        raw = (
+            liquidity_component * 0.4
+            + trader_component * 0.35
+            + rt_component * 0.25
+        )
+        return float(round(raw * 100, 2))
+
+    def check_and_dispatch_alert(
+        self,
+        asset_pair: str,
+        trades_7d: pd.DataFrame,
+        liquidity_depth_usd: float = 0.0,
+        amm_tvl_usd: float = 0.0,
+        round_trip_frequency: float = 0.0,
+        dispatcher=None,
+    ) -> float | None:
+        """Compute thin-market wash risk and dispatch alert if threshold exceeded.
+
+        Returns the composite score if the pair is thin-market, else None.
+
+        Parameters
+        ----------
+        dispatcher:
+            Optional :class:`streaming.alert_dispatcher.AlertDispatcher`.
+            When ``None``, alert is logged to stderr only.
+        """
+        score = self.thin_market_wash_risk(
+            asset_pair, trades_7d, liquidity_depth_usd, amm_tvl_usd, round_trip_frequency
+        )
+        if score is None or (isinstance(score, float) and score != score):  # NaN check
+            return None
+
+        if score >= self._cfg["alert_threshold"]:
+            alert = {
+                "type": "thin_market_wash_risk",
+                "asset_pair": asset_pair,
+                "score": score,
+                "threshold": self._cfg["alert_threshold"],
+            }
+            if dispatcher is not None:
+                try:
+                    dispatcher.dispatch(asset_pair, round(score), alert)
+                except Exception:
+                    pass
+            else:
+                import sys
+                print(f"THIN_MARKET_ALERT: {alert}", file=sys.stderr)
+
+        return score

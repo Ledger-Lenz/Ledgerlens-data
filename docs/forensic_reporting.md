@@ -241,6 +241,95 @@ Confirm that `base_account`, `counter_account`, `base_amount`, and
 
 ---
 
+## SHAP Interaction Values
+
+### What they are
+
+Standard SHAP values decompose a model's prediction into additive per-feature
+contributions — each feature gets a single number representing its average
+marginal contribution. **SHAP interaction values** (the Shapley interaction
+index, Lundberg et al., 2018) go one step further: they decompose the prediction
+into pairwise *interactions*, quantifying how much of the prediction is explained
+by Feature A and Feature B *working together*, beyond what either contributes
+alone.
+
+Formally, the interaction value φᵢⱼ satisfies:
+
+```
+Σᵢ Σⱼ φᵢⱼ = f(x) − E[f(x)]        (completeness)
+φᵢᵢ = main effect of feature i
+φᵢⱼ = φⱼᵢ (symmetry)
+```
+
+### How to interpret a strong interaction
+
+A large positive `interaction` value for a pair `(feature_a, feature_b)` means
+the model learned a **synergistic risk signal**: those two features together push
+the score higher than you would predict by summing their individual SHAP values.
+
+Example: an interaction of `+8.2` for `counterparty_concentration x account_age`
+means that wallets with *both* high counterparty concentration *and* a young
+account age are scored approximately 8 points higher than a model that treats
+those features independently would assign — a classic wash-trading fingerprint
+not captured by either feature alone.
+
+A negative interaction value indicates a *suppressive* relationship: the presence
+of both features together reduces the score compared to adding their main effects.
+
+### Computational cost
+
+Interaction values are **O(n_samples × n_features²)** to compute. For a feature
+matrix with 40 features and 10 000 rows this is ~16 million calls into the tree
+ensemble, versus ~400 000 for plain SHAP values. They are therefore gated behind
+a feature flag:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHAP_INTERACTIONS_ENABLED` | `false` | Set to `true` to compute and include interaction values in forensic reports. |
+
+Enable only for targeted forensic investigations, not for real-time scoring.
+
+### LightGBM API compatibility note
+
+Both XGBoost and LightGBM expose interaction values through the same
+`shap.TreeExplainer(model).shap_interaction_values(X)` call with
+`feature_perturbation="tree_path_dependent"` (the default). The returned array
+shape is `(n_samples, n_features, n_features)` in both cases.
+
+**Incompatibility:** LightGBM does **not** support
+`feature_perturbation="interventional"` for interaction values. Passing that
+option raises a `NotImplementedError`. If you have overridden the default
+perturbation mode, revert to `"tree_path_dependent"` before calling
+`shap_interaction_values`.
+
+XGBoost multi-class models return a list of `(n_samples, n_features, n_features)`
+arrays (one per class); `ShapExplainer.compute_interaction_values` automatically
+selects index `[1]` (positive / wash-trade class).
+
+### Report field
+
+When `SHAP_INTERACTIONS_ENABLED=true`, the forensic report JSON gains a
+`top_interactions` field and the Markdown report renders a **Feature Interactions**
+table:
+
+```json
+"top_interactions": [
+  {"feature_a": "counterparty_concentration", "feature_b": "account_age", "interaction": 8.2},
+  ...
+]
+```
+
+The corresponding formatted strings (via `format_top_interactions`) read:
+
+```
+counterparty_concentration x account_age contributes 8.2000 points to the score
+```
+
+Security note: `top_interactions` is an internal forensic report field. It is
+**not** exposed via the external public API — see the Security Properties table above.
+
+---
+
 ## Configuration
 
 | Environment Variable | Default | Description |
@@ -251,3 +340,73 @@ Confirm that `base_account`, `counter_account`, `base_amount`, and
 | `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint for on-chain anchoring. |
 | `LEDGERLENS_CONTRACT_ID` | _(required for anchoring)_ | Contract ID of the `ledgerlens-score` Soroban contract. |
 | `LEDGERLENS_SUBMITTER_SECRET` | _(required for anchoring)_ | Secret key of the service account authorised to anchor reports. |
+| `SHAP_INTERACTIONS_ENABLED` | `false` | Enable SHAP pairwise interaction values in forensic reports (O(n·d²) cost). |
+
+---
+
+## Interactive HTML Report Format
+
+`detection/forensic_report_interactive.py` generates a self-contained HTML
+forensic report alongside the existing JSON/PDF formats.
+
+### Dependencies
+
+```
+plotly>=5.0        # interactive SHAP waterfall chart
+pyvis>=0.3         # wallet graph visualisation (optional — graceful degradation)
+```
+
+### Generating an HTML report
+
+```bash
+python -m scripts.generate_reports --input wallets.csv --output-format html \
+    --output-dir reports/forensic
+```
+
+Or from Python:
+
+```python
+from detection.forensic_report_interactive import generate_interactive_report
+
+generate_interactive_report(report.to_dict(), "reports/forensic/my_report.html")
+```
+
+### Self-contained requirement
+
+The HTML file embeds all JavaScript (Plotly, vis-network) inline; no external
+CDN requests are made.  Reports can be opened in an air-gapped environment.
+File size is < 5 MB for a standard report (≤ 100 trades, ≤ 50 graph nodes).
+
+### Interactive features
+
+| Feature | Interaction |
+|---|---|
+| SHAP waterfall chart | Hover for exact contribution values; click a bar to expand contributing trades in the drill-down panel below. |
+| Wallet graph | Zoom / pan / drag nodes; click a node to see its risk score and feature breakdown. |
+| Wallet address reveal | Double-click the wallet hash cell; enter your operator key to reveal the decrypted address (AES-GCM in production). |
+
+### Provenance drill-down
+
+Each SHAP feature bar is linked to the trades that contributed to that feature
+value.  Clicking a bar populates the "Provenance Drill-Down" section with a
+table of relevant trades, each showing its Ledger number, hashed counterparty
+addresses, amounts, and asset pair.
+
+### Security
+
+Raw wallet addresses are **not** present in the HTML source.  Each address is
+replaced with a JavaScript-decoded, operator-key-encrypted field.  The operator
+must enter the key at view time via a browser prompt.  The decryption key is
+never transmitted to any server.
+
+### File size budget
+
+| Component | Approximate size |
+|---|---|
+| Plotly JS bundle (minified) | ≤ 3.5 MB |
+| vis-network (via pyvis) | ≤ 0.8 MB |
+| Report data (100 trades, 50 nodes) | ≤ 0.2 MB |
+| **Total** | **≤ 4.5 MB** |
+
+If plotly is not installed, a plain HTML table fallback is rendered instead
+(< 0.1 MB).

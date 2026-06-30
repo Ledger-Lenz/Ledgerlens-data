@@ -61,87 +61,77 @@ Use SHAP for attribution. Use causal scoring for investigation and evidence tria
 - Trace the funding chain behind a flagged wallet.
 - Test whether an apparent wash-trading signal propagates into downstream trade-pattern features.
 
----
+## E-Value Sensitivity Analysis
 
-## Causal Transfer Learning (Issue #255)
+### What Is an E-Value?
 
-Causal models trained on one asset pair (e.g. USDC/XLM) do not always
-generalise to structurally different pairs (e.g. a low-liquidity token pair)
-because the causal graph structure may differ.  **Causal transfer learning**
-identifies the invariant causal mechanisms shared across pairs and trains
-pair-specific adjustments on top.
+The causal attribution system attributes a wallet's risk score to specific causal
+factors (e.g. *"high counterparty concentration caused a 30-point score increase"*).
+However, the causal model may be confounded by unobserved variables — for example,
+a market-maker responding to a liquidity event might share observable features with
+a wash trader, but the underlying cause differs.
 
-### Invariant Causal Prediction (ICP)
+An **E-value** (VanderWeele & Ding, 2017) quantifies the minimum strength of
+association that an unobserved confounder would need to have with *both* the exposure
+and the outcome to fully explain away the observed causal effect.
 
-`CausalTransfer` (`detection/causal_transfer.py`) implements ICP
-(Peters et al., 2016).
+- **High E-value** → the attribution is robust; a very strong confounder would be
+  required to invalidate it.
+- **Low E-value** → the attribution is fragile; even a modest unobserved variable
+  could account for the observed effect.
 
-**Algorithm**:
+### Formula
 
-1. Each unique asset pair is treated as a separate *environment*.
-2. For every feature subset S ⊆ features (up to `max_subset_size=8`):
-   - Fit a linear regression of the label on S within each environment.
-   - Pool within-environment residuals.
-   - Run a one-way ANOVA F-test at α=0.01 across environments.
-   - If p > 0.01 (fail to reject equal-mean null), S is "potentially invariant".
-3. The invariant feature set = intersection of all accepted subsets.
-4. If no features survive the test (empty intersection), fall back to the global model.
+For a risk ratio RR ≥ 1:
 
-### Shared mechanism + pair-specific adjustments
-
-Once the invariant set is identified:
-
-- A **global model** is trained on all environments using only the invariant features.
-- A **pair-specific logistic regression** is trained on each environment's data
-  as a local adjustment layer.
-- At inference, the pair-specific model is used when the pair is known; the
-  global model handles unseen pairs.
-
-### Environment definition for Stellar DEX
-
-Environments are defined by **asset pair**.  Alternative definitions
-(time period, market regime) can be substituted by changing the `pair_col`
-argument to `CausalTransfer.fit`.
-
-### Security: anonymised environment labels
-
-Raw pair IDs (e.g. `USDC:GA5Z.../XLM:native`) are hashed with SHA-256
-(first 8 hex characters) before use as environment labels.  The raw pair
-string is never stored in the fitted model.
-
-### Usage
-
-```python
-from detection.causal_transfer import CausalTransfer
-
-ct = CausalTransfer(feature_cols=["benford_chi_square_24h", "round_trip_frequency", ...])
-result = ct.fit(train_df, pair_col="pair_id", label_col="label")
-
-# Evaluate on a held-out pair
-auc = ct.evaluate(test_df, pair_col="pair_id", label_col="label")
-
-# Predict probabilities (uses pair-specific model if available)
-probs = ct.predict_proba(new_df, pair_col="pair_id")
+```
+E = RR + sqrt(RR × (RR − 1))
 ```
 
-### Fallback behaviour
+Special case: RR = 1.0 (no effect) → E-value = 1.0.
 
-When `result.fallback_to_global is True`, all predictions use a single
-logistic regression trained on the full feature set.  This happens when the
-ANOVA test finds no stable features across environments.
+For RR < 1 the ratio is inverted first.
 
-### Generalisation benchmark
+**Verification**: RR = 2.0 → E = 2.0 + √(2.0 × 1.0) = 2.0 + 1.414 ≈ **3.41**
 
-The benchmark compares three models on a held-out pair:
+### Confidence Threshold
 
-| Model | Description |
-|---|---|
-| Transferred causal model | `CausalTransfer` trained on all other pairs |
-| Pair-specific model (10× data) | Trained on 10× more labelled data for the held-out pair |
-| Global model | Single model trained on all data without causal transfer |
+Attributions with **E-value < 2.0** are flagged as *"low confidence — possible
+confounding"* in the forensic report.  This threshold means a confounder with
+only a 2× association with both exposure and outcome could invalidate the finding.
 
-The target is: transferred model AUC ≥ pair-specific model AUC − 0.05.
+### For Compliance Officers
 
-### References
+Think of the E-value as a *minimum bar for an alternative explanation*.  An
+E-value of 3.41 means any alternative explanation would need to be at least
+3.41× more common in wash traders than in legitimate traders, *and* 3.41× more
+likely to produce the observed risk signal.  The higher the E-value, the harder
+it is for any hidden factor to explain away the flagged behaviour.
 
-- Peters, J., Bühlmann, P., & Meinshausen, N. (2016). Causal Inference Using Invariant Prediction: Identification and Confidence Intervals. *Journal of the Royal Statistical Society: Series B*, 78(5), 947–1012.
+E-values are **advisory context for investigators** and must not be used to
+suppress alerts or change gating logic.  A low E-value means the finding
+warrants more scrutiny, not dismissal.
+
+### In the Forensic Report
+
+Each causal attribution in the `CausalForensicReport` now includes a
+`sensitivity_results` field:
+
+```json
+"sensitivity_results": [
+  {
+    "label": "overall score vs counterfactual",
+    "risk_ratio": 2.0,
+    "evalue": 3.41,
+    "low_confidence": false,
+    "interpretation": "Robust attribution (E-value=3.41): an unobserved confounder
+      would need a 3.41× association with both exposure and outcome to explain
+      away this effect."
+  }
+]
+```
+
+### Reference
+
+VanderWeele, T.J. & Ding, P. (2017). Sensitivity Analysis in Observational
+Research: Introducing the E-Value. *Annals of Internal Medicine*, 167(4), 268–274.

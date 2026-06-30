@@ -1,0 +1,60 @@
+{
+  "version": "1.0",
+  "patterns": [
+    {
+      "id": "circular_trading",
+      "description": "Circular trading between fixed set of counterparties with high round-trip frequency",
+      "feature_weights": {
+        "round_trip_frequency": 3.0,
+        "counterparty_concentration_ratio": 2.5,
+        "self_matching_rate": 2.5,
+        "cross_pair_counterparty_overlap": 2.0,
+        "net_asset_flow_deviation": -1.5,
+        "inter_arrival_cv": -1.0
+      }
+    },
+    {
+      "id": "round_number_regular_intervals",
+      "description": "Round-number trade amounts at suspiciously regular time intervals",
+      "feature_weights": {
+        "benford_mad_24h": 2.5,
+        "benford_chi_square_24h": 2.0,
+        "intra_minute_clustering": 1.5,
+        "inter_arrival_cv": -2.0,
+        "entropy_of_amounts": -1.5
+      }
+    },
+    {
+      "id": "volume_inflation_cross_pair",
+      "description": "Coordinated volume inflation across multiple asset pairs simultaneously",
+      "feature_weights": {
+        "cross_pair_volume_correlation": 3.0,
+        "cross_pair_trade_synchrony": 2.5,
+        "volume_per_counterparty_ratio": 2.0,
+        "pair_diversity_score": -1.0,
+        "volume_spike_frequency": 1.5
+      }
+    },
+    {
+      "id": "layering_spoofing",
+      "description": "High order cancellation rates indicating layering or spoofing behaviour",
+      "feature_weights": {
+        "order_cancellation_rate": 3.5,
+        "intra_minute_clustering": 2.0,
+        "off_hours_activity_ratio": 1.5,
+        "benford_z_max_1h": 1.5
+      }
+    },
+    {
+      "id": "new_account_wash_ring",
+      "description": "New accounts with concentrated funding sources operating as a wash-trade ring",
+      "feature_weights": {
+        "account_age_days": -3.0,
+        "funding_source_similarity": 2.5,
+        "network_centrality": 2.0,
+        "in_wash_trading_ring": 3.0,
+        "ring_internal_density": 2.0
+      }
+    }
+  ]
+}
