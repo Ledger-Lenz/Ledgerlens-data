@@ -47,8 +47,10 @@ from detection.model_training import (
     compute_feature_schema_hash,
 )
 from utils.logging import get_logger
+from utils.tracing import get_tracer, hash_span_id
 
 logger = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 BENFORD_MAD_FLAG_THRESHOLD = 0.015
 ML_FLAG_THRESHOLD = 0.5
@@ -426,21 +428,21 @@ class RiskScorer:
         self,
         feature_row: pd.Series,
         labelled_count: int | None = None,
+    ) -> dict:  # type: ignore[override]
+        """Compute the LedgerLens Risk Score for a single feature row."""
+        wallet = str(feature_row.get("wallet", ""))
+        with _tracer.start_as_current_span("model.scored") as span:
+            span.set_attribute("wallet.id", hash_span_id(wallet) if wallet else "unknown")
+            result = self._score_impl(feature_row, labelled_count)
+            span.set_attribute("model.score", result.get("score", -1))
+            return result
+
+    def _score_impl(
+        self,
+        feature_row: pd.Series,
+        labelled_count: int | None = None,
     ) -> dict:
-        """Compute the LedgerLens Risk Score for a single feature row.
-
-        When ``labelled_count`` is provided and is less than
-        ``config.ZERO_SHOT_MIN_LABELLED_EXAMPLES``, scoring is routed through
-        the zero-shot pattern detector instead of the ensemble.
-
-        Returns a dict matching the on-chain `RiskScore` shape:
-            {score, benford_flag, ml_flag, confidence}
-
-        Args:
-            feature_row: Feature matrix row for the wallet/pair
-            caller_id: Caller identifier (e.g. "api.user123", "internal"). 
-                      "internal" skips output perturbation; external callers get Laplace noise.
-        """
+        """Internal scoring logic (called from score() inside an OTel span)."""
         override = self._check_override(feature_row)
         if override is not None:
             return override

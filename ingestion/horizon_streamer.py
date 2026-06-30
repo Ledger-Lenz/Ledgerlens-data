@@ -12,8 +12,10 @@ from stellar_sdk import Server
 from config import config
 from ingestion.data_models import Asset, Trade
 from utils.logging import get_logger
+from utils.tracing import get_tracer, hash_span_id, inject_trace_context
 
 logger = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 
 def _to_trade(record: dict) -> Trade:
@@ -56,7 +58,12 @@ def stream_trades(
         call_builder = server.trades().for_asset_pair(base_asset, counter_asset).cursor(cursor)
         try:
             for response in call_builder.stream():
-                yield _to_trade(response)
+                trade = _to_trade(response)
+                with _tracer.start_as_current_span("trade_event.received") as span:
+                    span.set_attribute("trade.id", hash_span_id(trade.trade_id))
+                    span.set_attribute("trade.base_asset", trade.base_asset.code)
+                    span.set_attribute("trade.counter_asset", trade.counter_asset.code)
+                yield trade
                 cursor = response["paging_token"]
                 attempts = 0
         except (ConnectionError, TimeoutError, OSError) as exc:

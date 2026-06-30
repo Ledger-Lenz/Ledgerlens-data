@@ -34,6 +34,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from utils.tracing import get_tracer
+
+_tracer = get_tracer(__name__)
+
 
 @dataclass
 class BenfordMetrics:
