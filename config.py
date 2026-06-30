@@ -246,6 +246,16 @@ class Config:
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
+    # Hyperparameter optimisation (#213)
+    # Number of Optuna trials per model when running scripts/optimize_hyperparams.py.
+    HPARAM_SEARCH_TRIALS: int = int(os.getenv("HPARAM_SEARCH_TRIALS", "100"))
+    # Wall-clock timeout per model in hours.
+    HPARAM_SEARCH_TIMEOUT_HOURS: float = float(os.getenv("HPARAM_SEARCH_TIMEOUT_HOURS", "2"))
+    # RNG seed — fixing this makes optimisation results reproducible.
+    HPARAM_RANDOM_STATE: int = int(os.getenv("HPARAM_RANDOM_STATE", "42"))
+    # Stop a single-objective study early after this many non-improving trials.
+    HPARAM_NO_IMPROVEMENT_PATIENCE: int = int(os.getenv("HPARAM_NO_IMPROVEMENT_PATIENCE", "30"))
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []

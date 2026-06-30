@@ -242,9 +242,44 @@ def train_models(
     noise = rng.normal(1.0, 0.005, size=X_test.shape)
     X_test_adv = X_test * noise
 
+    # Load pre-optimised hyperparameters if available (written by
+    # scripts/optimize_hyperparams.py).  Per-model files take precedence over
+    # the unified best_hyperparams.json so operators can tune one model at a
+    # time without touching the others.
+    from detection.hyperparameter_search import (  # noqa: PLC0415
+        load_best_hyperparams,
+        load_best_params,
+        validate_hyperparams,
+    )
+
+    _unified_hparams: dict = load_best_hyperparams() or {}
+
     results = {}
     for name, model_cls in MODEL_REGISTRY.items():
-        model = model_cls(random_state=random_state)
+        # Resolve hyperparams: per-model file > unified JSON > defaults
+        hparams: dict = {}
+        per_model = load_best_params(name)
+        if per_model is not None:
+            hparams = per_model
+            logger.info("Using optimised hyperparams for %s from best_params_%s.json", name, name)
+        elif name in _unified_hparams:
+            hparams = _unified_hparams[name]
+            logger.info("Using optimised hyperparams for %s from best_hyperparams.json", name)
+
+        # Security: validate bounds before passing to the constructor.
+        if hparams:
+            try:
+                validate_hyperparams(name, hparams)
+            except ValueError as _ve:
+                logger.warning(
+                    "Hyperparams for %s failed bounds validation (%s). "
+                    "Falling back to model defaults.",
+                    name,
+                    _ve,
+                )
+                hparams = {}
+
+        model = model_cls(random_state=random_state, **hparams)
         model.fit(X_train_res, y_train_res)
 
         probs = model.predict_proba(X_test)[:, 1]
