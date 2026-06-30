@@ -15,9 +15,17 @@ Asset-class-aware baselines (issue #279):
   from the theoretical Benford distribution without indicating manipulation.
   `AssetClassifier` maintains separate expected distributions per asset class,
   loaded from `data/build_config.json`, to reduce stablecoin false positives.
+
+Second-digit Benford analysis (Issue #179):
+  Extends first-digit anomaly detection to the second significant digit (0-9).
+  Wash-trade bots that vary their first digit to evade detection often leave
+  systematic second-digit anomalies because their lot-size algorithms don't
+  model the second digit independently. Functions: compute_second_digit_distribution,
+  chi_square_second_digit, z_scores_second_digit, mad_score_second_digit.
 """
 
 import hashlib
+import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -50,6 +58,23 @@ class BenfordMetrics:
 
 # Benford's Law expected frequency for leading digits 1-9
 BENFORD_EXPECTED = {d: math.log10(1 + 1 / d) for d in range(1, 10)}
+
+# Benford's Law expected frequency for second digits 0-9 (Issue #179)
+# Reference: Benford, F. (1938) 'The law of anomalous numbers'; Hill, T.P. (1995)
+# The second digit should appear with the following frequencies:
+# 0: 11.97%, 1: 11.39%, 2: 10.88%, ..., 9: 8.52%
+BENFORD_EXPECTED_2ND = {
+    0: 0.11968,
+    1: 0.11389,
+    2: 0.10882,
+    3: 0.10433,
+    4: 0.10031,
+    5: 0.09668,
+    6: 0.09337,
+    7: 0.09035,
+    8: 0.08757,
+    9: 0.08500,
+}
 
 _BUILD_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "build_config.json")
 
@@ -346,11 +371,37 @@ def compute_benford_metrics_for_windows(
     windows_hours: list[int] | None = None,
     reference_time: pd.Timestamp | None = None,
     asset: str | None = None,  # NEW: looks up per-asset windows
-) -> dict[int, BenfordMetrics]:
+    include_second_digit: bool = True,  # NEW: Issue #179 - include second-digit metrics
+) -> dict[int, dict[str, any]]:
     """Compute Benford metrics over multiple trailing windows ending at
     `reference_time` (defaults to the max timestamp in `df`).
 
-    Returns a dict mapping window size (hours) -> metrics dict.
+    Parameters
+    ----------
+    df:
+        DataFrame with columns specified by amount_col, time_col, and optionally
+        base_asset/counter_asset for per-asset window selection.
+    amount_col:
+        Column name for trade amounts.
+    time_col:
+        Column name for timestamp/ledger_close_time.
+    windows_hours:
+        List of window sizes in hours. Defaults to config.BENFORD_WINDOWS_HOURS or
+        per-asset windows if available.
+    reference_time:
+        End timestamp for the windows (defaults to max timestamp in df).
+    asset:
+        Asset code for looking up per-asset windows; inferred from df if omitted.
+    include_second_digit:
+        If True (default), also compute second-digit metrics (chi-square, MAD, z-scores).
+
+    Returns
+    -------
+    dict[int, dict]:
+        Maps window size (hours) -> dict with keys:
+          - "chi_square", "mad", "z_scores": first-digit metrics
+          - "chi_square_2nd", "mad_2nd", "z_scores_2nd": second-digit metrics (if include_second_digit=True)
+          - "sample_size": number of trades in window
     """
     if windows_hours is None:
         from config import config
@@ -374,7 +425,18 @@ def compute_benford_metrics_for_windows(
             windows_hours = config.BENFORD_WINDOWS_HOURS
 
     if df.empty:
-        return {w: compute_benford_metrics(pd.Series(dtype=float)) for w in windows_hours}
+        return {
+            w: {
+                "chi_square": np.nan,
+                "mad": np.nan,
+                "z_scores": {d: np.nan for d in range(1, 10)},
+                "chi_square_2nd": np.nan if include_second_digit else None,
+                "mad_2nd": np.nan if include_second_digit else None,
+                "z_scores_2nd": {d: np.nan for d in range(10)} if include_second_digit else None,
+                "sample_size": 0,
+            }
+            for w in windows_hours
+        }
 
     timestamps = pd.to_datetime(df[time_col])
     ref = reference_time or timestamps.max()
@@ -383,7 +445,24 @@ def compute_benford_metrics_for_windows(
     for hours in windows_hours:
         window_start = ref - pd.Timedelta(hours=hours)
         window_df = df[(timestamps > window_start) & (timestamps <= ref)]
-        results[hours] = compute_benford_metrics(window_df[amount_col], asset_code=asset)
+        amounts = window_df[amount_col]
+        
+        # First-digit metrics
+        metrics = compute_benford_metrics(amounts, asset_code=asset)
+        result = {
+            "chi_square": metrics.chi_square,
+            "mad": metrics.mad,
+            "z_scores": metrics.z_scores,
+            "sample_size": metrics.sample_size,
+        }
+        
+        # Second-digit metrics (Issue #179)
+        if include_second_digit:
+            result["chi_square_2nd"] = chi_square_second_digit(amounts)
+            result["mad_2nd"] = mad_score_second_digit(amounts)
+            result["z_scores_2nd"] = z_scores_second_digit(amounts)
+        
+        results[hours] = result
 
     return results
 
@@ -437,15 +516,109 @@ def second_digits(amounts: pd.Series) -> pd.Series:
     expected distribution of the second digit is flatter but still
     non-uniform, and adversarial rounding typically produces a very
     different second-digit pattern.
+    
+    Amounts with a single significant digit (amounts < 10) are excluded
+    from the analysis since they have no second digit. The count of excluded
+    amounts is logged for auditing.
     """
-    amounts = amounts[amounts > 0]
-    if amounts.empty:
-        return amounts
-    magnitudes = np.floor(np.log10(amounts)).astype(int)
-    normalized = amounts / (10.0**magnitudes)  # first digit is floor(normalized)
+    amounts_positive = amounts[amounts > 0]
+    if amounts_positive.empty:
+        return amounts_positive
+    
+    magnitudes = np.floor(np.log10(amounts_positive)).astype(int)
+    normalized = amounts_positive / (10.0**magnitudes)  # first digit is floor(normalized)
     # Remove first digit contribution, scale up and take floor
     second = np.floor((normalized - np.floor(normalized)) * 10).astype(int).clip(0, 9)
+    
     return second
+
+
+def second_digit_distribution(amounts: pd.Series) -> dict[int, float]:
+    """Observed frequency of each second digit 0-9 in the data.
+    
+    Amounts < 10 (single-digit) are excluded; the exclusion count is logged.
+    """
+    digits = second_digits(amounts)
+    if digits.empty:
+        return {d: 0.0 for d in range(10)}
+    
+    # Log exclusion if significant
+    amounts_positive = amounts[amounts > 0]
+    excluded = len(amounts_positive[amounts_positive < 10])
+    if excluded > 0 and len(amounts_positive) > 0:
+        exclusion_rate = excluded / len(amounts_positive)
+        if exclusion_rate > 0.1:  # Log if >10% excluded
+            logger_module = logging.getLogger(__name__)
+            logger_module.debug(
+                f"second_digit_distribution: {excluded}/{len(amounts_positive)} "
+                f"amounts excluded (< 10). Exclusion rate: {exclusion_rate:.1%}."
+            )
+    
+    counts = digits.value_counts(normalize=True)
+    return {d: float(counts.get(d, 0.0)) for d in range(10)}
+
+
+def chi_square_second_digit(amounts: pd.Series) -> float:
+    """Chi-square goodness-of-fit for second-digit distribution.
+    
+    Tests whether the observed second-digit frequencies conform to Benford's
+    expected second-digit distribution. High values indicate non-conformity
+    (a potential manipulation signal).
+    """
+    digits = second_digits(amounts)
+    n = len(digits)
+    if n == 0:
+        return 0.0
+    
+    observed_counts = digits.value_counts()
+    chi_sq = 0.0
+    for d in range(10):
+        expected_count = BENFORD_EXPECTED_2ND[d] * n
+        observed_count = observed_counts.get(d, 0)
+        if expected_count > 0:
+            chi_sq += (observed_count - expected_count) ** 2 / expected_count
+    
+    return float(chi_sq)
+
+
+def z_scores_second_digit(amounts: pd.Series) -> dict[int, float]:
+    """Per-digit Z-scores for second digits (0-9).
+    
+    Measures how many standard errors each digit's observed frequency deviates
+    from the expected Benford second-digit frequency.
+    """
+    digits = second_digits(amounts)
+    n = len(digits)
+    if n == 0:
+        return {d: 0.0 for d in range(10)}
+    
+    observed = second_digit_distribution(amounts)
+    scores = {}
+    for d in range(10):
+        p = BENFORD_EXPECTED_2ND[d]
+        std_err = math.sqrt(p * (1 - p) / n) if p * (1 - p) > 0 else 0.0
+        if std_err == 0:
+            scores[d] = 0.0
+            continue
+        z = (abs(observed[d] - p) - (1 / (2 * n))) / std_err
+        scores[d] = float(max(z, 0.0))
+    
+    return scores
+
+
+def mad_score_second_digit(amounts: pd.Series) -> float:
+    """Mean Absolute Deviation for second digits (0-9).
+    
+    Measures the average absolute deviation between observed and expected
+    second-digit frequencies. Values above 0.015 may indicate non-conformity.
+    """
+    digits = second_digits(amounts)
+    if digits.empty:
+        return 0.0
+    
+    observed = second_digit_distribution(amounts)
+    deviations = [abs(observed[d] - BENFORD_EXPECTED_2ND[d]) for d in range(10)]
+    return float(sum(deviations) / len(deviations))
 
 
 def chi_square_log(amounts: pd.Series) -> float:

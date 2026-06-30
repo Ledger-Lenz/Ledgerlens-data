@@ -583,6 +583,74 @@ All threads are `daemon=True` so they are automatically killed if the main proce
 
 ---
 
+## Sliding Window Benford Aggregator (Issue #254)
+
+The DB-based Benford computation in `benford_engine.py` scans all trades in a
+time window from the database on every call.  For the 30-day window on active
+pairs this takes several seconds and scans millions of rows.
+
+`SlidingWindowBenfordAggregator` (`detection/sliding_window_benford.py`)
+maintains per-digit counts in memory, updated incrementally as trades arrive
+and expire.
+
+### Design
+
+```
+add_trade(amount, timestamp)
+  └── _lazy_expire(timestamp)          ← drain expired entries from heap
+  └── digit = leading_digit(amount)
+  └── digit_counts[digit-1] += 1
+  └── heappush(heap, (timestamp, digit))
+
+chi_square()  ← O(9) arithmetic over digit_counts; no DB access
+mad()         ← O(9) arithmetic
+z_scores()    ← O(9) arithmetic
+```
+
+**Lazy expiry**: a min-heap keyed by timestamp drains expired entries on each
+`add_trade` call.  No background thread or timer is required.
+
+**Concurrency**: all mutations are guarded by `asyncio.Lock`, making the
+aggregator safe for concurrent use from multiple scoring coroutines within the
+same event loop.
+
+### Tolerance guarantee
+
+Running chi-square matches the batch-computed value (from `benford_engine.py`)
+within **1e-4 absolute tolerance** on synthetic data.  Verified in
+`tests/test_issues_253_254_255_256.py`.
+
+### Backward clock / NTP correction
+
+If the system clock jumps backward (e.g. an NTP step correction), some trades
+will appear to have timestamps in the future relative to the new system time.
+`_lazy_expire` uses the *current trade's timestamp* as the reference for
+expiry — not the system clock — so a backward step does not immediately
+un-expire in-window trades.  Trades with future-relative timestamps will stay
+in the window longer than their nominal window size, but will eventually expire
+correctly as real trades arrive.  For deployments sensitive to this edge case,
+use a monotonic clock for `add_trade` timestamps.
+
+### Performance
+
+10 000 `add_trade` calls complete in < 100ms on a single asyncio event loop
+(verified in the performance test).
+
+### Integration
+
+For real-time (streaming) scoring, instantiate a `SlidingWindowBenfordAggregator`
+per wallet / per window size and call `add_trade` as each new trade arrives.
+Call `to_metrics()` to get a `BenfordMetrics` object compatible with the rest
+of the feature pipeline.  The DB-based `compute_benford_metrics_for_windows`
+in `benford_engine.py` remains in use for batch scoring runs.
+
+### Environment variables
+
+No new variables are introduced.  The aggregator window width is determined
+by `BENFORD_WINDOWS_HOURS` (default `1,4,24,168,720`).
+
+---
+
 ## Kafka Streaming Backend (Issue #36)
 
 The default `sse` backend runs one thread per pair inside a single process — it
@@ -692,3 +760,74 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 | `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
 | `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
 | `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |
+
+---
+
+## Adaptive Micro-Batch Sizing (Issue #243)
+
+### Problem
+
+The streaming scorer processes trade events in micro-batches. A fixed batch size is suboptimal: small batches waste per-batch inference overhead during quiet periods; large batches introduce queueing latency during spikes.
+
+### PID Controller
+
+`AdaptiveBatchController` (in `streaming/streaming_scorer.py`) adjusts batch size in real time using a **Proportional-Integral-Derivative (PID)** controller.
+
+```
+error = observed_p95_latency - target_p95_latency
+Δbatch = -(Kp × error + Ki × ∫error + Kd × Δerror)
+batch_size = clamp(batch_size + Δbatch, min_batch, max_batch)
+```
+
+- **P term** — responds immediately to the current latency error; dominant during fast changes.
+- **I term** — integrates accumulated error to correct steady-state offset (e.g. consistently high latency at the current batch size).
+- **D term** — damps oscillation by reacting to the rate of change in error.
+- **Anti-windup** — the integral is clamped to `±50` so that sustained overload does not build an unbounded correction term that overshoots when conditions improve.
+
+### Default Gains
+
+| Gain | Default | Notes |
+|---|---|---|
+| `Kp` | 0.5 | Scale down for pipelines with high natural latency variance. |
+| `Ki` | 0.1 | Increase if steady-state offset persists after many seconds. |
+| `Kd` | 0.05 | Increase if the batch size oscillates. |
+
+The defaults target a **p95 latency of 2 seconds** on typical LedgerLens workloads.
+
+### Tuning for Different Deployment Sizes
+
+- **High-throughput (>10 k trades/s)**: reduce `Kp` to 0.2–0.3 and increase `max_batch` to 1000.
+- **Low-throughput (<100 trades/s)**: the controller naturally settles near `max_batch` since latency is always below target.
+- **Bursty workloads (exchange listings)**: increase `Kd` to dampen oscillation during volume spikes.
+
+Batch-size adjustments are logged at `DEBUG` level (`streaming.streaming_scorer`). Enable debug logging to produce a PID trace:
+
+```bash
+LOG_LEVEL=DEBUG python -m scripts.stream
+```
+
+### Disabling Adaptive Sizing
+
+Pass `--fixed-batch-size N` to `scripts/stream.py` to pin the batch size for debugging:
+
+```bash
+python -m scripts.stream --fixed-batch-size 64
+```
+
+### Prometheus Gauges
+
+| Metric | Type | Description |
+|---|---|---|
+| `ledgerlens_adaptive_batch_size` | Gauge | Current batch size chosen by the PID controller |
+| `ledgerlens_batch_target_latency_seconds` | Gauge | Configured p95 latency target |
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `STREAM_TARGET_P95_LATENCY_SECONDS` | `2.0` | PID target latency |
+| `STREAM_MIN_BATCH_SIZE` | `1` | Minimum allowed batch size |
+| `STREAM_MAX_BATCH_SIZE` | `500` | Maximum allowed batch size |
+| `STREAM_PID_KP` | `0.5` | Proportional gain |
+| `STREAM_PID_KI` | `0.1` | Integral gain |
+| `STREAM_PID_KD` | `0.05` | Derivative gain |

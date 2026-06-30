@@ -1,0 +1,101 @@
+# data/causal_priors.yaml
+#
+# Domain-expert prior knowledge constraints for the LedgerLens causal discovery
+# module (Issue #192).  These constraints prevent the PC algorithm from
+# producing causal edges that violate known temporal or structural facts about
+# the Stellar DEX wash-trade domain.
+#
+# FORMAT
+# ------
+# Each constraint is a triple:
+#   cause:  the variable that causally precedes ...
+#   effect: ... this variable.
+#   kind:   "required"  — this edge MUST appear in the learned DAG
+#               regardless of data evidence (hard constraint).
+#           "forbidden" — this edge must NOT appear in the learned DAG
+#               (soft constraint; a warning is emitted if the data-driven
+#               graph contained it before enforcement).
+#
+# DOMAIN RATIONALE
+# ----------------
+# 1. account_age_days → round_trip_frequency
+#    Account age precedes any trading activity.  Older accounts have had more
+#    time to develop wash-trading patterns.  The reverse is impossible — trading
+#    cannot make an account older.
+#
+# 2. account_age_days → self_matching_rate
+#    Same temporal reasoning: account creation date precedes trade execution.
+#
+# 3. funding_source_similarity → round_trip_frequency
+#    Wallets sharing a funding source are more likely to be controlled by the
+#    same operator and to execute coordinated round-trip trades.
+#
+# 4. counterparty_concentration_ratio → label
+#    High counterparty concentration (a wallet trading overwhelmingly with a
+#    single counterparty) is a direct causal indicator of wash trading.
+#
+# 5. benford_mad_24h → label
+#    Benford MAD at 24 hours is a direct statistical causal precursor of the
+#    wash-trade classification; it must remain a direct predecessor of label.
+#
+# 6. round_trip_frequency → account_age_days  (FORBIDDEN)
+#    Trading patterns cannot causally increase an account's age — age is
+#    determined solely by account creation time.
+#
+# 7. volume_per_counterparty_ratio → account_age_days  (FORBIDDEN)
+#    Volume metrics cannot retroactively change the creation timestamp.
+#
+# 8. label → benford_mad_24h  (FORBIDDEN)
+#    The wash-trade label is derived from feature values, not the other way
+#    around.  Reverse label → feature edges are spurious data artefacts.
+#
+# 9. label → counterparty_concentration_ratio  (FORBIDDEN)
+#    Same as above — the label cannot causally determine feature values.
+
+constraints:
+
+  # ── Temporal ordering: account age causally precedes trading activity ────
+
+  - cause: account_age_days
+    effect: round_trip_frequency
+    kind: required
+
+  - cause: account_age_days
+    effect: self_matching_rate
+    kind: required
+
+  # ── Structural funding-source causation ─────────────────────────────────
+
+  - cause: funding_source_similarity
+    effect: round_trip_frequency
+    kind: required
+
+  # ── Direct causal predictors of the label ───────────────────────────────
+
+  - cause: counterparty_concentration_ratio
+    effect: label
+    kind: required
+
+  - cause: benford_mad_24h
+    effect: label
+    kind: required
+
+  # ── Forbidden reverse edges (time cannot run backward) ──────────────────
+
+  - cause: round_trip_frequency
+    effect: account_age_days
+    kind: forbidden
+
+  - cause: volume_per_counterparty_ratio
+    effect: account_age_days
+    kind: forbidden
+
+  # ── Forbidden reverse edges (label cannot cause features) ───────────────
+
+  - cause: label
+    effect: benford_mad_24h
+    kind: forbidden
+
+  - cause: label
+    effect: counterparty_concentration_ratio
+    kind: forbidden

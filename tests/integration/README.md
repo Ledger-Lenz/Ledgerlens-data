@@ -5,6 +5,16 @@ Testnet. They are **not** executed by `make test` and require explicit opt-in.
 
 ---
 
+## Available Tests
+
+| Test | File | Purpose |
+|---|---|---|
+| **E2E Pipeline Test** | `test_full_pipeline_e2e.py` | Full-stack test: trades from Horizon SSE → ingestion → features → scoring → DB |
+| **Contract Client Live** | `test_contract_client_live.py` | Soroban contract interaction (deploy, submit, retrieve scores) |
+| **Kafka Streaming** | `test_kafka_streaming.py` | Kafka producer and consumer integration |
+
+---
+
 ## Prerequisites
 
 | Requirement | How to satisfy |
@@ -23,6 +33,8 @@ Testnet. They are **not** executed by `make test` and require explicit opt-in.
 | `LEDGERLENS_CONTRACT_ID` | Yes | — |
 | `LEDGERLENS_SUBMITTER_SECRET` | Yes | — |
 | `SOROBAN_RPC_URL` | No | `https://soroban-testnet.stellar.org` |
+| `HORIZON_URL` | No | `https://horizon-testnet.stellar.org` |
+| `RISK_SCORE_DB_URL` | No | `sqlite:///./testnet_scores.db` |
 
 Populate them by sourcing `.env.testnet` (written by `scripts/testnet_setup.py`):
 
@@ -46,9 +58,39 @@ python -m scripts.testnet_setup \
 export $(grep -v '^#' .env.testnet | xargs)
 export LEDGERLENS_INTEGRATION_TESTS=1
 
-# 3. Run the integration tests
+# 3. Run all integration tests
 pytest tests/integration/ -v --timeout=120
+
+# 3b. Or run just the e2e test
+make test-e2e
 ```
+
+---
+
+## End-to-End Test Expectations
+
+The E2E test (`test_full_pipeline_e2e.py`) validates the full pipeline:
+
+1. **Setup:** Generates known trade patterns using test factories
+2. **Stream:** Ingests trades from Horizon Testnet SSE
+3. **Process:** Computes Benford metrics, extracts features, scores with ensemble
+4. **Store:** Persists risk scores to the database
+5. **Validate:** Asserts scores are within expected ranges for the trade pattern
+
+### Test Patterns
+
+| Pattern | Trade behavior | Expected score range | Risk flag |
+|---|---|---|---|
+| **Clean** | Random amounts, diverse counterparties | 0–30 | ✗ (legitimate) |
+| **Round-trip** | Buy then sell same asset back | 60–100 | ✓ (wash trade) |
+| **Same-amount** | Repeated fixed-amount trades | 60–100 | ✓ (wash trade) |
+
+### Timeout & Assertions
+
+- Each pattern generates ≥3 wallets with ≥20 trades
+- Pipeline must compute scores within 60 seconds
+- If scores don't appear, test fails with descriptive message
+- DB is cleaned before and after test to avoid contamination
 
 ---
 
@@ -130,6 +172,7 @@ Integration tests are completely separate from the main `ci.yml` workflow:
 
 ## Troubleshooting
 
+- **`LEDGERLENS_INTEGRATION_TESTS not set`** — set `export LEDGERLENS_INTEGRATION_TESTS=1`.
 - **`LEDGERLENS_CONTRACT_ID not set`** — run `scripts/testnet_setup.py` first.
 - **`Friendbot rate limit (429)`** — the setup script retries 3 times with a
   5-second delay automatically.
@@ -138,3 +181,6 @@ Integration tests are completely separate from the main `ci.yml` workflow:
   5-second delay before the test fails.
 - **WASM hash mismatch** — pass the correct `--wasm-sha256` or use
   `--skip-hash-check` only for local development.
+- **Database locked** — if the integration test DB is locked after a crash,
+  delete `testnet_scores.db` and try again.
+
