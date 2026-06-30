@@ -583,6 +583,74 @@ All threads are `daemon=True` so they are automatically killed if the main proce
 
 ---
 
+## Sliding Window Benford Aggregator (Issue #254)
+
+The DB-based Benford computation in `benford_engine.py` scans all trades in a
+time window from the database on every call.  For the 30-day window on active
+pairs this takes several seconds and scans millions of rows.
+
+`SlidingWindowBenfordAggregator` (`detection/sliding_window_benford.py`)
+maintains per-digit counts in memory, updated incrementally as trades arrive
+and expire.
+
+### Design
+
+```
+add_trade(amount, timestamp)
+  └── _lazy_expire(timestamp)          ← drain expired entries from heap
+  └── digit = leading_digit(amount)
+  └── digit_counts[digit-1] += 1
+  └── heappush(heap, (timestamp, digit))
+
+chi_square()  ← O(9) arithmetic over digit_counts; no DB access
+mad()         ← O(9) arithmetic
+z_scores()    ← O(9) arithmetic
+```
+
+**Lazy expiry**: a min-heap keyed by timestamp drains expired entries on each
+`add_trade` call.  No background thread or timer is required.
+
+**Concurrency**: all mutations are guarded by `asyncio.Lock`, making the
+aggregator safe for concurrent use from multiple scoring coroutines within the
+same event loop.
+
+### Tolerance guarantee
+
+Running chi-square matches the batch-computed value (from `benford_engine.py`)
+within **1e-4 absolute tolerance** on synthetic data.  Verified in
+`tests/test_issues_253_254_255_256.py`.
+
+### Backward clock / NTP correction
+
+If the system clock jumps backward (e.g. an NTP step correction), some trades
+will appear to have timestamps in the future relative to the new system time.
+`_lazy_expire` uses the *current trade's timestamp* as the reference for
+expiry — not the system clock — so a backward step does not immediately
+un-expire in-window trades.  Trades with future-relative timestamps will stay
+in the window longer than their nominal window size, but will eventually expire
+correctly as real trades arrive.  For deployments sensitive to this edge case,
+use a monotonic clock for `add_trade` timestamps.
+
+### Performance
+
+10 000 `add_trade` calls complete in < 100ms on a single asyncio event loop
+(verified in the performance test).
+
+### Integration
+
+For real-time (streaming) scoring, instantiate a `SlidingWindowBenfordAggregator`
+per wallet / per window size and call `add_trade` as each new trade arrives.
+Call `to_metrics()` to get a `BenfordMetrics` object compatible with the rest
+of the feature pipeline.  The DB-based `compute_benford_metrics_for_windows`
+in `benford_engine.py` remains in use for batch scoring runs.
+
+### Environment variables
+
+No new variables are introduced.  The aggregator window width is determined
+by `BENFORD_WINDOWS_HOURS` (default `1,4,24,168,720`).
+
+---
+
 ## Kafka Streaming Backend (Issue #36)
 
 The default `sse` backend runs one thread per pair inside a single process — it
