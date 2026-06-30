@@ -1,13 +1,20 @@
-"""Cryptographically committed audit trail for forensic reports."""
+"""Cryptographically committed audit trail for forensic reports.
+
+Security note: all content hashing uses SHA-256 exclusively (not MD5 or SHA-1),
+per the project security policy documented in docs/security.md.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -216,3 +223,179 @@ def commit_forensic_report(
         features=features,
         timestamp=timestamp,
     )
+
+
+# ---------------------------------------------------------------------------
+# Merkle-chain tamper detection (Issue #196)
+# ---------------------------------------------------------------------------
+
+class TamperDetectedError(Exception):
+    """Raised when AuditMerkleChain.verify_chain detects a modified entry."""
+
+
+class _MerkleBase(DeclarativeBase):
+    pass
+
+
+class _MerkleRootRecord(_MerkleBase):
+    """Separate append-only table storing Merkle roots independently."""
+
+    __tablename__ = "audit_merkle_roots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    entry_index = Column(Integer, nullable=False, unique=True)
+    merkle_root = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+def _sha256(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _leaf_hash(index: int, content_hash: str) -> str:
+    return _sha256(f"{index}:{content_hash}")
+
+
+def _node_hash(left: str, right: str) -> str:
+    return _sha256(left + right)
+
+
+def _merkle_root(leaf_hashes: list[str]) -> str:
+    """Compute Merkle root from leaf hashes in O(n) time."""
+    if not leaf_hashes:
+        return _sha256("empty")
+    nodes = list(leaf_hashes)
+    while len(nodes) > 1:
+        if len(nodes) % 2 == 1:
+            nodes.append(nodes[-1])  # duplicate last leaf when odd
+        nodes = [_node_hash(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)]
+    return nodes[0]
+
+
+@dataclass
+class MerkleAuditEntry:
+    """A single entry in the Merkle audit chain."""
+
+    index: int
+    content_hash: str          # SHA-256 of entry content
+    prev_merkle_root: str      # root before this entry
+    merkle_root: str           # root after including this entry
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+class AuditMerkleChain:
+    """Merkle tree commitment scheme over audit log entries.
+
+    Each new entry extends a running Merkle root so any retrospective
+    modification to a log entry is detectable via :meth:`verify_chain`.
+
+    Merkle roots are stored in a separate ``audit_merkle_roots`` table,
+    making root tampering independently detectable from in-entry tampering.
+
+    Security: SHA-256 is used for all hashing (not MD5 or SHA-1).
+    """
+
+    def __init__(self, session_factory=None) -> None:
+        if session_factory is None:
+            engine = create_engine(config.RISK_SCORE_DB_URL)
+            _MerkleBase.metadata.create_all(engine, checkfirst=True)
+            if str(engine.url).startswith("sqlite"):
+                @event.listens_for(engine, "connect")
+                def _wal(conn, _rec):
+                    conn.execute("PRAGMA journal_mode=WAL")
+            self._session_factory = sessionmaker(bind=engine, future=True)
+        else:
+            self._session_factory = session_factory
+        self._entries: list[MerkleAuditEntry] = []
+
+    def _load_roots_from_db(self) -> dict[int, str]:
+        with self._session_factory() as session:
+            rows = session.query(_MerkleRootRecord).order_by(_MerkleRootRecord.entry_index).all()
+            return {r.entry_index: r.merkle_root for r in rows}
+
+    def _save_root(self, session: Session, index: int, root: str) -> None:
+        record = _MerkleRootRecord(
+            entry_index=index,
+            merkle_root=root,
+            created_at=datetime.now(UTC),
+        )
+        session.add(record)
+
+    def append(self, content: dict[str, Any]) -> MerkleAuditEntry:
+        """Append a new audit entry and extend the Merkle chain.
+
+        Parameters
+        ----------
+        content:
+            Arbitrary dict representing the audit event.  Its canonical
+            JSON SHA-256 hash becomes the leaf node in the chain.
+
+        Returns the constructed :class:`MerkleAuditEntry`.
+        """
+        content_bytes = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+
+        index = len(self._entries)
+        prev_root = self._entries[-1].merkle_root if self._entries else _sha256("genesis")
+
+        leaf_hashes = [_leaf_hash(e.index, e.content_hash) for e in self._entries]
+        leaf_hashes.append(_leaf_hash(index, content_hash))
+        new_root = _merkle_root(leaf_hashes)
+
+        entry = MerkleAuditEntry(
+            index=index,
+            content_hash=content_hash,
+            prev_merkle_root=prev_root,
+            merkle_root=new_root,
+        )
+        self._entries.append(entry)
+
+        with self._session_factory() as session:
+            self._save_root(session, index, new_root)
+            session.commit()
+
+        return entry
+
+    def verify_chain(self, start_index: int = 0, end_index: int | None = None) -> bool:
+        """Re-compute Merkle roots and confirm they match recorded roots.
+
+        Runs in O(n) where n = end_index - start_index.
+
+        Raises
+        ------
+        TamperDetectedError
+            When any entry's re-computed root does not match the stored root.
+        """
+        stop = end_index if end_index is not None else len(self._entries)
+        db_roots = self._load_roots_from_db()
+
+        leaf_hashes: list[str] = []
+        for i in range(stop):
+            if i < start_index:
+                # Still need to build up hashes before the window
+                leaf_hashes.append(_leaf_hash(i, self._entries[i].content_hash))
+                continue
+            if i >= len(self._entries):
+                raise TamperDetectedError(f"Entry index {i} is missing from in-memory chain")
+            entry = self._entries[i]
+            leaf_hashes.append(_leaf_hash(i, entry.content_hash))
+            recomputed = _merkle_root(leaf_hashes[:])
+
+            if recomputed != entry.merkle_root:
+                raise TamperDetectedError(
+                    f"In-entry Merkle root mismatch at index {i}: "
+                    f"expected {entry.merkle_root!r}, got {recomputed!r}"
+                )
+
+            stored_root = db_roots.get(i)
+            if stored_root is None:
+                raise TamperDetectedError(
+                    f"No Merkle root found in separate table for index {i}"
+                )
+            if stored_root != recomputed:
+                raise TamperDetectedError(
+                    f"Separate-table Merkle root mismatch at index {i}: "
+                    f"db={stored_root!r}, computed={recomputed!r}"
+                )
+
+        return True

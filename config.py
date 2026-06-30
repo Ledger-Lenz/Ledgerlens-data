@@ -58,6 +58,30 @@ class Config:
     )
 
     ASSET_BENFORD_WINDOWS: dict[str, list[int]] = {}
+    
+    # Adaptive Benford window selection (Issue #178)
+    # Minimum number of trades required for a window to produce statistically valid metrics.
+    # Must be >= 10 to prevent trivially small samples. Default 50 is recommended.
+    BENFORD_MIN_SAMPLE_SIZE: int = max(
+        10,
+        int(os.getenv("BENFORD_MIN_SAMPLE_SIZE", "50"))
+    )
+    
+    # Benford Drift Detection (Issue #180)
+    # Enable Benford drift detection to trigger retraining when digit distributions shift.
+    BENFORD_DRIFT_DETECTION_ENABLED: bool = os.getenv("BENFORD_DRIFT_DETECTION_ENABLED", "true").lower() == "true"
+    # Z-score threshold for flagging a shift in chi-square or MAD per-pair (default 3.0 = 0.27% tail probability).
+    BENFORD_DRIFT_Z_THRESHOLD: float = float(os.getenv("BENFORD_DRIFT_Z_THRESHOLD", "3.0"))
+    # Minimum pairs that must drift before firing a global retraining trigger (default 0 = any single pair can trigger).
+    BENFORD_DRIFT_NUM_PAIRS_TRIGGER: int = int(os.getenv("BENFORD_DRIFT_NUM_PAIRS_TRIGGER", "0"))
+    
+    # Conformal prediction (Issue #181)
+    # Coverage level for conformal prediction intervals (e.g. 0.90 = 90% coverage guarantee).
+    CONFORMAL_COVERAGE_LEVEL: float = float(os.getenv("CONFORMAL_COVERAGE_LEVEL", "0.90"))
+    # Path to the calibration artifact (computed during training, loaded at inference startup).
+    CONFORMAL_CALIBRATION_PATH: str = os.getenv("CONFORMAL_CALIBRATION_PATH", "models/conformal_calibration.joblib")
+    # Enable conformal prediction intervals in the API response (default true).
+    CONFORMAL_ENABLED: bool = os.getenv("CONFORMAL_ENABLED", "true").lower() == "true"
 
     CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS: int = int(
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
@@ -117,6 +141,8 @@ class Config:
     WASH_RING_RESOLUTION: float = float(os.getenv("WASH_RING_RESOLUTION", "1.0"))
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
+    # Motif census timeout — partial results returned with census_truncated=True if exceeded.
+    MOTIF_CENSUS_TIMEOUT_SECONDS: float = float(os.getenv("MOTIF_CENSUS_TIMEOUT_SECONDS", "5"))
 
     # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
     HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
@@ -143,6 +169,21 @@ class Config:
     KAFKA_LAG_ALERT_THRESHOLD: int = int(os.getenv("KAFKA_LAG_ALERT_THRESHOLD", "500"))
     KAFKA_METRICS_PORT: int = int(os.getenv("KAFKA_METRICS_PORT", "9100"))
     TRADE_AVRO_SCHEMA_PATH: str = os.getenv("TRADE_AVRO_SCHEMA_PATH", "data/trade_avro_schema.json")
+
+    # Account metadata streaming join (streaming/account_metadata_stream.py,
+    # streaming/pipeline.py MetadataJoinState)
+    # METADATA_TOPIC: dedicated Kafka topic for account metadata update events.
+    METADATA_TOPIC: str = os.getenv("METADATA_TOPIC", "ledgerlens.account_metadata")
+    # METADATA_JOIN_WINDOW_SECONDS: how long (seconds) a metadata update enriches
+    # incoming trade events.  After this window the update is considered stale and
+    # must be refreshed by a subsequent Horizon effect.  Default: 3600 (1 hour).
+    METADATA_JOIN_WINDOW_SECONDS: int = int(os.getenv("METADATA_JOIN_WINDOW_SECONDS", "3600"))
+    # METADATA_ACTIVE_WALLET_TTL_SECONDS: wallets that have had no trade activity
+    # for this many seconds are pruned from join state to keep memory bounded.
+    # Default: 86400 (24 hours) — matches the requirement spec.
+    METADATA_ACTIVE_WALLET_TTL_SECONDS: int = int(
+        os.getenv("METADATA_ACTIVE_WALLET_TTL_SECONDS", "86400")
+    )
 
     ALERT_CHANNEL: str = os.getenv("ALERT_CHANNEL", "stdout")
     ALERT_WEBHOOK_URL: str | None = os.getenv("ALERT_WEBHOOK_URL")
@@ -171,8 +212,25 @@ class Config:
     DP_MAX_GRAD_NORM: float = float(os.getenv("DP_MAX_GRAD_NORM", "1.0"))
     DP_EPOCHS: int = int(os.getenv("DP_EPOCHS", "50"))
 
+    # DP privacy budget tracker (Issue #195)
+    # Total epsilon cap across all training rounds and inference queries.
+    DP_BUDGET_TOTAL_EPSILON: float = float(os.getenv("DP_BUDGET_TOTAL_EPSILON", "100.0"))
+    # Alert is fired when remaining epsilon drops below this value.
+    DP_BUDGET_ALERT_THRESHOLD: float = float(os.getenv("DP_BUDGET_ALERT_THRESHOLD", "10.0"))
+
+    # OpenTelemetry distributed tracing (Issue #198)
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+    OTEL_SAMPLING_RATE: float = float(os.getenv("OTEL_SAMPLING_RATE", "0.1"))
+
     # Adversarial training augmentation
     ADVERSARIAL_AUG_RATIO: float = float(os.getenv("ADVERSARIAL_AUG_RATIO", "0.0"))
+
+    # FGSM adversarial training (Issue #191)
+    # Set ADV_TRAINING_ENABLED=true to enable the FGSM adversarial training loop.
+    ADV_TRAINING_ENABLED: bool = os.getenv("ADV_TRAINING_ENABLED", "false").lower() == "true"
+    ADV_TRAINING_EPOCHS: int = int(os.getenv("ADV_TRAINING_EPOCHS", "3"))
+    ADV_TRAINING_EPSILON: float = float(os.getenv("ADV_TRAINING_EPSILON", "0.1"))
+    ADV_TRAINING_RATIO: float = float(os.getenv("ADV_TRAINING_RATIO", "0.5"))
 
     # Model integrity & BFT voting
     MODEL_SIGNING_PRIVATE_KEY_PATH: str = os.getenv("MODEL_SIGNING_PRIVATE_KEY_PATH", "")
@@ -218,6 +276,14 @@ class Config:
     AL_ROLLBACK_AUC_DROP: float = float(os.getenv("AL_ROLLBACK_AUC_DROP", "0.01"))
     AL_QUEUE_PATH: str = os.getenv("AL_QUEUE_PATH", "data/annotation_queue.json")
 
+    # Core-set selection (Issue #253)
+    ACTIVE_LEARNING_ALPHA: float = float(os.getenv("ACTIVE_LEARNING_ALPHA", "0.5"))
+    CORESET_MIN_DISTANCE: float = float(os.getenv("CORESET_MIN_DISTANCE", "0.1"))
+
+    # Active learning stopping criterion (Issue #256)
+    ACTIVE_LEARNING_EER_THRESHOLD: float = float(os.getenv("ACTIVE_LEARNING_EER_THRESHOLD", "0.001"))
+    ACTIVE_LEARNING_CONVERGENCE_WINDOW: int = int(os.getenv("ACTIVE_LEARNING_CONVERGENCE_WINDOW", "5"))
+
     # Wash Trade Simulation Engine
     GAN_ROUNDS: int = int(os.getenv("GAN_ROUNDS", "5"))
     GAN_PLATEAU_THRESHOLD: float = float(os.getenv("GAN_PLATEAU_THRESHOLD", "0.005"))
@@ -242,25 +308,60 @@ class Config:
     FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))
     FEDERATED_MAX_STALENESS: int = int(os.getenv("FEDERATED_MAX_STALENESS", "5"))
 
+    # Feature cache (detection/feature_cache.py) — in-memory TTL+LRU cache for
+    # per-wallet feature matrices used by the streaming scorer.
+    FEATURE_CACHE_TTL_SECONDS: int = int(os.getenv("FEATURE_CACHE_TTL_SECONDS", "30"))
+    FEATURE_CACHE_MAXSIZE: int = int(os.getenv("FEATURE_CACHE_MAXSIZE", "1000"))
+
     # Label quality estimation (#271)
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
-    # Watermark-based late-arrival handling (#199)
-    WATERMARK_ALLOWED_LATENESS_SECONDS: int = int(os.getenv("WATERMARK_ALLOWED_LATENESS_SECONDS", "120"))
+    # ---------------------------------------------------------------------------
+    # Transformer sequence model (#182)
+    # ---------------------------------------------------------------------------
+    # Number of distinct asset-pair slots in the one-hot pair encoding.
+    # Increase this if the deployment monitors more than the default 32 pairs.
+    SEQ_MODEL_NUM_PAIRS: int = int(os.getenv("SEQ_MODEL_NUM_PAIRS", "32"))
+    # Dimension of the token embeddings and sequence-level output embedding.
+    SEQ_MODEL_EMBED_DIM: int = int(os.getenv("SEQ_MODEL_EMBED_DIM", "64"))
+    # Number of self-attention heads.  Must divide SEQ_MODEL_EMBED_DIM evenly.
+    SEQ_MODEL_NUM_HEADS: int = int(os.getenv("SEQ_MODEL_NUM_HEADS", "4"))
+    # Number of transformer encoder layers (2–4 is the sweet spot for latency).
+    SEQ_MODEL_NUM_LAYERS: int = int(os.getenv("SEQ_MODEL_NUM_LAYERS", "2"))
+    # Feed-forward expansion dimension inside each transformer layer.
+    SEQ_MODEL_FFN_DIM: int = int(os.getenv("SEQ_MODEL_FFN_DIM", "128"))
+    # Dropout probability applied during training (disabled at eval time).
+    SEQ_MODEL_DROPOUT: float = float(os.getenv("SEQ_MODEL_DROPOUT", "0.1"))
+    # Maximum allowed input sequence length.  Inputs longer than this are
+    # rejected before reaching the model to prevent memory exhaustion.
+    SEQ_MODEL_MAX_LENGTH: int = int(os.getenv("SEQ_MODEL_MAX_LENGTH", "512"))
+    # Whether to attempt loading the sequence model at inference time.
+    # Set to "false" to skip loading (e.g., before the first training run).
+    SEQ_MODEL_ENABLED: bool = os.getenv("SEQ_MODEL_ENABLED", "true").lower() in ("1", "true", "yes")
 
-    # Model watermarking — trigger key must be 32 bytes (AES-256) (#200)
-    MODEL_WATERMARK_KEY: str = os.getenv("MODEL_WATERMARK_KEY", "")
-    MODEL_WATERMARK_TRIGGER_COUNT: int = int(os.getenv("MODEL_WATERMARK_TRIGGER_COUNT", "100"))
-    MODEL_WATERMARK_TRIGGER_PATH: str = os.getenv("MODEL_WATERMARK_TRIGGER_PATH", "models/watermark_triggers.enc")
-
-    # Multi-region Horizon failover (#202)
-    HORIZON_FAILOVER_URLS: list[str] = [
-        u.strip() for u in os.getenv("HORIZON_FAILOVER_URLS", "").split(",") if u.strip()
-    ]
-    HORIZON_HEALTH_CHECK_INTERVAL_SECONDS: int = int(os.getenv("HORIZON_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
-    HORIZON_FAILOVER_TIMEOUT_SECONDS: int = int(os.getenv("HORIZON_FAILOVER_TIMEOUT_SECONDS", "10"))
-    HORIZON_DEV_MODE: bool = os.getenv("HORIZON_DEV_MODE", "").lower() in ("1", "true")
+    # ---------------------------------------------------------------------------
+    # Redis feature store (#183)
+    # ---------------------------------------------------------------------------
+    # Redis URL for the feature store.  Overrides the rate-limiter REDIS_URL when set.
+    # Format: redis://[:password@]host[:port][/db] or
+    #         rediss://[:password@]host[:port][/db]  (TLS)
+    FEATURE_STORE_REDIS_URL: str = os.getenv("FEATURE_STORE_REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/1"))
+    # Enable TLS for the feature store Redis connection.
+    # When FEATURE_STORE_REDIS_URL starts with rediss:// this is implied.
+    FEATURE_STORE_REDIS_TLS: bool = os.getenv("FEATURE_STORE_REDIS_TLS", "false").lower() in ("1", "true", "yes")
+    # Redis CA certificate path for TLS verification (optional).
+    FEATURE_STORE_REDIS_TLS_CA_CERT: str = os.getenv("FEATURE_STORE_REDIS_TLS_CA_CERT", "")
+    # Redis connection pool: maximum number of pooled connections.
+    FEATURE_STORE_REDIS_POOL_SIZE: int = int(os.getenv("FEATURE_STORE_REDIS_POOL_SIZE", "10"))
+    # Per-window TTLs (seconds) for cached feature vectors.
+    # Format: comma-separated "hours:seconds" pairs, e.g. "1:3600,4:14400,24:86400"
+    # When empty, a fixed 300-second TTL is used for all windows.
+    FEATURE_STORE_WINDOW_TTLS: str = os.getenv(
+        "FEATURE_STORE_WINDOW_TTLS", "1:3600,4:14400,24:86400,168:604800,720:2592000"
+    )
+    # Fallback to direct feature computation when Redis is unavailable.
+    FEATURE_STORE_FALLBACK_ENABLED: bool = os.getenv("FEATURE_STORE_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
 
     @classmethod
     def validate(cls, require_onchain: bool = False):

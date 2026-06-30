@@ -1,0 +1,1 @@
+{"event_id": "event_2", "account": "GVXYZ1234567890ABCDEFGHIJKLMNOPQRSTUV", "ledger_close_time": "2026-06-30T00:17:56.325532+00:00", "selling": {"code": "USDC", "issuer": "GBUQWP3BOUZX34ULNQG23RQ6F4OFSAI5BC2D3ZKAB2ZXUCNRC572BL5Z"}, "buying": {"code": "XLM", "issuer": null}, "amount": 120.0, "price": 1.22, "action": "created"}

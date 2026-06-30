@@ -9,6 +9,9 @@ API:
   - compute_ring_concentration_score(community_map, graph, trades_df)
     Compute intra-cluster trade ratio per community to detect artificial volume
     concentration.
+  - enrich_communities_with_motifs(graph, community_map, timeout_seconds)
+    Augment each community with structural motif features (triangle density, star
+    ratio, 4-cycle count, reciprocity) derived from the motif census.
 """
 
 import time
@@ -18,6 +21,7 @@ import networkx as nx
 import pandas as pd
 
 from config import config
+from detection.motif_census import MotifCensusResult, compute_motif_census
 
 try:
     import community as _community_louvain
@@ -168,3 +172,63 @@ def compute_ring_concentration_score(
 def validate_resolution_parameter(value: float) -> bool:
     """Check if resolution parameter is valid (0.1 <= value <= 10.0)."""
     return isinstance(value, (int, float)) and 0.1 <= value <= 10.0
+
+
+def enrich_communities_with_motifs(
+    graph: nx.DiGraph,
+    community_map: dict[str, int],
+    timeout_seconds: float = 5.0,
+) -> dict[int, dict]:
+    """Compute motif census features for each detected community.
+
+    Extracts the induced subgraph for each community (excluding singletons/noise
+    with id -1), runs the motif census, and returns normalised structural features
+    keyed by community id.
+
+    The following features are returned per community and are normalised by
+    community size to be comparable across communities of different sizes:
+
+      triangle_density  – triangles / C(n, 3), computed via the A³ matrix method.
+      star_ratio        – open-wedge (P3) motifs / total 3-node connected motifs.
+      cycle_4_per_node  – distinct 4-cycles divided by node count.
+      reciprocity       – fraction of directed edges that have a reverse edge.
+
+    Additional metadata keys:
+      node_count        – number of nodes (after sampling if applicable).
+      was_sampled       – True if the community exceeded 500 nodes and was subsampled.
+      census_truncated  – True if the timeout was hit before all features completed.
+
+    Args:
+        graph: Full wallet graph (used to derive known_nodes and community subgraphs).
+        community_map: Wallet -> community_id mapping from detect_communities().
+            Communities with id -1 (noise/below min size) are skipped.
+        timeout_seconds: Per-community motif census budget in seconds.
+
+    Returns:
+        Mapping community_id -> feature dict.
+    """
+    known_nodes: set = set(graph.nodes())
+
+    by_community: dict[int, list] = defaultdict(list)
+    for wallet, cid in community_map.items():
+        if cid != -1:
+            by_community[cid].append(wallet)
+
+    results: dict[int, dict] = {}
+    for cid, members in by_community.items():
+        subgraph = graph.subgraph(members).copy()
+        census: MotifCensusResult = compute_motif_census(
+            subgraph, known_nodes, timeout_seconds=timeout_seconds
+        )
+        n = max(census.node_count, 1)
+        results[cid] = {
+            "triangle_density": census.triangle_density,
+            "star_ratio": census.star_ratio,
+            "cycle_4_per_node": census.cycle_4_count / n,
+            "reciprocity": census.reciprocity,
+            "node_count": census.node_count,
+            "was_sampled": census.was_sampled,
+            "census_truncated": census.census_truncated,
+        }
+
+    return results

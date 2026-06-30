@@ -21,8 +21,10 @@ from detection.persistence import (
     get_session_factory,
 )
 from utils.logging import get_logger
+from utils.tracing import get_tracer, hash_span_id
 
 logger = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 
 class RiskScoreStore:
@@ -32,16 +34,14 @@ class RiskScoreStore:
         self._session_factory = session_factory or get_session_factory()
 
     def upsert(self, wallet: str, asset_pair: str, risk_score: dict) -> RiskScoreRecord:
-        """Insert or update the `RiskScore` record for `(wallet, asset_pair)`.
+        """Insert or update the `RiskScore` record for `(wallet, asset_pair)`."""
+        with _tracer.start_as_current_span("score.stored") as span:
+            span.set_attribute("wallet.id", hash_span_id(wallet))
+            span.set_attribute("score.value", risk_score.get("score", -1))
+            return self._upsert_impl(wallet, asset_pair, risk_score)
 
-        `risk_score` is the dict returned by `RiskScorer.score()`:
-        ``{"score", "benford_flag", "ml_flag", "confidence"}`` plus the
-        optional ``"propagated_risk"`` float produced by
-        :func:`detection.risk_propagation.propagate_risk_scores` and the
-        optional ``"ring_id"`` wash-trading ring grouping. ``"timestamp"`` is
-        ignored — ``updated_at`` is set server-side. When ``ring_id`` is absent
-        the existing value is preserved.
-        """
+    def _upsert_impl(self, wallet: str, asset_pair: str, risk_score: dict) -> RiskScoreRecord:
+        """Internal upsert logic called inside an OTel span."""
         for attempt in range(5):
             try:
                 with self._session_factory() as session:
