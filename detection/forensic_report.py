@@ -28,6 +28,12 @@ from detection.causal_attribution import CounterfactualAttributor
 from detection.model_inference import RiskScorer
 from detection.shap_explainer import ShapExplainer
 
+# CounterfactualResult is imported lazily to avoid circular imports;
+# we use TYPE_CHECKING for the type annotation only.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from detection.counterfactual_explainer import CounterfactualResult
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -94,6 +100,7 @@ class ForensicReport:
     soroban_anchor_tx: str | None = field(default=None, init=False)
     causal_attribution: CausalAttribution | None = None
     propagation_path: PropagationPath | None = None
+    counterfactual_result: "CounterfactualResult | None" = None
 
     def __post_init__(self) -> None:
         self.report_sha256 = self._compute_sha256()
@@ -129,6 +136,8 @@ class ForensicReport:
             d["causal_attribution"] = asdict(self.causal_attribution)
         if self.propagation_path is not None:
             d["propagation_path"] = asdict(self.propagation_path)
+        if self.counterfactual_result is not None:
+            d["counterfactual_result"] = self.counterfactual_result.to_dict()
         return d
 
     def to_dict(self) -> dict:

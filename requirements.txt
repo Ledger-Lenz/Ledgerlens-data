@@ -101,3 +101,9 @@ tabulate>=0.9.0
 
 # Hyperparameter optimization (Issue #281)
 optuna>=4.0.0
+
+# Causal discovery prior constraints (Issue #192)
+causal-learn>=0.1.4
+
+# Counterfactual explainer (Issue #193)
+dice-ml>=0.11

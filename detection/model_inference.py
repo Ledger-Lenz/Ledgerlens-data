@@ -202,6 +202,7 @@ class RiskScorer:
         self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+        self.selected_features: list[str] | None = self._load_selected_features()
         self.calibrators: dict[str, ConformalCalibrator] = {}
         self._load_calibrators()
         from detection.meta_learner import LeafEmbeddingExtractor
