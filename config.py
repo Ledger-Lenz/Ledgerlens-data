@@ -58,6 +58,30 @@ class Config:
     )
 
     ASSET_BENFORD_WINDOWS: dict[str, list[int]] = {}
+    
+    # Adaptive Benford window selection (Issue #178)
+    # Minimum number of trades required for a window to produce statistically valid metrics.
+    # Must be >= 10 to prevent trivially small samples. Default 50 is recommended.
+    BENFORD_MIN_SAMPLE_SIZE: int = max(
+        10,
+        int(os.getenv("BENFORD_MIN_SAMPLE_SIZE", "50"))
+    )
+    
+    # Benford Drift Detection (Issue #180)
+    # Enable Benford drift detection to trigger retraining when digit distributions shift.
+    BENFORD_DRIFT_DETECTION_ENABLED: bool = os.getenv("BENFORD_DRIFT_DETECTION_ENABLED", "true").lower() == "true"
+    # Z-score threshold for flagging a shift in chi-square or MAD per-pair (default 3.0 = 0.27% tail probability).
+    BENFORD_DRIFT_Z_THRESHOLD: float = float(os.getenv("BENFORD_DRIFT_Z_THRESHOLD", "3.0"))
+    # Minimum pairs that must drift before firing a global retraining trigger (default 0 = any single pair can trigger).
+    BENFORD_DRIFT_NUM_PAIRS_TRIGGER: int = int(os.getenv("BENFORD_DRIFT_NUM_PAIRS_TRIGGER", "0"))
+    
+    # Conformal prediction (Issue #181)
+    # Coverage level for conformal prediction intervals (e.g. 0.90 = 90% coverage guarantee).
+    CONFORMAL_COVERAGE_LEVEL: float = float(os.getenv("CONFORMAL_COVERAGE_LEVEL", "0.90"))
+    # Path to the calibration artifact (computed during training, loaded at inference startup).
+    CONFORMAL_CALIBRATION_PATH: str = os.getenv("CONFORMAL_CALIBRATION_PATH", "models/conformal_calibration.joblib")
+    # Enable conformal prediction intervals in the API response (default true).
+    CONFORMAL_ENABLED: bool = os.getenv("CONFORMAL_ENABLED", "true").lower() == "true"
 
     CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS: int = int(
         os.getenv("CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS", "30")
