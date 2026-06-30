@@ -2,13 +2,20 @@
 
 Exit codes:
     0  — No drift detected, no retraining needed.
-    2  — Drift detected, retrained and promoted.
+    2  — Drift detected, retrained (full or incremental) and promoted.
     3  — Drift detected, retrained but NOT promoted (metric regression).
     1  — Fatal error.
 
 Usage:
     python -m scripts.retrain_if_drifted --lookback-days 30
     python -m scripts.retrain_if_drifted --lookback-days 30 --retrain-data-path data/synthetic_dataset.parquet
+
+Incremental training mode (``--incremental``):
+    When the flag is passed, the script attempts to run
+    ``incremental_train_lightgbm`` instead of a full ensemble retrain.  A
+    full retrain is forced if the staleness detector reports that
+    ``MAX_INCREMENTAL_ROUNDS`` consecutive incremental passes have already
+    occurred, or if the buffer does not yet contain enough samples.
 """
 
 import argparse
@@ -20,16 +27,21 @@ import shutil
 import sys
 from datetime import UTC, datetime, timedelta
 
+import joblib
 import pandas as pd
 
 from config import config
 from detection.drift_monitor import DriftMonitor
+from detection.feature_cache import RecentDataBuffer
 from detection.feature_engineering import build_feature_matrix
 from detection.model_training import (
     MODEL_REGISTRY,
+    IncrementalTrainingStalenessDetector,
+    incremental_train_lightgbm,
     load_training_data,
     save_models,
     save_training_artifacts,
+    split_features_labels,
     train_models,
 )
 from utils.logging import get_logger
@@ -215,7 +227,137 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--random-state", type=int, default=42, help="Random state for train/test split"
     )
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        default=False,
+        help=(
+            "Attempt incremental LightGBM training instead of a full ensemble retrain. "
+            "A full retrain is forced when the staleness cap (MAX_INCREMENTAL_ROUNDS) "
+            "is reached or the buffer has too few samples."
+        ),
+    )
+    parser.add_argument(
+        "--incremental-buffer-path",
+        default=None,
+        help=(
+            "Path to a labelled parquet file used as the RecentDataBuffer contents "
+            "for incremental training (bypasses the live streaming buffer).  "
+            "Only used when --incremental is set."
+        ),
+    )
+    parser.add_argument(
+        "--n-new-trees",
+        type=int,
+        default=None,
+        help=(
+            "Number of new trees to append per incremental pass "
+            "(default: config.INCREMENTAL_N_NEW_TREES = 100)."
+        ),
+    )
+    parser.add_argument(
+        "--staleness-state-path",
+        default=None,
+        help="Override path for the staleness detector state JSON file.",
+    )
     return parser.parse_args(argv)
+
+
+# ---------------------------------------------------------------------------
+# Incremental training helpers
+# ---------------------------------------------------------------------------
+
+
+def run_incremental_training(
+    model_dir: str,
+    new_data: pd.DataFrame,
+    n_new_trees: int,
+    staleness_detector: IncrementalTrainingStalenessDetector,
+) -> tuple[bool, str]:
+    """Attempt an incremental LightGBM update.
+
+    Appends *n_new_trees* to the existing LightGBM model using *new_data*,
+    overwrites ``lightgbm.joblib`` in *model_dir*, and increments the
+    staleness counter.
+
+    Returns:
+        ``(success: bool, reason: str)``
+    """
+    lgbm_path = os.path.join(model_dir, "lightgbm.joblib")
+    if not os.path.exists(lgbm_path):
+        return False, f"LightGBM artifact not found at {lgbm_path}"
+
+    # Load metadata to get the authoritative feature column list
+    metadata = load_model_metadata(model_dir)
+    if metadata is None:
+        return False, "Cannot load model_metadata.json — skipping incremental training"
+
+    reference_feature_columns: list[str] = metadata.get("feature_columns", [])
+    if not reference_feature_columns:
+        return False, "model_metadata.json has no feature_columns — cannot validate schema"
+
+    existing_lgbm = joblib.load(lgbm_path)
+
+    try:
+        updated_lgbm = incremental_train_lightgbm(
+            existing_model=existing_lgbm,
+            new_data=new_data,
+            n_new_trees=n_new_trees,
+            reference_feature_columns=reference_feature_columns,
+        )
+    except Exception as exc:
+        return False, f"incremental_train_lightgbm failed: {exc}"
+
+    # Overwrite the LightGBM artifact in-place (atomic-ish via temp file)
+    tmp_path = lgbm_path + ".tmp"
+    joblib.dump(updated_lgbm, tmp_path)
+    os.replace(tmp_path, lgbm_path)
+
+    stale = staleness_detector.increment()
+    msg = (
+        f"Incremental update applied ({n_new_trees} new trees). "
+        f"Staleness round {staleness_detector.rounds}/{staleness_detector.max_rounds}."
+    )
+    if stale:
+        msg += " Staleness cap reached — full retrain required next cycle."
+
+    logger.info(msg)
+    return True, msg
+
+
+def _evaluate_incremental_model(
+    model_dir: str,
+    new_data: pd.DataFrame,
+    reference_feature_columns: list[str],
+) -> dict | None:
+    """Compute AUC-ROC for the updated LightGBM model on *new_data*.
+
+    Returns a metrics dict ``{"lightgbm": {"auc_roc": float}}`` or ``None``
+    on failure.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    lgbm_path = os.path.join(model_dir, "lightgbm.joblib")
+    if not os.path.exists(lgbm_path):
+        return None
+
+    try:
+        from detection.model_training import validate_incremental_samples
+
+        X_val = validate_incremental_samples(new_data, reference_feature_columns)
+        y_val = new_data.loc[X_val.index, "label"]
+
+        if len(y_val.unique()) < 2:
+            logger.warning("_evaluate_incremental_model: only one class in validation — skipping AUC")
+            return None
+
+        lgbm = joblib.load(lgbm_path)
+        probs = lgbm.predict_proba(X_val)[:, 1]
+        auc = float(roc_auc_score(y_val, probs))
+        return {"lightgbm": {"auc_roc": auc}}
+    except Exception as exc:
+        logger.warning("_evaluate_incremental_model failed: %s", exc)
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,6 +406,104 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("Drift detected — starting retraining pipeline")
 
+    # -----------------------------------------------------------------------
+    # Incremental training path
+    # -----------------------------------------------------------------------
+    if args.incremental:
+        n_new_trees = args.n_new_trees or getattr(config, "INCREMENTAL_N_NEW_TREES", 100)
+        staleness_detector = IncrementalTrainingStalenessDetector(
+            state_path=args.staleness_state_path,
+        )
+
+        if staleness_detector.is_stale():
+            logger.info(
+                "Staleness cap reached (%d/%d rounds) — forcing full retrain",
+                staleness_detector.rounds,
+                staleness_detector.max_rounds,
+            )
+            # Fall through to full-retrain path below; reset counter after
+            # successful promotion.
+            args.incremental = False  # trigger full-retrain branch
+        else:
+            # Load incremental buffer data
+            if args.incremental_buffer_path:
+                new_data = pd.read_parquet(args.incremental_buffer_path)
+            elif args.retrain_data_path:
+                # Fallback: use the labelled dataset as the incremental buffer
+                new_data = load_training_data(args.retrain_data_path)
+            else:
+                logger.error(
+                    "Incremental training requested but neither --incremental-buffer-path "
+                    "nor --retrain-data-path provided"
+                )
+                return 1
+
+            min_samples = getattr(config, "INCREMENTAL_BUFFER_SIZE", 10_000) // 10
+            buffer = RecentDataBuffer(
+                max_size=getattr(config, "INCREMENTAL_BUFFER_SIZE", 10_000),
+                min_samples=min_samples,
+            )
+            buffer.add(new_data)
+
+            if not buffer.is_ready(force=True):
+                logger.warning(
+                    "Incremental buffer has too few samples (%d < %d min) — "
+                    "skipping incremental training",
+                    len(buffer),
+                    min_samples,
+                )
+                write_retrain_report(drift_dict, None, None, False,
+                                     "Buffer too small for incremental training", None)
+                return 0
+
+            buffered_data = buffer.flush()
+
+            reference_feature_columns: list[str] = metadata.get("feature_columns", [])
+            old_metrics = load_metrics(model_dir)
+            archive_path = archive_current_models(model_dir)
+
+            success, reason = run_incremental_training(
+                model_dir=model_dir,
+                new_data=buffered_data,
+                n_new_trees=n_new_trees,
+                staleness_detector=staleness_detector,
+            )
+
+            if not success:
+                logger.error("Incremental training failed: %s", reason)
+                write_retrain_report(drift_dict, old_metrics, None, False, reason, archive_path)
+                return 1
+
+            # Evaluate the updated LightGBM on the buffered data
+            new_metrics = _evaluate_incremental_model(
+                model_dir, buffered_data, reference_feature_columns
+            )
+
+            # Lightweight promotion check: only LightGBM AUC is available
+            promote = True
+            if old_metrics and new_metrics and "lightgbm" in old_metrics and "lightgbm" in new_metrics:
+                old_auc = old_metrics["lightgbm"].get("auc_roc", 0.0)
+                new_auc = new_metrics["lightgbm"].get("auc_roc", 0.0)
+                if new_auc < old_auc - PROMOTION_TOLERANCE:
+                    promote = False
+                    reason = (
+                        f"Incremental update: LightGBM AUC {new_auc:.4f} < "
+                        f"{old_auc:.4f} - {PROMOTION_TOLERANCE} — not promoted"
+                    )
+                    logger.warning(reason)
+
+            write_retrain_report(drift_dict, old_metrics, new_metrics, promote, reason, archive_path)
+
+            if staleness_detector.is_stale():
+                logger.warning(
+                    "Staleness cap now reached — next drift event will trigger a full retrain"
+                )
+
+            return 2 if promote else 3
+
+    # -----------------------------------------------------------------------
+    # Full-retrain path (original behaviour, also used after staleness reset)
+    # -----------------------------------------------------------------------
     if not args.retrain_data_path:
         logger.error("Drift detected but --retrain-data-path not provided")
         return 1
@@ -310,6 +550,18 @@ def main(argv: list[str] | None = None) -> int:
             archive_path,
         )
         shutil.rmtree(temp_model_dir, ignore_errors=True)
+
+        # Reset staleness counter — a full retrain resets the incremental clock
+        try:
+            staleness_state_path = getattr(args, "staleness_state_path", None)
+            staleness_detector = IncrementalTrainingStalenessDetector(
+                state_path=staleness_state_path
+            )
+            staleness_detector.reset()
+            logger.info("Staleness counter reset after full retrain")
+        except Exception as exc:
+            logger.warning("Could not reset staleness counter: %s", exc)
+
         return 2
     else:
         logger.warning("New models did not meet promotion criteria — archived but not promoted")
