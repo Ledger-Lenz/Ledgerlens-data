@@ -19,6 +19,7 @@ detection on Ethereum (Elliptic dataset, AUC > 0.97) and are directly applicable
 **Key references:**
 - Weber et al. (2019) — Anti-Money Laundering in Bitcoin: Experimenting with Graph Convolutional Networks
 - Lo et al. (2023) — Inspection-L: Towards Flow-Level Detection of Wash Trading on DEXs via Graph Neural Networks
+- Xu et al. (2020) — Inductive Representation Learning on Temporal Graphs (TGAT), ICLR 2020
 
 ---
 
@@ -314,3 +315,154 @@ pytest tests/test_cluster_scoring.py -v
 
 Tests cover permutation invariance, cluster ID stability, correct return shape,
 high-risk ring produces score > 80, and DiffPool pooling to `n_clusters`.
+
+---
+
+## Heterogeneous Graph Schema (Issue #186)
+
+Wash trade rings on the Stellar DEX often span multiple asset pairs and involve
+both wallet-to-wallet and wallet-to-AMM-pool relationships.  A heterogeneous
+graph with distinct node types enables more expressive GNN representations than
+a single-type wallet graph.
+
+### Node types
+
+| Node type | Feature dim | Features |
+|---|---|---|
+| `wallet` | 37 | Full wallet feature vector |
+| `asset` | 3 | `total_volume_30d`, `unique_traders_30d`, `benford_mad_30d` |
+| `amm_pool` | 3 | `tvl`, `fee_rate`, `volume_24h` |
+
+Node features are fetched from the existing feature cache; they are **not**
+recomputed during graph construction.
+
+### Edge types
+
+```
+(wallet) ──traded──────────────────► (asset)
+(wallet) ──provided_liquidity──────► (amm_pool)
+(wallet) ──co_traded_with──────────► (wallet)
+```
+
+| Edge type | Meaning |
+|---|---|
+| `(wallet, traded, asset)` | Wallet traded the given asset |
+| `(wallet, provided_liquidity, amm_pool)` | Wallet provided liquidity to pool |
+| `(wallet, co_traded_with, wallet)` | Wallets co-active on the same pair within `co_trade_window_hours` |
+
+### Security
+
+Wallet addresses are **SHA-256-hashed** before being embedded as node IDs
+(`hash_wallet_ids=True`, default) to prevent re-identification from model
+artefacts.
+
+### API
+
+```python
+from detection.wallet_graph import build_hetero_graph
+from detection.gnn_encoder import HeteroGNNEncoder
+
+hetero_data = build_hetero_graph(
+    activities=account_activities,
+    trades=trades_df,
+    asset_features={"XLM:native": [1e6, 500, 0.03]},
+    amm_pool_features={"pool_abc": [2e5, 0.003, 5e4]},
+)
+
+encoder = HeteroGNNEncoder()
+embeddings = encoder.encode(hetero_data)
+# embeddings["wallet"]   → np.ndarray (N_wallets, embedding_dim)
+# embeddings["asset"]    → np.ndarray (N_assets,  embedding_dim)
+# embeddings["amm_pool"] → np.ndarray (N_pools,   embedding_dim)
+```
+
+### Performance target
+
+Graph construction must complete in < 5 seconds for graphs with up to 10,000
+wallet nodes.
+
+---
+
+## Temporal Graph Attention Network (Issue #187)
+
+Wash trade rings evolve over time: participants join and leave, intensity
+changes, and rings may go dormant and re-activate.  `TemporalGNNEncoder`
+captures these dynamics by operating on **timestamped edges** using the TGAT
+architecture (Xu et al., 2020, ICLR).
+
+### Architecture
+
+```
+Trade edge (src_wallet, dst_wallet, amount, timestamp)
+        │
+        ▼
+_FunctionalTimeEncoding(delta_t)
+  delta_t = query_timestamp − neighbour_timestamp
+  FTE(Δt) = cos(w · Δt + b)   ← learnable w, b  (NOT sinusoidal)
+        │
+        ▼
+TemporalGraphAttentionLayer
+  Q = q_proj(src_feat)
+  K = k_proj([nbr_feat ‖ FTE(Δt)])
+  V = v_proj([nbr_feat ‖ FTE(Δt)])
+  ctx = softmax(Q Kᵀ / √d) · V
+  out = ReLU(out_proj([src_feat ‖ ctx]))
+        │
+        ▼
+Temporal embedding  (embedding_dim,)
+```
+
+**Time encoding** uses the **Functional Time Encoding (FTE)** from TGAT: a
+learnable linear projection of cosine-transformed time deltas.  Positional
+sinusoids are explicitly NOT used.
+
+### Memory module
+
+Each wallet maintains a bounded list of the last `max_edges_per_wallet`
+(default 200) observed trade edges in memory.  Memory is capped at **1 MB
+per wallet** to prevent unbounded growth.  The full state is JSON-serialisable
+for checkpointing.
+
+### Timestamp validation
+
+Trade timestamps are validated as **Unix seconds in [2015-01-01, 2040-01-01]**
+before encoding.  Values outside this range raise `ValueError` and are skipped
+during training to prevent adversarial time injection.
+
+### Training
+
+```bash
+python -m detection.model_training \
+  --data-path data/synthetic_dataset.parquet \
+  --raw-trades-path data/raw_trades.parquet \
+  --with-temporal-gnn
+```
+
+The encoder observes all trade edges from `--raw-trades-path`, then saves its
+state to `{MODEL_DIR}/temporal_gnn_encoder.json`.
+
+### API
+
+```python
+from detection.gnn_encoder import TemporalGNNEncoder
+import json
+
+# Training
+tgnn = TemporalGNNEncoder(max_edges_per_wallet=200)
+tgnn.observe_edge(src_wallet, dst_wallet, src_features, dst_features, timestamp)
+state = tgnn.state_dict()
+with open("models/temporal_gnn_encoder.json", "w") as f:
+    json.dump(state, f)
+
+# Inference
+tgnn2 = TemporalGNNEncoder()
+with open("models/temporal_gnn_encoder.json") as f:
+    tgnn2.load_state_dict(json.load(f))
+emb = tgnn2.encode(wallet, query_timestamp)  # → np.ndarray (embedding_dim,)
+```
+
+### Reference
+
+Xu, D., Ruan, C., Körpeoglu, E., Kumar, S., & Achan, K. (2020). *Inductive
+Representation Learning on Temporal Graphs*. ICLR 2020.
+<https://arxiv.org/abs/2002.07962>

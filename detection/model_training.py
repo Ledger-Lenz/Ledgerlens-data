@@ -419,6 +419,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--with-temporal-gnn",
+        action="store_true",
+        default=False,
+        help=(
+            "Pre-train a TemporalGNNEncoder (TGAT-style) on timestamped trade edges "
+            "before ensemble calibration.  Requires --raw-trades-path to contain a "
+            "Parquet file with columns (base_account, counter_account, base_amount, "
+            "ledger_close_time as Unix seconds).  The encoder state is saved to "
+            "{MODEL_DIR}/temporal_gnn_encoder.json."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-gnn-max-edges",
+        type=int,
+        default=200,
+        help="Max timestamped edges per wallet retained by TemporalGNNEncoder (default: 200)",
+    )
+    parser.add_argument(
         "--raw-trades-path",
         default="data/raw_trades.parquet",
         help="Path to raw trades Parquet file for Benford window optimization"
@@ -573,6 +591,64 @@ def main() -> None:
         except ImportError as exc:
             logger.error("--with-gnn requested but torch/torch_geometric not available: %s", exc)
             logger.error("Install torch and torch_geometric to enable GNN training.")
+
+    # --with-temporal-gnn: optional TGAT pre-training step (Issue #187)
+    if args.with_temporal_gnn:
+        try:
+            from detection.gnn_encoder import TemporalGNNEncoder
+
+            raw_trades_path = args.raw_trades_path
+            if not os.path.exists(raw_trades_path):
+                logger.error(
+                    "--with-temporal-gnn requires --raw-trades-path (%s not found)",
+                    raw_trades_path,
+                )
+            else:
+                logger.info("Loading raw trades for TemporalGNNEncoder from %s", raw_trades_path)
+                raw_trades = pd.read_parquet(raw_trades_path)
+                required_cols = {"base_account", "counter_account", "ledger_close_time"}
+                missing = required_cols - set(raw_trades.columns)
+                if missing:
+                    logger.error(
+                        "--with-temporal-gnn: raw trades missing columns %s", sorted(missing)
+                    )
+                else:
+                    tgnn = TemporalGNNEncoder(
+                        max_edges_per_wallet=args.temporal_gnn_max_edges,
+                        random_state=args.random_state,
+                    )
+                    n_edges = 0
+                    for _, row in raw_trades.iterrows():
+                        try:
+                            ts = float(row["ledger_close_time"])
+                            src_f = [0.0] * tgnn.in_dim
+                            dst_f = [0.0] * tgnn.in_dim
+                            if "base_amount" in row and not pd.isna(row["base_amount"]):
+                                src_f[3] = float(row["base_amount"])
+                            tgnn.observe_edge(
+                                str(row["base_account"]),
+                                str(row["counter_account"]),
+                                src_f,
+                                dst_f,
+                                ts,
+                            )
+                            n_edges += 1
+                        except ValueError as exc:
+                            logger.debug("Skipping edge with invalid timestamp: %s", exc)
+
+                    logger.info("TemporalGNNEncoder observed %d trade edges", n_edges)
+
+                    os.makedirs(model_dir, exist_ok=True)
+                    output_path = os.path.join(model_dir, "temporal_gnn_encoder.json")
+                    state = tgnn.state_dict()
+                    with open(output_path, "w") as f:
+                        json.dump(state, f)
+                    logger.info("TemporalGNNEncoder state saved to %s", output_path)
+
+        except ImportError as exc:
+            logger.error(
+                "--with-temporal-gnn requested but torch not available: %s", exc
+            )
 
     training_output = train_models(
         df,

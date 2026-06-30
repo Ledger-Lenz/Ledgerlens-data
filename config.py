@@ -144,6 +144,17 @@ class Config:
     KAFKA_METRICS_PORT: int = int(os.getenv("KAFKA_METRICS_PORT", "9100"))
     TRADE_AVRO_SCHEMA_PATH: str = os.getenv("TRADE_AVRO_SCHEMA_PATH", "data/trade_avro_schema.json")
 
+    # Back-pressure (Issue #184)
+    KAFKA_BACKPRESSURE_HWM: int = int(os.getenv("KAFKA_BACKPRESSURE_HWM", "10000"))
+    KAFKA_BACKPRESSURE_LWM: int = int(os.getenv("KAFKA_BACKPRESSURE_LWM", "2000"))
+    KAFKA_MAX_RETRIES: int = int(os.getenv("KAFKA_MAX_RETRIES", "3"))
+    KAFKA_DEAD_LETTER_TOPIC: str = os.getenv("KAFKA_DEAD_LETTER_TOPIC", "ledgerlens.trades.dead-letter")
+
+    # Exactly-once / transactions (Issue #185)
+    KAFKA_TRANSACTION_TIMEOUT_MS: int = int(os.getenv("KAFKA_TRANSACTION_TIMEOUT_MS", "60000"))
+    KAFKA_TRANSACTIONAL_ID_PREFIX: str = os.getenv("KAFKA_TRANSACTIONAL_ID_PREFIX", "ledgerlens-txn")
+    KAFKA_DEDUP_TTL_SECONDS: int = int(os.getenv("KAFKA_DEDUP_TTL_SECONDS", "3600"))
+
     ALERT_CHANNEL: str = os.getenv("ALERT_CHANNEL", "stdout")
     ALERT_WEBHOOK_URL: str | None = os.getenv("ALERT_WEBHOOK_URL")
     ALERT_COOLDOWN_SECONDS: int = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))

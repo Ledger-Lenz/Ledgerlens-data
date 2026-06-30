@@ -692,3 +692,100 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 | `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
 | `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
 | `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |
+| `KAFKA_BACKPRESSURE_HWM` | `10000` | Queue depth to pause a partition (back-pressure) |
+| `KAFKA_BACKPRESSURE_LWM` | `2000` | Queue depth to resume a partition (back-pressure) |
+| `KAFKA_MAX_RETRIES` | `3` | Failures before routing a message to the dead-letter topic |
+| `KAFKA_DEAD_LETTER_TOPIC` | `ledgerlens.trades.dead-letter` | DLT for exhausted-retry messages |
+| `KAFKA_TRANSACTION_TIMEOUT_MS` | `60000` | Kafka transaction timeout for exactly-once mode |
+| `KAFKA_TRANSACTIONAL_ID_PREFIX` | `ledgerlens-txn` | Prefix for worker transactional IDs |
+| `KAFKA_DEDUP_TTL_SECONDS` | `3600` | Redis dedup cache TTL (exactly-once second layer) |
+
+---
+
+## Back-Pressure Management (Issue #184)
+
+Under sudden trade volume spikes the consumer can accumulate messages faster than
+the detection pipeline can process them. Without back-pressure controls, the
+in-memory message buffer grows unbounded until the process is OOM-killed.
+
+### How it works
+
+```
+Kafka Partition P0
+       │  messages
+       ▼
+BackPressureController.check_and_apply(tp, queue_depth)
+       │
+       ├─ queue_depth ≥ HWM (10 000)?  → consumer.pause([P0])
+       │                                  KAFKA_BACKPRESSURE_PAUSES counter ++
+       │                                  log INFO "paused P0 at depth N"
+       │
+       └─ queue_depth ≤ LWM (2 000)?   → consumer.resume([P0])
+                                          KAFKA_BACKPRESSURE_RESUMES counter ++
+                                          log INFO "resumed P0 at depth N"
+```
+
+Pause/resume operate **per-partition** so a slow partition does not stall
+faster ones.
+
+Messages that have been retried more than `KAFKA_MAX_RETRIES` times without
+successful processing are routed to the **dead-letter topic**
+(`ledgerlens.trades.dead-letter`) via a fire-and-forget producer that never
+blocks the main consumer loop.  All original Kafka headers (including trace
+IDs) are preserved on the DLT message for forensic replay.
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `kafka_backpressure_pauses_total` | Counter (`topic`, `partition`) | Partition pauses |
+| `kafka_backpressure_resumes_total` | Counter (`topic`, `partition`) | Partition resumes |
+
+---
+
+## Exactly-Once Delivery Semantics (Issue #185)
+
+The default at-least-once delivery can cause duplicate trade events which
+double-count in Benford windows, inflating chi-square statistics and producing
+false positives for active trading wallets.
+
+### Two-layer defence
+
+**Layer 1 — Kafka Transactions** (`HorizonKafkaProducer(transactional=True)`):
+
+```
+begin_transaction()
+  → process message
+  → produce to output topic
+  → send_offsets_to_transaction(positions, consumer_metadata)
+commit_transaction()
+
+on failure:
+  abort_transaction(txn_id, offset)  ← logs txn_id + offset for replay
+```
+
+The transactional producer uses a unique `transactional.id` per worker
+instance (`{KAFKA_TRANSACTIONAL_ID_PREFIX}-{hostname}-{pid}`).  In
+multi-tenant deployments, override `KAFKA_TRANSACTIONAL_ID_PREFIX` to avoid
+exposing hostnames.
+
+**Layer 2 — Redis deduplication cache** (`DeduplicationCache`):
+
+```
+key = "dedup:{ledger_sequence}:{trade_id}"
+SET key "1" NX EX {KAFKA_DEDUP_TTL_SECONDS}
+  → returns None  → duplicate, skip
+  → returns "OK"  → first-seen, process
+```
+
+The Redis cache acts as a fallback for consumers that do not participate in
+Kafka transactions.  It gracefully degrades to a no-op when Redis is
+unavailable (logged once at WARNING level, processing continues).
+
+### Limitations
+
+- Exactly-once is only guaranteed end-to-end when both the producer and
+  consumer participate in the same Kafka transaction.
+- The Redis dedup cache provides probabilistic deduplication within the TTL
+  window; events older than `KAFKA_DEDUP_TTL_SECONDS` may be double-processed
+  after a long partition pause.

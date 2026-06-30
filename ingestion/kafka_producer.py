@@ -11,7 +11,8 @@ Partition Key Format:
 
 Dead-letter Topic:
     Malformed asset pair IDs are routed to {topic}-dlq for validation failure.
-"""Kafka producer that publishes Horizon SSE trades as Avro to per-pair topics.
+
+Kafka producer that publishes Horizon SSE trades as Avro to per-pair topics.
 
 ``HorizonKafkaProducer`` is the ingestion half of the Kafka streaming backend
 (Issue #36).  For every trade it:
@@ -34,181 +35,8 @@ Failure handling
 
 from __future__ import annotations
 
-import json
-import re
-from typing import TYPE_CHECKING
-
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-
-from utils.logging import get_logger
-
-if TYPE_CHECKING:
-    from ingestion.data_models import Trade
-
-logger = get_logger(__name__)
-
-# Canonical format: CODE:ISSUER or CODE:native
-ASSET_PAIR_PATTERN = re.compile(r"^([A-Z0-9]+):(native|[A-Z0-9]{56})$")
-
-DLQ_SUFFIX = "-dlq"
-
-
-def _validate_asset_code(code: str) -> bool:
-    """Check if asset code matches expected format."""
-    return bool(re.match(r"^[A-Z0-9]+$", code)) and 1 <= len(code) <= 12
-
-
-def _validate_issuer(issuer: str) -> bool:
-    """Check if issuer is 'native' or a 56-char Stellar account ID."""
-    if issuer == "native":
-        return True
-    return bool(re.match(r"^[A-Z0-9]{56}$", issuer))
-
-
-def _to_canonical_pair_id(code_a: str, issuer_a: str, code_b: str, issuer_b: str) -> str:
-    """Generate canonical asset pair ID (alphabetically sorted).
-
-    Returns:
-        str: "CODE1:ISSUER1/CODE2:ISSUER2" (sorted alphabetically)
-
-    Raises:
-        ValueError: If asset format is invalid.
-    """
-    if not _validate_asset_code(code_a) or not _validate_issuer(issuer_a):
-        raise ValueError(f"Invalid asset A: {code_a}:{issuer_a}")
-    if not _validate_asset_code(code_b) or not _validate_issuer(issuer_b):
-        raise ValueError(f"Invalid asset B: {code_b}:{issuer_b}")
-
-    asset_a = f"{code_a}:{issuer_a}"
-    asset_b = f"{code_b}:{issuer_b}"
-
-    # Sort alphabetically to ensure deterministic ordering
-    pair_parts = sorted([asset_a, asset_b])
-    return "/".join(pair_parts)
-
-
-class KafkaTradeProducer:
-    """Produces trades to Kafka topic with asset_pair_id partition key."""
-
-    def __init__(
-        self,
-        topic: str,
-        bootstrap_servers: list[str] | str = "localhost:9092",
-    ):
-        """Initialize Kafka producer.
-
-        Args:
-            topic: Kafka topic name for trade events
-            bootstrap_servers: Kafka bootstrap server(s)
-        """
-        self.topic = topic
-        self.dlq_topic = f"{topic}{DLQ_SUFFIX}"
-
-        if isinstance(bootstrap_servers, str):
-            bootstrap_servers = [bootstrap_servers]
-
-        self.producer = KafkaProducer(
-            bootstrap_servers=bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            key_serializer=lambda k: k.encode("utf-8") if k else None,
-        )
-
-        logger.info(
-            "KafkaTradeProducer initialized: topic=%s, dlq_topic=%s, servers=%s",
-            self.topic,
-            self.dlq_topic,
-            bootstrap_servers,
-        )
-
-    def produce_trade(self, trade: Trade) -> None:
-        """Produce a single trade to Kafka.
-
-        Args:
-            trade: Trade object to produce
-
-        Raises:
-            ValueError: If asset pair ID validation fails (sent to DLQ)
-        """
-        try:
-            # Generate deterministic partition key
-            partition_key = _to_canonical_pair_id(
-                trade.base_asset.code,
-                trade.base_asset.issuer or "native",
-                trade.counter_asset.code,
-                trade.counter_asset.issuer or "native",
-            )
-        except ValueError as exc:
-            # Validation failed: send to DLQ
-            logger.warning("Invalid asset pair for trade %s: %s", trade.trade_id, exc)
-            self._send_to_dlq(trade, str(exc))
-            return
-
-        # Trade payload
-        payload = {
-            "trade_id": trade.trade_id,
-            "ledger_close_time": trade.ledger_close_time,
-            "base_account": trade.base_account,
-            "counter_account": trade.counter_account,
-            "base_asset_code": trade.base_asset.code,
-            "base_asset_issuer": trade.base_asset.issuer,
-            "counter_asset_code": trade.counter_asset.code,
-            "counter_asset_issuer": trade.counter_asset.issuer,
-            "base_amount": trade.base_amount,
-            "counter_amount": trade.counter_amount,
-            "price": trade.price,
-            "pair_id": partition_key,  # Include canonical pair ID in payload
-        }
-
-        # Send to main topic with partition key
-        future = self.producer.send(
-            self.topic,
-            value=payload,
-            key=partition_key,
-        )
-
-        try:
-            record_metadata = future.get(timeout=10)
-            logger.debug(
-                "Produced trade %s to partition %d offset %d",
-                trade.trade_id,
-                record_metadata.partition,
-                record_metadata.offset,
-            )
-        except KafkaError as exc:
-            logger.error("Failed to produce trade %s: %s", trade.trade_id, exc)
-            raise
-
-    def _send_to_dlq(self, trade: Trade, error_reason: str) -> None:
-        """Send malformed trade to dead-letter queue.
-
-        Args:
-            trade: The invalid trade
-            error_reason: Description of the validation error
-        """
-        dlq_payload = {
-            "trade_id": trade.trade_id,
-            "error": error_reason,
-            "original_trade": {
-                "base_asset_code": trade.base_asset.code,
-                "base_asset_issuer": trade.base_asset.issuer,
-                "counter_asset_code": trade.counter_asset.code,
-                "counter_asset_issuer": trade.counter_asset.issuer,
-            },
-        }
-        try:
-            self.producer.send(self.dlq_topic, value=dlq_payload, key=None)
-            logger.info("Sent invalid trade %s to DLQ %s", trade.trade_id, self.dlq_topic)
-        except KafkaError as exc:
-            logger.error("Failed to send trade to DLQ: %s", exc)
-
-    def flush(self, timeout_ms: int = 30000) -> None:
-        """Flush pending messages."""
-        self.producer.flush(timeout_ms=timeout_ms)
-
-    def close(self) -> None:
-        """Close producer."""
-        self.producer.close()
+import os
+import socket
 
 from confluent_kafka import KafkaException, Producer
 
@@ -228,6 +56,18 @@ def sanitise_pair(asset_pair: str) -> str:
     return _SANITISE_RE.sub("_", asset_pair).strip("_")
 
 
+def _build_transactional_id() -> str:
+    """Build a unique transactional ID per worker instance (hostname + PID).
+
+    In multi-tenant deployments the prefix can be overridden via
+    ``KAFKA_TRANSACTIONAL_ID_PREFIX`` to avoid exposing hostnames.
+    """
+    prefix = config.KAFKA_TRANSACTIONAL_ID_PREFIX
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    return f"{prefix}-{hostname}-{pid}"
+
+
 class HorizonKafkaProducer:
     """Serialises trades to Avro and produces them to per-pair Kafka topics."""
 
@@ -239,15 +79,24 @@ class HorizonKafkaProducer:
         dlq_topic: str | None = None,
         schema_path: str | None = None,
         producer: Producer | None = None,
+        transactional: bool = False,
     ) -> None:
         self._topic_prefix = topic_prefix or config.KAFKA_TOPIC_PREFIX
         self._dlq_topic = dlq_topic or config.KAFKA_DLQ_TOPIC
         self._schema = load_schema(schema_path)
-        self._producer = (
-            producer
-            if producer is not None
-            else Producer(_build_producer_conf(bootstrap_servers or config.KAFKA_BOOTSTRAP_SERVERS))
-        )
+        self._transactional = transactional
+
+        if producer is not None:
+            self._producer = producer
+        else:
+            servers = bootstrap_servers or config.KAFKA_BOOTSTRAP_SERVERS
+            conf = _build_producer_conf(servers)
+            if transactional:
+                conf["transactional.id"] = _build_transactional_id()
+                conf["transaction.timeout.ms"] = config.KAFKA_TRANSACTION_TIMEOUT_MS
+            self._producer = Producer(conf)
+            if transactional:
+                self._producer.init_transactions()
 
     # ------------------------------------------------------------------
     # Public API
@@ -276,6 +125,34 @@ class HorizonKafkaProducer:
         key = record["base_account"].encode("utf-8")
         self._produce(topic, value, key)
         self._producer.poll(0)
+
+    def begin_transaction(self) -> None:
+        """Begin a Kafka transaction (requires transactional=True at construction)."""
+        self._producer.begin_transaction()
+
+    def commit_transaction(self, consumer, positions: list | None = None) -> None:
+        """Commit in-flight transaction and optionally send consumer offsets.
+
+        *positions* is a list of ``TopicPartition`` objects with the offsets to
+        commit atomically inside the transaction.
+        """
+        if positions:
+            self._producer.send_offsets_to_transaction(
+                positions, consumer.consumer_group_metadata()
+            )
+        self._producer.commit_transaction()
+
+    def abort_transaction(self, transaction_id: str, offset: int) -> None:
+        """Abort the current transaction and log for replay investigation."""
+        try:
+            self._producer.abort_transaction()
+        except KafkaException as exc:
+            logger.error(
+                "abort_transaction failed — txn_id=%s offset=%d err=%s",
+                transaction_id,
+                offset,
+                exc,
+            )
 
     def flush(self, timeout: float = 10.0) -> int:
         """Block until all queued messages are delivered; returns # still in queue."""
