@@ -21,9 +21,11 @@ Also provides:
 
 import hashlib
 import re
+import threading
 import warnings
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from itertools import combinations
 from typing import Literal
 
@@ -33,6 +35,41 @@ import pandas as pd
 
 from config import config
 from ingestion.data_models import AccountActivity
+
+try:
+    from prometheus_client import Gauge
+
+    _graph_nodes_total = Gauge(
+        "wallet_graph_nodes_total",
+        "Current number of nodes in the incremental wallet graph",
+    )
+    _graph_edges_total = Gauge(
+        "wallet_graph_edges_total",
+        "Current number of edges in the incremental wallet graph",
+    )
+    _graph_stale_edges_total = Gauge(
+        "wallet_graph_stale_edges_total",
+        "Number of stale edges removed in the last removal pass",
+    )
+except Exception:  # pragma: no cover
+    _graph_nodes_total = None  # type: ignore[assignment]
+    _graph_edges_total = None  # type: ignore[assignment]
+    _graph_stale_edges_total = None  # type: ignore[assignment]
+
+
+def _parse_edge_timestamp(ts) -> datetime:
+    """Parse an edge timestamp to a UTC-aware datetime."""
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+    if isinstance(ts, pd.Timestamp):
+        return ts.to_pydatetime().replace(tzinfo=UTC) if ts.tzinfo is None else ts.to_pydatetime()
+    if isinstance(ts, str):
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=UTC)
 
 try:  # python-louvain — preferred community detector
     import community as _community_louvain

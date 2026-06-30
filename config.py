@@ -303,6 +303,18 @@ class Config:
     # GNN DiffPool cluster scoring (#269)
     GNN_DIFFPOOL_CLUSTERS: int = int(os.getenv("GNN_DIFFPOOL_CLUSTERS", "10"))
 
+    # Incremental wallet graph cache (#203)
+    GRAPH_STALE_EDGE_MAX_AGE_HOURS: int = int(os.getenv("GRAPH_STALE_EDGE_MAX_AGE_HOURS", "168"))
+    FEATURE_CACHE_TTL_SECONDS: int = int(os.getenv("FEATURE_CACHE_TTL_SECONDS", "60"))
+    FEATURE_CACHE_MAXSIZE: int = int(os.getenv("FEATURE_CACHE_MAXSIZE", "10000"))
+
+    # Shadow deployment / concept drift-aware model versioning (#204)
+    SHADOW_TRAFFIC_PERCENT: int = int(os.getenv("SHADOW_TRAFFIC_PERCENT", "20"))
+    SHADOW_PERIOD_HOURS: int = int(os.getenv("SHADOW_PERIOD_HOURS", "24"))
+    SHADOW_DRIFT_THRESHOLD_POINTS: int = int(os.getenv("SHADOW_DRIFT_THRESHOLD_POINTS", "15"))
+    SHADOW_DRIFT_MAX_RATE: float = float(os.getenv("SHADOW_DRIFT_MAX_RATE", "0.05"))
+    SHADOW_FP_RATE_MAX_EXCESS: float = float(os.getenv("SHADOW_FP_RATE_MAX_EXCESS", "0.10"))
+
     # Async federated learning (#270)
     FEDERATED_ASYNC_TRIGGER_N: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_N", "3"))
     FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))

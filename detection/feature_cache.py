@@ -22,10 +22,14 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from config import config
+
+if TYPE_CHECKING:
+    from detection.wallet_graph import IncrementalWalletGraph
 
 try:
     from prometheus_client import Counter
