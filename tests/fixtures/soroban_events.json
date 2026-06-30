@@ -1,0 +1,89 @@
+{
+  "score_read": {
+    "type": "contract",
+    "ledger": "54321",
+    "ledgerClosedAt": "2026-06-30T00:10:00Z",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    "id": "0000000054321000-0000000001",
+    "topic": [
+      {"type": "symbol", "value": "score_read"},
+      {"type": "address", "value": "GBTEST12345678901234567890123456789012345678901234567890"},
+      {"type": "address", "value": "GCONSUMER1234567890123456789012345678901234567890123456"}
+    ],
+    "value": {
+      "type": "map",
+      "value": [
+        {"key": {"type": "symbol", "value": "score"},      "val": {"type": "u32", "value": 75}},
+        {"key": {"type": "symbol", "value": "asset_pair"}, "val": {"type": "string", "value": "USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/XLM:native"}},
+        {"key": {"type": "symbol", "value": "consumer"},   "val": {"type": "address", "value": "GCONSUMER1234567890123456789012345678901234567890123456"}}
+      ]
+    }
+  },
+  "score_updated": {
+    "type": "contract",
+    "ledger": "54322",
+    "ledgerClosedAt": "2026-06-30T00:10:05Z",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    "id": "0000000054322000-0000000001",
+    "topic": [
+      {"type": "symbol", "value": "score_updated"},
+      {"type": "address", "value": "GBTEST12345678901234567890123456789012345678901234567890"}
+    ],
+    "value": {
+      "type": "map",
+      "value": [
+        {"key": {"type": "symbol", "value": "score"},      "val": {"type": "u32", "value": 82}},
+        {"key": {"type": "symbol", "value": "asset_pair"}, "val": {"type": "string", "value": "USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN/XLM:native"}}
+      ]
+    }
+  },
+  "threshold_updated": {
+    "type": "contract",
+    "ledger": "54323",
+    "ledgerClosedAt": "2026-06-30T00:10:10Z",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    "id": "0000000054323000-0000000001",
+    "topic": [
+      {"type": "symbol", "value": "threshold_updated"},
+      {"type": "address", "value": "GBTEST12345678901234567890123456789012345678901234567890"}
+    ],
+    "value": {
+      "type": "map",
+      "value": [
+        {"key": {"type": "symbol", "value": "old_threshold"}, "val": {"type": "u32", "value": 70}},
+        {"key": {"type": "symbol", "value": "new_threshold"}, "val": {"type": "u32", "value": 75}}
+      ]
+    }
+  },
+  "unknown_event": {
+    "type": "contract",
+    "ledger": "54324",
+    "ledgerClosedAt": "2026-06-30T00:10:15Z",
+    "contractId": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+    "id": "0000000054324000-0000000001",
+    "topic": [
+      {"type": "symbol", "value": "some_future_event"},
+      {"type": "address", "value": "GBTEST12345678901234567890123456789012345678901234567890"}
+    ],
+    "value": {"type": "u32", "value": 0}
+  },
+  "horizon_score_read": {
+    "type": "contract_credited",
+    "created_at": "2026-06-30T00:11:00Z",
+    "paging_token": "54325000-1",
+    "data": {
+      "topic": [
+        {"type": "symbol", "value": "score_read"},
+        {"type": "address", "value": "GBTEST12345678901234567890123456789012345678901234567890"}
+      ],
+      "value": {
+        "type": "map",
+        "value": [
+          {"key": {"type": "symbol", "value": "score"},    "val": {"type": "u32", "value": 60}},
+          {"key": {"type": "symbol", "value": "consumer"}, "val": {"type": "address", "value": "GCONSUMER1234567890123456789012345678901234567890123456"}}
+        ]
+      },
+      "ledger": "54325"
+    }
+  }
+}

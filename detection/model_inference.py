@@ -29,8 +29,11 @@ import hashlib
 import json
 import math
 import os
+import random
 import statistics
+import threading
 import time
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import joblib
@@ -39,6 +42,7 @@ import pandas as pd
 
 from config import config
 from detection.conformal import ConformalCalibrator
+from detection.differential_privacy import laplace_scale, add_laplace_noise
 from detection.list_override import ListOverride
 from detection.model_training import (
     FEATURE_COLUMNS_EXCLUDE,
@@ -46,8 +50,10 @@ from detection.model_training import (
     compute_feature_schema_hash,
 )
 from utils.logging import get_logger
+from utils.tracing import get_tracer, hash_span_id
 
 logger = get_logger(__name__)
+_tracer = get_tracer(__name__)
 
 BENFORD_MAD_FLAG_THRESHOLD = 0.015
 ML_FLAG_THRESHOLD = 0.5
@@ -58,7 +64,7 @@ _CONSENSUS_WINDOW = 10  # two models must be within this many points of each oth
 # installed or not yet wired to an exporter)
 # ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Summary
 
     bft_divergence_detected_total: Counter | None = Counter(
         "bft_divergence_detected_total",
@@ -68,9 +74,14 @@ try:
         "ledgerlens_cluster_scored_total",
         "Total number of wallet clusters scored by score_cluster()",
     )
+    ledgerlens_canary_score_delta: Summary | None = Summary(
+        "ledgerlens_canary_score_delta_seconds",
+        "Absolute score difference between canary and champion model per wallet",
+    )
 except Exception:  # pragma: no cover
     bft_divergence_detected_total = None
     ledgerlens_cluster_scored_total = None
+    ledgerlens_canary_score_delta = None
 
 
 def _increment_bft_counter() -> None:
@@ -197,12 +208,14 @@ class RiskScorer:
         self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+        self.selected_features: list[str] | None = self._load_selected_features()
         self.calibrators: dict[str, ConformalCalibrator] = {}
         self._load_calibrators()
         from detection.meta_learner import LeafEmbeddingExtractor
 
         self.extractor = LeafEmbeddingExtractor(self.models)
         self.maml_adapter, self.proto_classifier = self._load_meta_learners()
+        self.seq_model = self._load_seq_model()
 
     def _load_calibrators(self) -> None:
         """Load conformal calibration artifacts for each model.
@@ -334,6 +347,32 @@ class RiskScorer:
             return data.get("selected_features")
         return None
 
+    def _load_seq_model(self):
+        """Load the transformer sequence model if enabled and available.
+
+        Returns the model in eval mode, or ``None`` when the feature is
+        disabled (``SEQ_MODEL_ENABLED=false``) or before the first training
+        run (artifact absent).  Never raises — a missing artifact is a
+        normal pre-training state.
+        """
+        if not config.SEQ_MODEL_ENABLED:
+            return None
+        try:
+            from detection.trade_sequence_transformer import TradeSequenceTransformer
+
+            model = TradeSequenceTransformer.load(
+                model_dir=self.model_dir,
+                verify_integrity=True,
+            )
+            model.eval()
+            return model
+        except Exception as exc:
+            logger.info(
+                "Sequence model not loaded (this is expected before first training run): %s",
+                exc,
+            )
+            return None
+
     def _ensemble_probabilities(self, feature_row: pd.Series) -> list[float]:
         """Per-model wash-trade probabilities for a single feature row.
 
@@ -392,21 +431,21 @@ class RiskScorer:
         self,
         feature_row: pd.Series,
         labelled_count: int | None = None,
+    ) -> dict:  # type: ignore[override]
+        """Compute the LedgerLens Risk Score for a single feature row."""
+        wallet = str(feature_row.get("wallet", ""))
+        with _tracer.start_as_current_span("model.scored") as span:
+            span.set_attribute("wallet.id", hash_span_id(wallet) if wallet else "unknown")
+            result = self._score_impl(feature_row, labelled_count)
+            span.set_attribute("model.score", result.get("score", -1))
+            return result
+
+    def _score_impl(
+        self,
+        feature_row: pd.Series,
+        labelled_count: int | None = None,
     ) -> dict:
-        """Compute the LedgerLens Risk Score for a single feature row.
-
-        When ``labelled_count`` is provided and is less than
-        ``config.ZERO_SHOT_MIN_LABELLED_EXAMPLES``, scoring is routed through
-        the zero-shot pattern detector instead of the ensemble.
-
-        Returns a dict matching the on-chain `RiskScore` shape:
-            {score, benford_flag, ml_flag, confidence}
-
-        Args:
-            feature_row: Feature matrix row for the wallet/pair
-            caller_id: Caller identifier (e.g. "api.user123", "internal"). 
-                      "internal" skips output perturbation; external callers get Laplace noise.
-        """
+        """Internal scoring logic (called from score() inside an OTel span)."""
         override = self._check_override(feature_row)
         if override is not None:
             return override
@@ -598,6 +637,362 @@ class RiskScorer:
         """Score every row in a feature matrix."""
         scores = feature_matrix.apply(self.score, axis=1, result_type="expand")
         return pd.concat([feature_matrix[["wallet"]], scores], axis=1)
+
+    def compute_epistemic_uncertainty(self, feature_row: pd.Series) -> float:
+        """Estimate epistemic (model) uncertainty via Monte Carlo Dropout.
+
+        Runs N=``config.ACTIVE_LEARNING_MC_DROPOUT_PASSES`` stochastic forward
+        passes with dropout enabled at test time (Gal & Ghahramani, 2016).
+        Returns the variance of predictions across passes, normalised to [0, 1].
+
+        For PyTorch models (MAML adapter), MC Dropout is applied by enabling
+        training mode on dropout layers only.  For sklearn ensemble models,
+        epistemic uncertainty is estimated as the variance of per-model
+        probabilities (ensemble disagreement), which approximates Bayesian model
+        uncertainty when models are diverse.
+
+        This method must NOT be called during production scoring
+        (``caller_id != "internal"``) to prevent inference-time variability from
+        leaking model internals.
+
+        Parameters
+        ----------
+        feature_row:
+            Feature matrix row for the target wallet.
+
+        Returns
+        -------
+        float
+            Epistemic uncertainty in [0, 1].  Higher → more uncertain.
+        """
+        n_passes = config.ACTIVE_LEARNING_MC_DROPOUT_PASSES
+
+        # Try PyTorch MC Dropout when the MAML adapter is available
+        if self.maml_adapter is not None:
+            try:
+                import torch
+
+                feature_cols = [c for c in feature_row.index if c not in ("wallet",)]
+                X_df = feature_row[feature_cols].to_frame().T.astype(float)
+                self.extractor.fit(X_df)
+                leaf_embeddings = self.extractor.transform(X_df)
+                X_tensor = torch.tensor(leaf_embeddings, dtype=torch.float32)
+
+                # Enable MC Dropout: set model to train mode so dropout is active
+                self.maml_adapter.train()
+                mc_preds = []
+                with torch.no_grad():
+                    for _ in range(n_passes):
+                        logit = self.maml_adapter(X_tensor)
+                        prob = torch.sigmoid(logit).item()
+                        mc_preds.append(prob)
+                # Restore eval mode
+                self.maml_adapter.eval()
+
+                epistemic = float(np.var(mc_preds))
+                # Variance of a Bernoulli is at most 0.25 (at p=0.5); normalise
+                return min(epistemic / 0.25, 1.0)
+            except Exception as exc:
+                logger.debug("PyTorch MC Dropout failed, falling back to ensemble: %s", exc)
+
+        # Fallback: ensemble disagreement as epistemic uncertainty proxy
+        probs = self._ensemble_probabilities(feature_row)
+        if len(probs) < 2:
+            return 0.0
+        epistemic = float(np.var(probs))
+        return min(epistemic / 0.25, 1.0)
+
+    def compute_aleatoric_uncertainty(self, feature_row: pd.Series) -> float:
+        """Estimate aleatoric (data) uncertainty from mean prediction entropy.
+
+        Aleatoric uncertainty captures irreducible noise inherent in the sample
+        (i.e. the sample is ambiguous regardless of model capacity).
+
+        Returns the mean binary entropy of model predictions, normalised to [0, 1].
+        Entropy is maximised at p=0.5 (H=1 bit = log(2) nats); samples near
+        the decision boundary have high aleatoric uncertainty.
+
+        Parameters
+        ----------
+        feature_row:
+            Feature matrix row for the target wallet.
+
+        Returns
+        -------
+        float
+            Aleatoric uncertainty in [0, 1].  Higher → more inherently ambiguous.
+        """
+        probs = self._ensemble_probabilities(feature_row)
+        entropies = []
+        for p in probs:
+            p = np.clip(p, 1e-9, 1 - 1e-9)
+            h = -(p * np.log(p) + (1 - p) * np.log(1 - p))
+            entropies.append(h)
+        # Normalise: max binary entropy = log(2) ≈ 0.693
+        return float(np.mean(entropies) / np.log(2))
+
+
+# ---------------------------------------------------------------------------
+# Canary deployment monitoring (issue #240)
+# ---------------------------------------------------------------------------
+
+_CANARY_P95_DELTA_LIMIT = 15.0  # promotion readiness threshold
+
+
+class ModelCanaryMonitor:
+    """Log per-wallet champion/canary score pairs and check promotion readiness.
+
+    During the shadow period both the champion (production) model and the
+    canary (candidate) model score every wallet.  This class records those
+    pairs in-memory (or to a supplied DB table via ``log_score_pair``) so
+    operators can inspect the delta distribution before promoting.
+
+    Parameters
+    ----------
+    champion_version:
+        Human-readable identifier for the current production model.
+    canary_version:
+        Human-readable identifier for the candidate model under evaluation.
+    """
+
+    def __init__(self, champion_version: str, canary_version: str) -> None:
+        self.champion_version = champion_version
+        self.canary_version = canary_version
+        self._pairs: list[dict] = []
+
+    def log_score_pair(
+        self,
+        wallet_id_hash: str,
+        champion_score: float,
+        canary_score: float,
+    ) -> None:
+        """Record a (champion, canary) score pair for a hashed wallet ID.
+
+        Wallet addresses are never stored; callers must pass a pre-hashed ID
+        (e.g. ``hashlib.sha256(wallet.encode()).hexdigest()``).
+
+        Also updates the Prometheus summary metric with the absolute delta.
+        """
+        delta = abs(canary_score - champion_score)
+        self._pairs.append(
+            {
+                "wallet_id_hash": wallet_id_hash,
+                "champion_score": champion_score,
+                "canary_score": canary_score,
+                "delta": delta,
+                "champion_version": self.champion_version,
+                "canary_version": self.canary_version,
+            }
+        )
+        if ledgerlens_canary_score_delta is not None:
+            try:
+                ledgerlens_canary_score_delta.observe(delta)
+            except Exception:
+                pass
+
+    def score_pairs(self) -> list[dict]:
+        """Return all logged score pairs for the current canary version."""
+        return list(self._pairs)
+
+    def disagreement_rate(self, band_threshold: float = 15.0) -> float:
+        """Fraction of wallets where |canary - champion| > band_threshold."""
+        if not self._pairs:
+            return 0.0
+        disagreements = sum(1 for p in self._pairs if p["delta"] > band_threshold)
+        return disagreements / len(self._pairs)
+
+    def top_divergent_wallets(self, n: int = 10) -> list[dict]:
+        """Return the n wallets with the largest score divergence."""
+        return sorted(self._pairs, key=lambda p: p["delta"], reverse=True)[:n]
+
+    def promotion_readiness(self) -> dict:
+        """Compute a promotion readiness summary.
+
+        Returns a dict with ``ready`` (bool) and diagnostic fields.
+        The check fails (``ready=False``) if the p95 absolute score delta
+        exceeds ``_CANARY_P95_DELTA_LIMIT`` (15 points).
+        """
+        if not self._pairs:
+            return {
+                "ready": False,
+                "reason": "no score pairs logged",
+                "pair_count": 0,
+            }
+
+        deltas = sorted(p["delta"] for p in self._pairs)
+        n = len(deltas)
+        p95_index = min(int(n * 0.95), n - 1)
+        p95_delta = deltas[p95_index]
+        mean_delta = sum(deltas) / n
+        disagreement = self.disagreement_rate()
+
+        ready = p95_delta <= _CANARY_P95_DELTA_LIMIT
+        return {
+            "ready": ready,
+            "pair_count": n,
+            "p95_delta": round(p95_delta, 2),
+            "mean_delta": round(mean_delta, 2),
+            "disagreement_rate": round(disagreement, 4),
+            "champion_version": self.champion_version,
+            "canary_version": self.canary_version,
+            "reason": (
+                None
+                if ready
+                else f"p95 score delta {p95_delta:.1f} exceeds limit {_CANARY_P95_DELTA_LIMIT}"
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Shadow deployment / concept drift-aware versioning (Issue #204)
+# ---------------------------------------------------------------------------
+
+
+class ShadowScorer:
+    """Routes a configurable fraction of scoring requests through a candidate model.
+
+    The production scorer handles every request; a random sample
+    (``SHADOW_TRAFFIC_PERCENT``%) is also scored by the candidate.  When the
+    candidate score diverges from production by more than
+    ``SHADOW_DRIFT_THRESHOLD_POINTS`` points the event is counted as a shadow
+    drift event and logged.
+
+    After the shadow period (``SHADOW_PERIOD_HOURS``) expires:
+
+    - If shadow drift rate < ``SHADOW_DRIFT_MAX_RATE`` the candidate is
+      eligible for promotion (caller should call :meth:`should_promote`).
+    - Otherwise promotion is blocked and rollback is recommended.
+
+    Thread-safe: counters are updated under ``_lock``.
+    """
+
+    def __init__(
+        self,
+        production: "RiskScorer",
+        candidate: "RiskScorer",
+        shadow_start: datetime | None = None,
+        traffic_percent: int | None = None,
+    ) -> None:
+        self._production = production
+        self._candidate = candidate
+        self._shadow_start = shadow_start or datetime.now(UTC)
+        self._traffic_percent = (
+            traffic_percent if traffic_percent is not None else config.SHADOW_TRAFFIC_PERCENT
+        )
+        self._lock = threading.Lock()
+        self._total_shadow_requests = 0
+        self._drift_events = 0
+
+    def score(self, feature_row: pd.Series, **kwargs) -> dict:
+        """Score via the production model; sample a fraction for shadow comparison."""
+        result = self._production.score(feature_row, **kwargs)
+
+        if random.randint(1, 100) <= self._traffic_percent:
+            try:
+                candidate_result = self._candidate.score(feature_row, **kwargs)
+                diff = abs(candidate_result["score"] - result["score"])
+                is_drift = diff > config.SHADOW_DRIFT_THRESHOLD_POINTS
+                with self._lock:
+                    self._total_shadow_requests += 1
+                    if is_drift:
+                        self._drift_events += 1
+                if is_drift:
+                    logger.info(
+                        "Shadow drift event: production=%d candidate=%d diff=%d",
+                        result["score"],
+                        candidate_result["score"],
+                        diff,
+                    )
+            except Exception as exc:
+                logger.warning("Shadow candidate scoring failed: %s", exc)
+
+        return result
+
+    @property
+    def shadow_drift_rate(self) -> float:
+        with self._lock:
+            if self._total_shadow_requests == 0:
+                return 0.0
+            return self._drift_events / self._total_shadow_requests
+
+    @property
+    def shadow_elapsed_hours(self) -> float:
+        return (datetime.now(UTC) - self._shadow_start).total_seconds() / 3600
+
+    @property
+    def shadow_stats(self) -> dict:
+        with self._lock:
+            return {
+                "total_shadow_requests": self._total_shadow_requests,
+                "drift_events": self._drift_events,
+                "drift_rate": (
+                    self._drift_events / self._total_shadow_requests
+                    if self._total_shadow_requests
+                    else 0.0
+                ),
+                "elapsed_hours": self.shadow_elapsed_hours,
+                "shadow_period_complete": self.shadow_elapsed_hours >= config.SHADOW_PERIOD_HOURS,
+            }
+
+    def should_promote(self) -> tuple[bool, str]:
+        """Return ``(eligible, reason)`` for candidate promotion.
+
+        Promotion requires:
+
+        1. Shadow period has elapsed (``SHADOW_PERIOD_HOURS``).
+        2. Shadow drift rate < ``SHADOW_DRIFT_MAX_RATE``.
+        """
+        if self.shadow_elapsed_hours < config.SHADOW_PERIOD_HOURS:
+            remaining = config.SHADOW_PERIOD_HOURS - self.shadow_elapsed_hours
+            return False, f"Shadow period incomplete — {remaining:.1f} h remaining"
+
+        rate = self.shadow_drift_rate
+        if rate >= config.SHADOW_DRIFT_MAX_RATE:
+            return (
+                False,
+                f"Shadow drift rate {rate:.1%} >= threshold {config.SHADOW_DRIFT_MAX_RATE:.1%}",
+            )
+
+        return True, f"Shadow drift rate {rate:.1%} < threshold — candidate eligible for promotion"
+
+
+def load_shadow_candidate(candidate_dir: str) -> "RiskScorer":
+    """Load a :class:`RiskScorer` from *candidate_dir* for shadow evaluation."""
+    return RiskScorer(model_dir=candidate_dir)
+
+
+def verify_model_artifact_signature(model_dir: str, version_id: str) -> bool:
+    """Verify the Ed25519 signature of a model artifact before rollback.
+
+    Loads the stored signature from ``{model_dir}/model_signature.json`` and
+    verifies it against the concatenated SHA-256 digests of all ``.joblib``
+    files using the configured trusted public key.
+
+    Returns ``True`` if the signature is valid, ``False`` otherwise.
+    """
+    from detection.persistence import ModelArtifact, ModelIntegrityError
+
+    try:
+        artifact = ModelArtifact(model_dir)
+        from detection.model_training import MODEL_REGISTRY
+
+        for name in MODEL_REGISTRY:
+            artifact.verify_chain(name)
+        logger.info("Artifact integrity verified for version %s in %s", version_id, model_dir)
+        return True
+    except ModelIntegrityError as exc:
+        logger.error(
+            "Artifact integrity check failed for version %s in %s: %s",
+            version_id,
+            model_dir,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Artifact integrity check error for version %s: %s", version_id, exc
+        )
+        return False
 
 
 def _score_one(wallet: str) -> dict:

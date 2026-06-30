@@ -19,6 +19,7 @@ detection on Ethereum (Elliptic dataset, AUC > 0.97) and are directly applicable
 **Key references:**
 - Weber et al. (2019) — Anti-Money Laundering in Bitcoin: Experimenting with Graph Convolutional Networks
 - Lo et al. (2023) — Inspection-L: Towards Flow-Level Detection of Wash Trading on DEXs via Graph Neural Networks
+- Xu et al. (2020) — Inductive Representation Learning on Temporal Graphs (TGAT), ICLR 2020
 
 ---
 
@@ -314,3 +315,141 @@ pytest tests/test_cluster_scoring.py -v
 
 Tests cover permutation invariance, cluster ID stability, correct return shape,
 high-risk ring produces score > 80, and DiffPool pooling to `n_clusters`.
+
+
+---
+
+## Contrastive Pre-training Strategy
+
+`detection/contrastive/` implements **SimCLR-style contrastive pre-training**
+for the `TransactionEncoder` (a 2-layer MLP encoder used before the GNN
+pooling stage).  The default random-augmentation approach is augmented with
+**domain-aware negative mining** that exploits labelled wash-trade structure
+to produce more discriminative embeddings.
+
+### Why domain-aware negatives?
+
+Standard SimCLR draws negatives uniformly at random from the mini-batch.  For
+wash-trade detection this is suboptimal: the encoder quickly learns to separate
+clearly different wallets but struggles to distinguish borderline wash-traders
+from high-frequency legitimate market makers — both produce high-volume,
+clustered trade patterns.  Domain-aware negatives address this by forcing the
+encoder to separate the most confusable pairs:
+
+- **Semi-hard negatives**: confirmed-clean wallets that are *currently closest*
+  to a wash-trade anchor in embedding space (hard in the model's representation,
+  correct in label).
+- **Ring positives**: wallet pairs from the same detected wash-trading ring are
+  pulled together as additional positives beyond the standard augmentation views.
+
+### Negative mining algorithm (`detection/contrastive/negative_miner.py`)
+
+```
+Input:  anchor embeddings  A  (batch × dim)
+        clean-wallet pool  C  (n_clean × dim)
+        epoch index        e
+
+1. L2-normalise A and C.
+2. Query FAISS HNSW index (built over C) for the k nearest neighbours
+   of each anchor.                              ← O(k log n_clean)
+3. Curriculum mix:
+     hard_fraction = min(e / curriculum_epochs, 1.0)
+     n_hard = round(hard_fraction × n_negatives)
+     n_easy = n_negatives − n_hard
+4. Return top-n_hard ANN results + n_easy random indices.
+```
+
+**Complexity**: HNSW query is O(k log n) vs O(n·k) brute-force, enabling
+large clean-wallet pools without training throughput degradation.  A brute-
+force cosine fallback is used automatically when `faiss` is not installed.
+
+**Privacy**: All wallet G-addresses are replaced with HMAC-SHA256 digests
+(keyed by `EVENT_HMAC_SECRET`) before entering the miner's data structures.
+Raw addresses never appear in training state, logs, or the ring registry.
+
+### Ring-positive construction
+
+`RingRegistry` stores hashed wallet IDs grouped by wash-trading ring
+(from Louvain community detection in `detection/wallet_graph.py`).  During
+each batch, `get_ring_positives(hashed_batch_ids)` returns `(i, j)` index
+pairs where wallets `i` and `j` are confirmed colluders.  A cosine-similarity
+auxiliary loss pulls these pairs together in embedding space.
+
+### Curriculum schedule
+
+```
+hard_fraction(epoch) = min(epoch / CONTRASTIVE_CURRICULUM_EPOCHS, 1.0)
+```
+
+| Epoch | hard_fraction | Negative source |
+|---|---|---|
+| 0 | 0.00 | 100 % random |
+| curriculum_epochs / 2 | 0.50 | 50 % hard, 50 % random |
+| curriculum_epochs | 1.00 | 100 % hard (ANN) |
+| > curriculum_epochs | 1.00 | 100 % hard (ANN) |
+
+The warm-up prevents training instability when the encoder is still random:
+hard negatives are only informative once the embedding space has some
+structure.
+
+**Configuration**:
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONTRASTIVE_CURRICULUM_EPOCHS` | `5` | Warm-up length (set to 0 for instant hard negatives) |
+| `EVENT_HMAC_SECRET` | (required) | HMAC key for wallet ID hashing |
+
+### Training the domain-aware encoder
+
+```bash
+# Domain-aware pre-training on the synthetic dataset:
+python -m detection.contrastive.pretrain \
+    --data data/synthetic_dataset.parquet \
+    --epochs 20 \
+    --domain-sampling \
+    --curriculum-epochs 5 \
+    --output models/pretrained_encoder.pt
+
+# AUC benchmark (random vs domain-aware):
+python -m detection.contrastive.pretrain \
+    --data data/synthetic_dataset.parquet \
+    --epochs 10 \
+    --benchmark
+```
+
+### Benchmark: random vs domain-aware AUC
+
+A linear probe (logistic regression on frozen encoder embeddings) is used
+to measure downstream classification quality on the synthetic dataset.
+
+| Pre-training strategy | Downstream AUC | Notes |
+|---|---|---|
+| Random augmentation (SimCLR) | baseline | No label information used |
+| Domain-aware (hard negatives + ring positives) | ≥ random AUC | Tested by `tests/test_negative_miner.py::TestAUCRegression` |
+
+The AUC regression test (`TestAUCRegression::test_domain_aware_auc_not_worse`)
+enforces that domain-aware pre-training does not degrade below the random
+baseline by more than 2 % on the synthetic dataset, with a tolerance for
+the variance introduced by short training runs.
+
+### Integration with downstream ML pipeline
+
+After pre-training, the encoder's hidden representation `h` (before the
+SimCLR projector head `z`) is used as an additional feature source:
+
+```python
+from detection.contrastive.encoder import TransactionEncoder
+import torch
+
+encoder = TransactionEncoder(input_dim=feature_dim)
+encoder.load_state_dict(torch.load("models/pretrained_encoder.pt", map_location="cpu"))
+encoder.eval()
+
+with torch.no_grad():
+    h, _ = encoder(feature_tensor)   # h: (batch, 256)
+```
+
+The 256-dim `h` vectors can be appended to the tabular feature matrix
+before training the RF / XGBoost / LightGBM ensemble, similar to how
+`gnn_0 … gnn_31` GNN embeddings are appended (see
+`detection/gnn_encoder.py::compute_graph_embedding_features`).

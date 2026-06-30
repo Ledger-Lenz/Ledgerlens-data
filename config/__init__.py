@@ -1,33 +1,17 @@
 """Configuration module.
 
-Re-exports the ``config`` singleton and ``Config`` class from the top-level
-``config.py`` so that ``from config import config`` resolves correctly
-regardless of whether Python resolves ``config`` as this package or as the
-sibling ``config.py`` module.
-
-The ``config/`` directory exists for tenant-specific YAML files
-(``config/tenants.yaml``) and the ``tenant_config.py`` helper; all global
-environment-driven configuration lives in the top-level ``config.py``.
+Re-exports ``Config`` and ``config`` from the project-root ``config.py`` so
+that ``from config import config`` and ``from config import Config`` continue
+to work even though a ``config/`` sub-package also exists at the project root.
 """
 
-import importlib
-import os
-import sys
-from pathlib import Path
+import importlib.util
+import os as _os
 
-# When Python resolves 'config' it picks this package (config/) over the
-# sibling config.py because packages take precedence.  We load config.py
-# explicitly by file path so that ``from config import config`` works the same
-# way everywhere in the codebase.
-_root = Path(__file__).resolve().parent.parent
-_config_py = str(_root / "config.py")
-
-_spec = importlib.util.spec_from_file_location("_config_module", _config_py)
+_root_config_path = _os.path.join(_os.path.dirname(__file__), "..", "config.py")
+_spec = importlib.util.spec_from_file_location("_config_root", _root_config_path)
 _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 
-# Re-export the names the rest of the codebase imports.
 Config = _mod.Config
 config = _mod.config
-
-__all__ = ["Config", "config"]
