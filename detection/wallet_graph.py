@@ -21,9 +21,11 @@ Also provides:
 
 import hashlib
 import re
+import threading
 import warnings
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from itertools import combinations
 from typing import Literal
 
@@ -33,6 +35,41 @@ import pandas as pd
 
 from config import config
 from ingestion.data_models import AccountActivity
+
+try:
+    from prometheus_client import Gauge
+
+    _graph_nodes_total = Gauge(
+        "wallet_graph_nodes_total",
+        "Current number of nodes in the incremental wallet graph",
+    )
+    _graph_edges_total = Gauge(
+        "wallet_graph_edges_total",
+        "Current number of edges in the incremental wallet graph",
+    )
+    _graph_stale_edges_total = Gauge(
+        "wallet_graph_stale_edges_total",
+        "Number of stale edges removed in the last removal pass",
+    )
+except Exception:  # pragma: no cover
+    _graph_nodes_total = None  # type: ignore[assignment]
+    _graph_edges_total = None  # type: ignore[assignment]
+    _graph_stale_edges_total = None  # type: ignore[assignment]
+
+
+def _parse_edge_timestamp(ts) -> datetime:
+    """Parse an edge timestamp to a UTC-aware datetime."""
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+    if isinstance(ts, pd.Timestamp):
+        return ts.to_pydatetime().replace(tzinfo=UTC) if ts.tzinfo is None else ts.to_pydatetime()
+    if isinstance(ts, str):
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=UTC)
 
 try:  # python-louvain — preferred community detector
     import community as _community_louvain
@@ -478,6 +515,180 @@ def _avg_funding_depth(graph: nx.DiGraph, members: list[str]) -> float:
 
     depths = [distance.get(node, 0) for node in sub.nodes]
     return float(sum(depths) / len(depths)) if depths else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Incremental wallet graph (Issue #203)
+# ---------------------------------------------------------------------------
+
+
+class IncrementalWalletGraph:
+    """Thread-safe in-memory wallet graph with incremental edge updates.
+
+    Wallet IDs are normalised to lowercase on ingestion to prevent duplicate
+    nodes from capitalisation variants.  The graph stores a ``last_seen``
+    timestamp on every edge so that :meth:`remove_stale_edges` can identify
+    and evict edges that have not been refreshed within the configured window.
+
+    Prometheus gauges ``wallet_graph_nodes_total`` and
+    ``wallet_graph_edges_total`` are updated on every mutating operation.
+    ``wallet_graph_stale_edges_total`` is updated after each stale-removal pass.
+    """
+
+    def __init__(self) -> None:
+        self._graph: nx.DiGraph = nx.DiGraph()
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Mutating operations
+    # ------------------------------------------------------------------
+
+    def add_trade_edge(self, src_wallet: str, dst_wallet: str, trade: dict) -> None:
+        """Add or refresh a directed trade edge. O(1) amortised per edge.
+
+        ``trade`` may contain ``ledger_close_time`` (str, pd.Timestamp, or
+        datetime) which is stored as ``last_seen`` for staleness tracking.
+        """
+        src = src_wallet.lower()
+        dst = dst_wallet.lower()
+        ts = _parse_edge_timestamp(trade.get("ledger_close_time", datetime.now(UTC)))
+        ts_str = ts.isoformat()
+
+        with self._lock:
+            if self._graph.has_edge(src, dst):
+                attrs = self._graph[src][dst]
+                attrs["weight"] = attrs.get("weight", 1) + 1
+                attrs["last_seen"] = ts_str
+            else:
+                self._graph.add_edge(
+                    src,
+                    dst,
+                    edge_type="co_trade",
+                    weight=1,
+                    timestamp=ts_str,
+                    last_seen=ts_str,
+                )
+            self._update_gauges()
+
+    def remove_stale_edges(self, max_age_hours: float | None = None) -> int:
+        """Remove edges whose ``last_seen`` is older than *max_age_hours*.
+
+        Defaults to ``config.GRAPH_STALE_EDGE_MAX_AGE_HOURS`` (168 h / 7 days).
+        Isolated nodes that result from edge removal are also pruned.
+        Returns the number of edges removed.
+        """
+        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+
+        with self._lock:
+            stale = [
+                (u, v)
+                for u, v, d in self._graph.edges(data=True)
+                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
+            ]
+            self._graph.remove_edges_from(stale)
+            isolated = list(nx.isolates(self._graph))
+            self._graph.remove_nodes_from(isolated)
+            count = len(stale)
+            self._update_gauges(stale_count=count)
+
+        return count
+
+    # ------------------------------------------------------------------
+    # Subgraph extraction
+    # ------------------------------------------------------------------
+
+    def get_ego_subgraph(self, wallet_id: str, hops: int = 2) -> nx.DiGraph:
+        """Return the *hops*-hop ego subgraph for *wallet_id*.
+
+        Uses BFS over the underlying undirected view so both incoming and
+        outgoing edges contribute neighbourhood.  Designed to run in < 10 ms
+        for wallets with up to 500 direct neighbours at ``hops=2``.
+
+        Returns an empty DiGraph when the wallet is not in the graph.
+        """
+        node = wallet_id.lower()
+        with self._lock:
+            if node not in self._graph:
+                return nx.DiGraph()
+
+            visited: set[str] = {node}
+            frontier: set[str] = {node}
+            undirected = self._graph.to_undirected(as_view=True)
+            for _ in range(hops):
+                next_frontier: set[str] = set()
+                for n in frontier:
+                    for nb in undirected.neighbors(n):
+                        if nb not in visited:
+                            visited.add(nb)
+                            next_frontier.add(nb)
+                if not next_frontier:
+                    break
+                frontier = next_frontier
+
+            return self._graph.subgraph(visited).copy()
+
+    # ------------------------------------------------------------------
+    # Metrics accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def node_count(self) -> int:
+        with self._lock:
+            return self._graph.number_of_nodes()
+
+    @property
+    def edge_count(self) -> int:
+        with self._lock:
+            return self._graph.number_of_edges()
+
+    def stale_edge_count(self, max_age_hours: float | None = None) -> int:
+        """Count edges that would be removed by :meth:`remove_stale_edges`."""
+        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        with self._lock:
+            return sum(
+                1
+                for _, _, d in self._graph.edges(data=True)
+                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
+            )
+
+    def graph_metrics(self, max_age_hours: float | None = None) -> dict:
+        """Return ``{nodes, edges, stale_edges}`` in a single lock acquisition."""
+        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
+        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+        with self._lock:
+            stale = sum(
+                1
+                for _, _, d in self._graph.edges(data=True)
+                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
+            )
+            return {
+                "nodes": self._graph.number_of_nodes(),
+                "edges": self._graph.number_of_edges(),
+                "stale_edges": stale,
+            }
+
+    # ------------------------------------------------------------------
+    # Read-only graph access
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> nx.DiGraph:
+        """Return a copy of the current graph (safe for read-only callers)."""
+        with self._lock:
+            return self._graph.copy()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _update_gauges(self, stale_count: int | None = None) -> None:
+        if _graph_nodes_total is not None:
+            _graph_nodes_total.set(self._graph.number_of_nodes())
+        if _graph_edges_total is not None:
+            _graph_edges_total.set(self._graph.number_of_edges())
+        if stale_count is not None and _graph_stale_edges_total is not None:
+            _graph_stale_edges_total.set(stale_count)
 
 
 def build_co_trade_graph(trades: pd.DataFrame, window_hours: float = 24.0) -> nx.DiGraph:

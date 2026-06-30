@@ -29,8 +29,11 @@ import hashlib
 import json
 import math
 import os
+import random
 import statistics
+import threading
 import time
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import joblib
@@ -598,6 +601,158 @@ class RiskScorer:
         """Score every row in a feature matrix."""
         scores = feature_matrix.apply(self.score, axis=1, result_type="expand")
         return pd.concat([feature_matrix[["wallet"]], scores], axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Shadow deployment / concept drift-aware versioning (Issue #204)
+# ---------------------------------------------------------------------------
+
+
+class ShadowScorer:
+    """Routes a configurable fraction of scoring requests through a candidate model.
+
+    The production scorer handles every request; a random sample
+    (``SHADOW_TRAFFIC_PERCENT``%) is also scored by the candidate.  When the
+    candidate score diverges from production by more than
+    ``SHADOW_DRIFT_THRESHOLD_POINTS`` points the event is counted as a shadow
+    drift event and logged.
+
+    After the shadow period (``SHADOW_PERIOD_HOURS``) expires:
+
+    - If shadow drift rate < ``SHADOW_DRIFT_MAX_RATE`` the candidate is
+      eligible for promotion (caller should call :meth:`should_promote`).
+    - Otherwise promotion is blocked and rollback is recommended.
+
+    Thread-safe: counters are updated under ``_lock``.
+    """
+
+    def __init__(
+        self,
+        production: "RiskScorer",
+        candidate: "RiskScorer",
+        shadow_start: datetime | None = None,
+        traffic_percent: int | None = None,
+    ) -> None:
+        self._production = production
+        self._candidate = candidate
+        self._shadow_start = shadow_start or datetime.now(UTC)
+        self._traffic_percent = (
+            traffic_percent if traffic_percent is not None else config.SHADOW_TRAFFIC_PERCENT
+        )
+        self._lock = threading.Lock()
+        self._total_shadow_requests = 0
+        self._drift_events = 0
+
+    def score(self, feature_row: pd.Series, **kwargs) -> dict:
+        """Score via the production model; sample a fraction for shadow comparison."""
+        result = self._production.score(feature_row, **kwargs)
+
+        if random.randint(1, 100) <= self._traffic_percent:
+            try:
+                candidate_result = self._candidate.score(feature_row, **kwargs)
+                diff = abs(candidate_result["score"] - result["score"])
+                is_drift = diff > config.SHADOW_DRIFT_THRESHOLD_POINTS
+                with self._lock:
+                    self._total_shadow_requests += 1
+                    if is_drift:
+                        self._drift_events += 1
+                if is_drift:
+                    logger.info(
+                        "Shadow drift event: production=%d candidate=%d diff=%d",
+                        result["score"],
+                        candidate_result["score"],
+                        diff,
+                    )
+            except Exception as exc:
+                logger.warning("Shadow candidate scoring failed: %s", exc)
+
+        return result
+
+    @property
+    def shadow_drift_rate(self) -> float:
+        with self._lock:
+            if self._total_shadow_requests == 0:
+                return 0.0
+            return self._drift_events / self._total_shadow_requests
+
+    @property
+    def shadow_elapsed_hours(self) -> float:
+        return (datetime.now(UTC) - self._shadow_start).total_seconds() / 3600
+
+    @property
+    def shadow_stats(self) -> dict:
+        with self._lock:
+            return {
+                "total_shadow_requests": self._total_shadow_requests,
+                "drift_events": self._drift_events,
+                "drift_rate": (
+                    self._drift_events / self._total_shadow_requests
+                    if self._total_shadow_requests
+                    else 0.0
+                ),
+                "elapsed_hours": self.shadow_elapsed_hours,
+                "shadow_period_complete": self.shadow_elapsed_hours >= config.SHADOW_PERIOD_HOURS,
+            }
+
+    def should_promote(self) -> tuple[bool, str]:
+        """Return ``(eligible, reason)`` for candidate promotion.
+
+        Promotion requires:
+
+        1. Shadow period has elapsed (``SHADOW_PERIOD_HOURS``).
+        2. Shadow drift rate < ``SHADOW_DRIFT_MAX_RATE``.
+        """
+        if self.shadow_elapsed_hours < config.SHADOW_PERIOD_HOURS:
+            remaining = config.SHADOW_PERIOD_HOURS - self.shadow_elapsed_hours
+            return False, f"Shadow period incomplete — {remaining:.1f} h remaining"
+
+        rate = self.shadow_drift_rate
+        if rate >= config.SHADOW_DRIFT_MAX_RATE:
+            return (
+                False,
+                f"Shadow drift rate {rate:.1%} >= threshold {config.SHADOW_DRIFT_MAX_RATE:.1%}",
+            )
+
+        return True, f"Shadow drift rate {rate:.1%} < threshold — candidate eligible for promotion"
+
+
+def load_shadow_candidate(candidate_dir: str) -> "RiskScorer":
+    """Load a :class:`RiskScorer` from *candidate_dir* for shadow evaluation."""
+    return RiskScorer(model_dir=candidate_dir)
+
+
+def verify_model_artifact_signature(model_dir: str, version_id: str) -> bool:
+    """Verify the Ed25519 signature of a model artifact before rollback.
+
+    Loads the stored signature from ``{model_dir}/model_signature.json`` and
+    verifies it against the concatenated SHA-256 digests of all ``.joblib``
+    files using the configured trusted public key.
+
+    Returns ``True`` if the signature is valid, ``False`` otherwise.
+    """
+    from detection.persistence import ModelArtifact, ModelIntegrityError
+
+    try:
+        artifact = ModelArtifact(model_dir)
+        from detection.model_training import MODEL_REGISTRY
+
+        for name in MODEL_REGISTRY:
+            artifact.verify_chain(name)
+        logger.info("Artifact integrity verified for version %s in %s", version_id, model_dir)
+        return True
+    except ModelIntegrityError as exc:
+        logger.error(
+            "Artifact integrity check failed for version %s in %s: %s",
+            version_id,
+            model_dir,
+            exc,
+        )
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Artifact integrity check error for version %s: %s", version_id, exc
+        )
+        return False
 
 
 def _score_one(wallet: str) -> dict:

@@ -314,3 +314,79 @@ pytest tests/test_cluster_scoring.py -v
 
 Tests cover permutation invariance, cluster ID stability, correct return shape,
 high-risk ring produces score > 80, and DiffPool pooling to `n_clusters`.
+
+---
+
+## Incremental Graph Update Strategy
+
+### Motivation
+
+Rebuilding the full wallet graph from scratch on every scoring cycle becomes a
+bottleneck at scale (10,000+ wallets → several seconds per rebuild, creating
+detection gaps).  `IncrementalWalletGraph` in `detection/wallet_graph.py`
+maintains a persistent in-memory graph that is updated edge-by-edge as new
+trade events arrive from the streaming pipeline.
+
+### API
+
+```python
+from detection.feature_cache import WalletGraphCache
+
+cache = WalletGraphCache.instance()
+
+# O(1) amortised: add or refresh a trade edge
+cache.add_trade_edge(src_wallet, dst_wallet, trade_dict)
+
+# Extract the 2-hop ego subgraph for GNN inference (< 10 ms for 500 direct neighbours)
+subgraph = cache.get_ego_subgraph(wallet_id, hops=2)
+
+# Scheduled task: evict stale edges (default window: GRAPH_STALE_EDGE_MAX_AGE_HOURS)
+removed = cache.remove_stale_edges()
+```
+
+### Ego Subgraph Extraction
+
+For GNN inference, only the *neighbourhood* of the wallet being scored is
+needed — not the full graph.  `get_ego_subgraph(wallet_id, hops=2)` performs a
+BFS over the undirected view of the graph to collect all nodes reachable within
+`hops` steps, then returns the induced directed subgraph.
+
+**Performance target:** < 10 ms for wallets with up to 500 direct neighbours.
+
+### Staleness Policy
+
+Every edge stores a `last_seen` timestamp that is updated whenever
+`add_trade_edge` refreshes an existing edge.  Edges that have not been
+refreshed within `GRAPH_STALE_EDGE_MAX_AGE_HOURS` (default 168 h / 7 days)
+are considered stale and are removed by `remove_stale_edges()`.  Isolated
+nodes that result from edge removal are also pruned.
+
+`remove_stale_edges()` is designed to run as a background scheduled task
+(e.g., every hour via APScheduler or a cron job).
+
+### Node ID Normalisation
+
+Wallet IDs are normalised to lowercase on ingestion (`wallet_id.lower()`) to
+prevent duplicate nodes arising from capitalisation variants in raw trade data.
+
+### Prometheus Gauges
+
+| Metric | Description |
+|--------|-------------|
+| `wallet_graph_nodes_total` | Current node count |
+| `wallet_graph_edges_total` | Current edge count |
+| `wallet_graph_stale_edges_total` | Edges removed in the last staleness pass |
+
+### Configuration
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `GRAPH_STALE_EDGE_MAX_AGE_HOURS` | `168` | Age threshold for stale edge removal |
+
+### File Layout
+
+```
+detection/
+├── wallet_graph.py      ← IncrementalWalletGraph, _parse_edge_timestamp
+└── feature_cache.py     ← WalletGraphCache (singleton wrapper)
+```

@@ -1,17 +1,22 @@
 """CLI script that detects feature drift and triggers automated retraining.
 
 Exit codes:
-    0  — No drift detected, no retraining needed.
-    2  — Drift detected, retrained and promoted.
-    3  — Drift detected, retrained but NOT promoted (metric regression).
+    0  — No drift detected (or no action needed).
+    2  — Retrained and promoted.
+    3  — Retrained but NOT promoted (metric regression or drift rate too high).
+    4  — Shadow deployment started; run again after SHADOW_PERIOD_HOURS to evaluate.
+    5  — Candidate promoted after successful shadow period.
+    6  — Candidate rolled back (FP rate regression or shadow drift too high).
     1  — Fatal error.
 
 Usage:
     python -m scripts.retrain_if_drifted --lookback-days 30
     python -m scripts.retrain_if_drifted --lookback-days 30 --retrain-data-path data/synthetic_dataset.parquet
+    python -m scripts.retrain_if_drifted --check-shadow   # evaluate pending shadow candidate
 """
 
 import argparse
+import uuid
 from typing import Any, cast
 
 import json
@@ -41,6 +46,7 @@ ARCHIVE_DIR = os.path.join(
 )
 REPORTS_DIR = "reports"
 PROMOTION_TOLERANCE = 0.01
+_SHADOW_STATE_FILE = "shadow_deployment_state.json"
 
 
 def get_feature_data(lookback_days: int) -> pd.DataFrame:
@@ -186,6 +192,164 @@ def write_retrain_report(
     return path
 
 
+def _shadow_state_path(model_dir: str) -> str:
+    return os.path.join(model_dir, _SHADOW_STATE_FILE)
+
+
+def load_shadow_state(model_dir: str) -> dict | None:
+    """Load persisted shadow deployment state from model_dir."""
+    path = _shadow_state_path(model_dir)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return cast(dict[Any, Any], json.load(f))
+
+
+def save_shadow_state(model_dir: str, state: dict) -> None:
+    path = _shadow_state_path(model_dir)
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2)
+    logger.info("Shadow state saved to %s", path)
+
+
+def clear_shadow_state(model_dir: str) -> None:
+    path = _shadow_state_path(model_dir)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def compute_false_positive_rate(model_dir: str, test_data_path: str) -> float | None:
+    """Estimate FP rate for the model in model_dir using the labelled test set.
+
+    Returns the FP rate (false positives / (false positives + true negatives)),
+    or None if the model cannot be loaded or the test set is missing.
+    """
+    try:
+        import numpy as np
+
+        from detection.model_inference import RiskScorer
+
+        if not os.path.exists(test_data_path):
+            logger.warning("Test data not found at %s — cannot compute FP rate", test_data_path)
+            return None
+
+        from detection.model_training import load_training_data
+
+        df = load_training_data(test_data_path)
+        if df.empty or "label" not in df.columns:
+            return None
+
+        negatives = df[df["label"] == 0]
+        if negatives.empty:
+            return None
+
+        scorer = RiskScorer(model_dir=model_dir)
+        from detection.model_training import FEATURE_COLUMNS_EXCLUDE
+
+        feature_cols = [c for c in negatives.columns if c not in FEATURE_COLUMNS_EXCLUDE]
+        fps = 0
+        for _, row in negatives[feature_cols].iterrows():
+            try:
+                result = scorer.score(pd.Series(row))
+                if result["ml_flag"]:
+                    fps += 1
+            except Exception:
+                continue
+
+        return fps / len(negatives)
+    except Exception as exc:
+        logger.warning("FP rate computation failed: %s", exc)
+        return None
+
+
+def evaluate_shadow_candidate(shadow_state: dict, model_dir: str, retrain_data_path: str | None) -> int:
+    """Check if the shadow candidate is ready for promotion or needs rollback.
+
+    Returns the appropriate exit code (5 = promoted, 6 = rolled back, 4 = still waiting).
+    """
+    candidate_dir = shadow_state.get("candidate_dir")
+    shadow_start_str = shadow_state.get("shadow_start")
+    version_id = shadow_state.get("version_id", "unknown")
+
+    if not candidate_dir or not os.path.exists(candidate_dir):
+        logger.error("Shadow candidate dir %s not found — clearing shadow state", candidate_dir)
+        clear_shadow_state(model_dir)
+        return 1
+
+    shadow_start = datetime.fromisoformat(shadow_start_str) if shadow_start_str else datetime.now(UTC)
+    elapsed_hours = (datetime.now(UTC) - shadow_start).total_seconds() / 3600
+
+    if elapsed_hours < config.SHADOW_PERIOD_HOURS:
+        remaining = config.SHADOW_PERIOD_HOURS - elapsed_hours
+        logger.info(
+            "Shadow period for %s still running — %.1f h remaining (started %s)",
+            version_id,
+            remaining,
+            shadow_start_str,
+        )
+        return 4
+
+    # Shadow period complete — read accumulated drift stats
+    drift_rate = shadow_state.get("drift_rate", 0.0)
+    logger.info(
+        "Shadow period complete for %s: drift_rate=%.2f%% (threshold %.2f%%)",
+        version_id,
+        drift_rate * 100,
+        config.SHADOW_DRIFT_MAX_RATE * 100,
+    )
+
+    if drift_rate >= config.SHADOW_DRIFT_MAX_RATE:
+        logger.warning(
+            "Shadow drift rate %.2f%% exceeds threshold — blocking promotion of %s",
+            drift_rate * 100,
+            version_id,
+        )
+        clear_shadow_state(model_dir)
+        shutil.rmtree(candidate_dir, ignore_errors=True)
+        return 6
+
+    # Check FP rate regression against production
+    if retrain_data_path:
+        prod_fp = compute_false_positive_rate(model_dir, retrain_data_path)
+        cand_fp = compute_false_positive_rate(candidate_dir, retrain_data_path)
+        if prod_fp is not None and cand_fp is not None:
+            excess = cand_fp - prod_fp
+            if excess > config.SHADOW_FP_RATE_MAX_EXCESS:
+                logger.warning(
+                    "Candidate FP rate %.2f%% exceeds production %.2f%% by %.2f%% (max %.2f%%) "
+                    "— rolling back %s",
+                    cand_fp * 100,
+                    prod_fp * 100,
+                    excess * 100,
+                    config.SHADOW_FP_RATE_MAX_EXCESS * 100,
+                    version_id,
+                )
+                # Verify artifact signature before noting rollback
+                from detection.model_inference import verify_model_artifact_signature
+
+                verify_model_artifact_signature(model_dir, version_id)
+                clear_shadow_state(model_dir)
+                shutil.rmtree(candidate_dir, ignore_errors=True)
+                logger.warning(
+                    "Automatic rollback triggered for %s — production model retained. "
+                    "See docs/model_rollback_runbook.md for manual intervention steps.",
+                    version_id,
+                )
+                return 6
+
+    # Promote candidate
+    logger.info("Promoting candidate %s to production", version_id)
+    archive_current_models(model_dir)
+    for fname in os.listdir(candidate_dir):
+        src = os.path.join(candidate_dir, fname)
+        dst = os.path.join(model_dir, fname)
+        shutil.copy2(src, dst)
+    logger.info("Candidate %s promoted to %s", version_id, model_dir)
+    clear_shadow_state(model_dir)
+    shutil.rmtree(candidate_dir, ignore_errors=True)
+    return 5
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Detect feature drift and trigger retraining")
     parser.add_argument(
@@ -215,6 +379,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--random-state", type=int, default=42, help="Random state for train/test split"
     )
+    parser.add_argument(
+        "--check-shadow",
+        action="store_true",
+        help="Check if a pending shadow candidate is ready for promotion or rollback",
+    )
+    parser.add_argument(
+        "--no-shadow",
+        action="store_true",
+        help="Skip shadow deployment and promote immediately (legacy behaviour)",
+    )
     return parser.parse_args(argv)
 
 
@@ -222,6 +396,30 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     model_dir = args.model_dir or config.MODEL_DIR
 
+    # ------------------------------------------------------------------
+    # Shadow evaluation mode: check a previously registered candidate
+    # ------------------------------------------------------------------
+    if args.check_shadow:
+        shadow_state = load_shadow_state(model_dir)
+        if shadow_state is None:
+            logger.info("No shadow candidate registered in %s", model_dir)
+            return 0
+        return evaluate_shadow_candidate(shadow_state, model_dir, args.retrain_data_path)
+
+    # Check for pending shadow candidate before running drift detection
+    shadow_state = load_shadow_state(model_dir)
+    if shadow_state is not None and not args.no_shadow:
+        logger.info(
+            "Pending shadow candidate detected (version %s) — evaluating before drift check",
+            shadow_state.get("version_id"),
+        )
+        rc = evaluate_shadow_candidate(shadow_state, model_dir, args.retrain_data_path)
+        if rc != 0:
+            return rc
+
+    # ------------------------------------------------------------------
+    # Drift detection
+    # ------------------------------------------------------------------
     logger.info("Loading model metadata from %s", model_dir)
     metadata = load_model_metadata(model_dir)
     if metadata is None:
@@ -268,9 +466,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Drift detected but --retrain-data-path not provided")
         return 1
 
-    logger.info("Archiving current models")
-    archive_path = archive_current_models(model_dir)
-
     old_metrics = load_metrics(model_dir)
 
     logger.info("Loading training data from %s", args.retrain_data_path)
@@ -295,32 +490,10 @@ def main(argv: list[str] | None = None) -> int:
     promote, reason = should_promote(old_metrics or {}, new_metrics)
     logger.info("Promotion decision: %s — %s", promote, reason)
 
-    if promote:
-        for fname in os.listdir(temp_model_dir):
-            src = os.path.join(temp_model_dir, fname)
-            dst = os.path.join(model_dir, fname)
-            shutil.copy2(src, dst)
-        logger.info("New models promoted to %s", model_dir)
-        write_retrain_report(
-            drift_dict,
-            old_metrics,
-            new_metrics,
-            promote,
-            reason,
-            archive_path,
-        )
-        shutil.rmtree(temp_model_dir, ignore_errors=True)
-        return 2
-    else:
+    if not promote:
         logger.warning("New models did not meet promotion criteria — archived but not promoted")
-        write_retrain_report(
-            drift_dict,
-            old_metrics,
-            new_metrics,
-            promote,
-            reason,
-            archive_path,
-        )
+        archive_path = archive_current_models(model_dir)
+        write_retrain_report(drift_dict, old_metrics, new_metrics, promote, reason, archive_path)
         for fname in os.listdir(temp_model_dir):
             src = os.path.join(temp_model_dir, fname)
             dst = os.path.join(archive_path, fname)
@@ -328,6 +501,40 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("New models also archived to %s", archive_path)
         shutil.rmtree(temp_model_dir, ignore_errors=True)
         return 3
+
+    # ------------------------------------------------------------------
+    # Shadow deployment (unless --no-shadow is set)
+    # ------------------------------------------------------------------
+    if args.no_shadow:
+        archive_path = archive_current_models(model_dir)
+        for fname in os.listdir(temp_model_dir):
+            src = os.path.join(temp_model_dir, fname)
+            dst = os.path.join(model_dir, fname)
+            shutil.copy2(src, dst)
+        logger.info("New models promoted immediately (--no-shadow) to %s", model_dir)
+        write_retrain_report(drift_dict, old_metrics, new_metrics, True, reason, archive_path)
+        shutil.rmtree(temp_model_dir, ignore_errors=True)
+        return 2
+
+    version_id = str(uuid.uuid4())
+    shadow_state = {
+        "version_id": version_id,
+        "candidate_dir": temp_model_dir,
+        "shadow_start": datetime.now(UTC).isoformat(),
+        "drift_rate": 0.0,
+        "drift_events": 0,
+        "total_shadow_requests": 0,
+    }
+    save_shadow_state(model_dir, shadow_state)
+    logger.info(
+        "Shadow deployment started for version %s — candidate in %s. "
+        "Run with --check-shadow after %d hours to evaluate promotion.",
+        version_id,
+        temp_model_dir,
+        config.SHADOW_PERIOD_HOURS,
+    )
+    write_retrain_report(drift_dict, old_metrics, new_metrics, False, "Shadow deployment started", None)
+    return 4
 
 
 if __name__ == "__main__":

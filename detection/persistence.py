@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -82,6 +82,35 @@ class EnsembleWeightRecord(Base):
     fp_rate: Mapped[float] = mapped_column(nullable=False)
     observation_count: Mapped[int] = mapped_column(Integer, nullable=False)
     is_systemic_reset: Mapped[bool] = mapped_column(nullable=False, default=False)
+
+
+class ModelVersionRecord(Base):
+    """Tracks every trained model version with its shadow deployment lifecycle.
+
+    ``status`` transitions: shadow → production | rolled_back | archived.
+    ``training_metadata`` stores a JSON blob (metrics, feature hash, etc.).
+    ``artifact_signature`` is the hex Ed25519 signature of the model directory
+    produced by :class:`ModelArtifact` — verified on rollback before loading.
+    """
+
+    __tablename__ = "model_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version_id: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    model_artifact_path: Mapped[str] = mapped_column(String, nullable=False)
+    artifact_signature: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="shadow", index=True)
+    trained_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True
+    )
+    shadow_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    shadow_drift_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shadow_total_requests: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    shadow_drift_events: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    promotion_blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    training_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ShapQueryCount(Base):

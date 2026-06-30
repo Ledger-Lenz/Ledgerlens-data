@@ -14,10 +14,14 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from config import config
+
+if TYPE_CHECKING:
+    from detection.wallet_graph import IncrementalWalletGraph
 
 try:
     from prometheus_client import Counter
@@ -94,3 +98,57 @@ class FeatureCache:
     def _record_miss() -> None:
         if feature_cache_misses_total is not None:
             feature_cache_misses_total.inc()
+
+
+class WalletGraphCache:
+    """Thread-safe singleton cache holding the live :class:`IncrementalWalletGraph`.
+
+    Wraps :class:`~detection.wallet_graph.IncrementalWalletGraph` so that the
+    streaming scorer and feature engineering pipeline share a single in-memory
+    graph that is updated incrementally as new trade edges arrive.
+
+    Usage::
+
+        cache = WalletGraphCache.instance()
+        cache.add_trade_edge(src, dst, trade)
+        subgraph = cache.get_ego_subgraph(wallet_id)
+        removed = cache.remove_stale_edges()
+    """
+
+    _singleton: "WalletGraphCache | None" = None
+    _singleton_lock = threading.Lock()
+
+    def __init__(self) -> None:
+        from detection.wallet_graph import IncrementalWalletGraph
+
+        self._graph = IncrementalWalletGraph()
+        self._lock = threading.Lock()
+
+    @classmethod
+    def instance(cls) -> "WalletGraphCache":
+        """Return the process-wide singleton (created on first call)."""
+        if cls._singleton is None:
+            with cls._singleton_lock:
+                if cls._singleton is None:
+                    cls._singleton = cls()
+        return cls._singleton
+
+    def add_trade_edge(self, src_wallet: str, dst_wallet: str, trade: dict) -> None:
+        """Delegate to the underlying :class:`IncrementalWalletGraph`."""
+        self._graph.add_trade_edge(src_wallet, dst_wallet, trade)
+
+    def remove_stale_edges(self, max_age_hours: float | None = None) -> int:
+        """Remove stale edges and return the count removed."""
+        return self._graph.remove_stale_edges(max_age_hours)
+
+    def get_ego_subgraph(self, wallet_id: str, hops: int = 2):
+        """Extract a k-hop ego subgraph from the live graph."""
+        return self._graph.get_ego_subgraph(wallet_id, hops)
+
+    def graph_metrics(self) -> dict:
+        """Return ``{nodes, edges, stale_edges}`` for the live graph."""
+        return self._graph.graph_metrics()
+
+    def snapshot(self):
+        """Return a full copy of the current graph state."""
+        return self._graph.snapshot()
