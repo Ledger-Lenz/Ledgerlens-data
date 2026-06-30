@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "tool": "ledgerlens-load-test",
+    "version": "1.0.0",
+    "timestamp": "2026-06-29T00:00:00+00:00",
+    "parameters": {
+      "rate_tps": 500,
+      "duration_s": 120,
+      "ramp_time_s": 30,
+      "no_kafka": true,
+      "bootstrap": "localhost:9092",
+      "topic_prefix": "ledgerlens.trades",
+      "seed": 42
+    }
+  },
+  "results": {
+    "summary": {
+      "total_sent": 56432,
+      "total_acked": 56432,
+      "total_errors": 0,
+      "throughput_tps": 470.27,
+      "benford_throughput_tps": 470.27,
+      "duration_s": 120.0
+    },
+    "latency_s": {
+      "p50":  0.0003,
+      "p95":  0.0011,
+      "p99":  0.0024,
+      "p999": 0.0089,
+      "max":  0.0143,
+      "mean": 0.0004
+    },
+    "kafka_lag": {
+      "p50": null,
+      "p95": null,
+      "max": null
+    },
+    "memory_mb": {
+      "p50": 142.3,
+      "p99": 158.7,
+      "max": 162.1
+    }
+  },
+  "pass_fail": {
+    "passed": true,
+    "checks": [
+      {
+        "name": "p99 latency < 10.0s (at >=500 tps)",
+        "passed": true,
+        "actual": "0.002s",
+        "threshold": "10.0s",
+        "enforced": true
+      },
+      {
+        "name": "worker memory < 1024 MB",
+        "passed": true,
+        "actual": "162.1 MB",
+        "threshold": "1024 MB",
+        "enforced": true
+      }
+    ]
+  },
+  "thresholds": {
+    "p99_latency_s": 10.0,
+    "memory_threshold_mb": 1024.0
+  }
+}
