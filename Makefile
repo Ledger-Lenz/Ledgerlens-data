@@ -1,5 +1,5 @@
 .PHONY: install lint format test run scale-workers
-.PHONY: install lint format test run typecheck
+.PHONY: install lint format test run typecheck fuzz
 
 VENV_BIN := $(abspath .venv/bin)
 ifeq ($(wildcard $(VENV_BIN)/python),)
@@ -30,6 +30,12 @@ format:
 
 test:
 	$(PYTEST) -q
+
+fuzz:
+	@echo "Running fuzz tests for 60 seconds each..."
+	timeout 65 python tests/fuzz/fuzz_avro_codec.py tests/fuzz/corpus/ -max_len=10000 -timeout=10 || true
+	timeout 65 python tests/fuzz/fuzz_horizon_response.py tests/fuzz/corpus/ -max_len=50000 -timeout=10 || true
+	@echo "Fuzz testing complete."
 
 run:
 	python run_pipeline.py
