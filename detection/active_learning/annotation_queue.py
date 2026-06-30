@@ -121,16 +121,51 @@ class AnnotationQueue:
     # Write operations
     # ------------------------------------------------------------------
 
-    def push(self, wallets: list[str], strategy_name: str, asset_pair: str = "") -> None:
+    def push(
+        self,
+        wallets: list[str],
+        strategy_name: str,
+        asset_pair: str = "",
+        epistemic_uncertainties: dict[str, float] | None = None,
+        aleatoric_uncertainties: dict[str, float] | None = None,
+    ) -> None:
         """Add *wallets* to the queue with status ``pending``.
 
         Wallets already present (any status) are skipped.
+
+        Parameters
+        ----------
+        wallets:
+            Wallet IDs to enqueue.
+        strategy_name:
+            Name of the query strategy that selected these wallets.
+        asset_pair:
+            Optional asset pair context.
+        epistemic_uncertainties:
+            Optional mapping of wallet_id -> epistemic uncertainty [0, 1].
+            Used to rank samples for annotation (higher = prioritised).
+        aleatoric_uncertainties:
+            Optional mapping of wallet_id -> aleatoric uncertainty [0, 1].
+            Wallets above ``config.ACTIVE_LEARNING_ALEATORIC_THRESHOLD`` are
+            filtered out before enqueuing (inherently noisy, annotation won't help).
         """
+        aleatoric_threshold = config.ACTIVE_LEARNING_ALEATORIC_THRESHOLD
         queue = _load_queue(self.queue_path)
         existing = {item["wallet"] for item in queue}
         now = datetime.now(UTC).isoformat()
+        skipped_aleatoric = 0
         for wallet in wallets:
             if wallet in existing:
+                continue
+            aleatoric = (aleatoric_uncertainties or {}).get(wallet)
+            if aleatoric is not None and aleatoric > aleatoric_threshold:
+                logger.debug(
+                    "Skipping wallet %s: aleatoric uncertainty %.4f exceeds threshold %.4f",
+                    wallet,
+                    aleatoric,
+                    aleatoric_threshold,
+                )
+                skipped_aleatoric += 1
                 continue
             queue.append(
                 {
@@ -140,7 +175,15 @@ class AnnotationQueue:
                     "query_strategy": strategy_name,
                     "selected_at": now,
                     "status": "pending",
+                    "epistemic_uncertainty": (epistemic_uncertainties or {}).get(wallet),
+                    "aleatoric_uncertainty": aleatoric,
                 }
+            )
+        if skipped_aleatoric:
+            logger.info(
+                "push: filtered %d wallet(s) with aleatoric uncertainty above threshold %.4f",
+                skipped_aleatoric,
+                aleatoric_threshold,
             )
         _atomic_write(self.queue_path, queue)
 
@@ -430,10 +473,22 @@ class AnnotationQueue:
     # ------------------------------------------------------------------
 
     def pop_batch(self, n: int) -> list[dict]:
-        """Return the next *n* pending wallets (does not change status)."""
+        """Return the next *n* pending wallets ranked by epistemic uncertainty.
+
+        Wallets with ``epistemic_uncertainty`` set are sorted in descending
+        order (highest epistemic uncertainty first — most informative for
+        annotation).  Wallets without uncertainty scores retain their
+        insertion order, after the ranked wallets.
+        """
         queue = _load_queue(self.queue_path)
         pending = [item for item in queue if item.get("status") == "pending"]
-        return pending[:n]
+
+        # Separate ranked vs unranked; sort ranked by descending epistemic uncertainty
+        ranked = [item for item in pending if item.get("epistemic_uncertainty") is not None]
+        unranked = [item for item in pending if item.get("epistemic_uncertainty") is None]
+        ranked.sort(key=lambda x: x["epistemic_uncertainty"], reverse=True)
+
+        return (ranked + unranked)[:n]
 
     def pending_wallets(self) -> list[str]:
         return [item["wallet"] for item in self.pop_batch(10**9)]

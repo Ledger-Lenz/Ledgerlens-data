@@ -246,6 +246,19 @@ class Config:
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
+    # Byzantine-resilient Krum aggregation (#189)
+    FEDERATED_BYZANTINE_TOLERANCE: int = int(os.getenv("FEDERATED_BYZANTINE_TOLERANCE", "1"))
+
+    # MC Dropout active learning uncertainty decomposition (#190)
+    # Aleatoric uncertainty threshold: samples above this are filtered from the annotation queue
+    ACTIVE_LEARNING_ALEATORIC_THRESHOLD: float = float(
+        os.getenv("ACTIVE_LEARNING_ALEATORIC_THRESHOLD", "0.25")
+    )
+    # Number of MC Dropout forward passes for epistemic uncertainty estimation
+    ACTIVE_LEARNING_MC_DROPOUT_PASSES: int = int(
+        os.getenv("ACTIVE_LEARNING_MC_DROPOUT_PASSES", "50")
+    )
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []

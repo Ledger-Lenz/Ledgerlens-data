@@ -43,6 +43,112 @@ FED_WEIGHT_DIM: int = int(os.getenv("FED_WEIGHT_DIM", "0"))  # 0 = inferred at r
 FEDERATED_ASYNC_TRIGGER_N: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_N", "3"))
 FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))
 FEDERATED_MAX_STALENESS: int = int(os.getenv("FEDERATED_MAX_STALENESS", "5"))
+# Krum Byzantine tolerance: assumed number of Byzantine participants per round (#189)
+FEDERATED_BYZANTINE_TOLERANCE: int = int(os.getenv("FEDERATED_BYZANTINE_TOLERANCE", "1"))
+# Magnitude clipping threshold before Krum scoring (prevents magnitude-based bypass)
+_KRUM_CLIP_NORM: float = float(os.getenv("FEDERATED_KRUM_CLIP_NORM", "10.0"))
+
+
+# ---------------------------------------------------------------------------
+# Krum Byzantine-resilient aggregation (Blanchard et al., NeurIPS 2017)
+# ---------------------------------------------------------------------------
+
+
+def krum_aggregate(
+    updates: list[np.ndarray],
+    n_byzantine: int,
+    multi_krum_m: int = 1,
+) -> np.ndarray:
+    """Select the gradient update(s) most resistant to Byzantine influence.
+
+    Implements the Krum and Multi-Krum algorithms from:
+        Blanchard et al., "Machine Learning with Adversaries: Byzantine Tolerant
+        Gradient Descent", NeurIPS 2017.
+
+    Each update's Krum score is the sum of squared distances to its
+    (n - n_byzantine - 2) nearest neighbours.  The m updates with the lowest
+    scores are averaged (Multi-Krum; m=1 gives vanilla Krum).
+
+    Gradient magnitudes are clipped to ``_KRUM_CLIP_NORM`` before scoring to
+    prevent magnitude-based Krum bypass attacks (a Byzantine participant
+    cannot gain advantage by inflating its gradient norm).
+
+    Complexity: O(n² × d) where n = len(updates), d = gradient dimension.
+    Implemented with vectorised numpy operations.
+
+    Parameters
+    ----------
+    updates:
+        List of gradient arrays from n participants.
+    n_byzantine:
+        Assumed number of Byzantine participants.
+    multi_krum_m:
+        Number of updates to select and average (default 1 = Krum).
+
+    Raises
+    ------
+    ValueError
+        If there are insufficient honest participants for Krum to be safe
+        (i.e. n - n_byzantine < 3).  Callers should fall back to FedAvg.
+    """
+    n = len(updates)
+    if n - n_byzantine < 3:
+        raise ValueError(
+            f"Krum requires n - n_byzantine >= 3 (n={n}, n_byzantine={n_byzantine}). "
+            "Fall back to FedAvg."
+        )
+
+    k = n - n_byzantine - 2  # number of nearest neighbours to sum
+
+    # Clip gradient magnitudes to prevent magnitude-based bypass attacks
+    clipped: list[np.ndarray] = []
+    for u in updates:
+        norm = np.linalg.norm(u)
+        if norm > _KRUM_CLIP_NORM:
+            clipped.append(u * (_KRUM_CLIP_NORM / norm))
+        else:
+            clipped.append(u)
+
+    # Stack into matrix: shape (n, d)
+    U = np.stack(clipped, axis=0)
+
+    # Pairwise squared Euclidean distances: shape (n, n) — vectorised
+    # ||u_i - u_j||^2 = ||u_i||^2 + ||u_j||^2 - 2 u_i · u_j
+    norms_sq = np.sum(U**2, axis=1, keepdims=True)  # (n, 1)
+    dist_sq = norms_sq + norms_sq.T - 2.0 * (U @ U.T)  # (n, n)
+    np.fill_diagonal(dist_sq, np.inf)  # exclude self
+
+    # Krum score: sum of k smallest distances for each update
+    sorted_dists = np.sort(dist_sq, axis=1)  # (n, n), rows sorted ascending
+    scores = sorted_dists[:, :k].sum(axis=1)  # (n,)
+
+    # Select m updates with the smallest Krum scores
+    m = min(multi_krum_m, n - n_byzantine)
+    selected_indices = np.argsort(scores)[:m]
+
+    # Warn if any selected update deviates significantly from the mean
+    mean_update = U.mean(axis=0)
+    for idx in selected_indices:
+        deviation = float(np.linalg.norm(updates[idx] - mean_update))
+        avg_norm = float(np.mean([np.linalg.norm(u) for u in updates]))
+        if deviation > 2.0 * avg_norm:
+            logger.warning(
+                "Krum: selected update[%d] deviates significantly from mean "
+                "(deviation=%.4f, avg_norm=%.4f) — possible Byzantine behaviour detected",
+                idx,
+                deviation,
+                avg_norm,
+            )
+
+    result: np.ndarray = np.mean(U[selected_indices], axis=0)
+    logger.info(
+        "Krum selected %d/%d updates (indices=%s, scores=%s)",
+        m,
+        n,
+        selected_indices.tolist(),
+        [f"{scores[i]:.4f}" for i in selected_indices],
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -74,17 +180,39 @@ class _RoundState:
         return True
 
     def _aggregate(self, masked_deltas: list[np.ndarray]) -> None:
-        """FedAvg: global += (1/N) * sum(masked_deltas)."""
+        """Aggregate deltas using Krum when possible, falling back to FedAvg.
+
+        Krum is used when ``n - FEDERATED_BYZANTINE_TOLERANCE >= 3``.
+        """
         n = len(masked_deltas)
-        agg = np.sum(masked_deltas, axis=0) / n
+        n_byz = FEDERATED_BYZANTINE_TOLERANCE
+
+        if n - n_byz >= 3:
+            try:
+                agg = krum_aggregate(masked_deltas, n_byzantine=n_byz)
+                method = "krum"
+            except Exception as exc:
+                logger.warning("Krum aggregation failed (%s); falling back to FedAvg", exc)
+                agg = np.sum(masked_deltas, axis=0) / n
+                method = "fedavg-fallback"
+        else:
+            logger.warning(
+                "Krum skipped: n=%d, n_byzantine=%d, need n-n_byzantine>=3; using FedAvg",
+                n,
+                n_byz,
+            )
+            agg = np.sum(masked_deltas, axis=0) / n
+            method = "fedavg"
+
         if self.global_weights is None:
             self.global_weights = agg
         else:
             self.global_weights = self.global_weights + agg
         logger.info(
-            "Round %d aggregated %d deltas. New global weight norm: %.4f",
+            "Round %d aggregated %d deltas via %s. New global weight norm: %.4f",
             self.round_number,
             n,
+            method,
             float(np.linalg.norm(self.global_weights)),
         )
         self.round_number += 1
@@ -418,7 +546,7 @@ class AsyncFederatedCoordinator:
         return False
 
     def _aggregate(self) -> bool:
-        """Apply staleness-weighted FedAvg to all pending updates.
+        """Apply staleness-weighted aggregation (Krum when safe, FedAvg otherwise).
 
         Must be called while holding ``self._lock``.
         """
@@ -427,6 +555,9 @@ class AsyncFederatedCoordinator:
 
         updates = list(self._pending)
         self._pending.clear()
+
+        n = len(updates)
+        n_byz = FEDERATED_BYZANTINE_TOLERANCE
 
         # Staleness-aware weights: w_i = 1 / (1 + staleness_i)
         weights = np.array(
@@ -438,7 +569,21 @@ class AsyncFederatedCoordinator:
         total_weight = weights.sum()
         norm_weights = weights / total_weight
 
-        agg = sum(w * u.delta for w, u in zip(norm_weights, updates, strict=True))
+        # Weighted deltas for Krum scoring
+        weighted_deltas = [w * u.delta for w, u in zip(norm_weights, updates, strict=True)]
+
+        if n - n_byz >= 3:
+            try:
+                agg = krum_aggregate(weighted_deltas, n_byzantine=n_byz)
+                method = "krum"
+            except Exception as exc:
+                logger.warning("Async Krum failed (%s); falling back to FedAvg", exc)
+                agg = sum(weighted_deltas)
+                method = "fedavg-fallback"
+        else:
+            agg = sum(weighted_deltas)
+            method = "fedavg"
+
         assert self._global_weights is not None
         self._global_weights = self._global_weights + agg
         self._model_version += 1
@@ -452,10 +597,11 @@ class AsyncFederatedCoordinator:
 
         logger.info(
             "Async aggregation complete: updates_included=%d mean_staleness=%.2f "
-            "new_model_version=%d global_weight_norm=%.4f",
+            "new_model_version=%d global_weight_norm=%.4f method=%s",
             len(updates),
             mean_staleness,
             self._model_version,
             float(np.linalg.norm(self._global_weights)),
+            method,
         )
         return True

@@ -599,6 +599,99 @@ class RiskScorer:
         scores = feature_matrix.apply(self.score, axis=1, result_type="expand")
         return pd.concat([feature_matrix[["wallet"]], scores], axis=1)
 
+    def compute_epistemic_uncertainty(self, feature_row: pd.Series) -> float:
+        """Estimate epistemic (model) uncertainty via Monte Carlo Dropout.
+
+        Runs N=``config.ACTIVE_LEARNING_MC_DROPOUT_PASSES`` stochastic forward
+        passes with dropout enabled at test time (Gal & Ghahramani, 2016).
+        Returns the variance of predictions across passes, normalised to [0, 1].
+
+        For PyTorch models (MAML adapter), MC Dropout is applied by enabling
+        training mode on dropout layers only.  For sklearn ensemble models,
+        epistemic uncertainty is estimated as the variance of per-model
+        probabilities (ensemble disagreement), which approximates Bayesian model
+        uncertainty when models are diverse.
+
+        This method must NOT be called during production scoring
+        (``caller_id != "internal"``) to prevent inference-time variability from
+        leaking model internals.
+
+        Parameters
+        ----------
+        feature_row:
+            Feature matrix row for the target wallet.
+
+        Returns
+        -------
+        float
+            Epistemic uncertainty in [0, 1].  Higher → more uncertain.
+        """
+        n_passes = config.ACTIVE_LEARNING_MC_DROPOUT_PASSES
+
+        # Try PyTorch MC Dropout when the MAML adapter is available
+        if self.maml_adapter is not None:
+            try:
+                import torch
+
+                feature_cols = [c for c in feature_row.index if c not in ("wallet",)]
+                X_df = feature_row[feature_cols].to_frame().T.astype(float)
+                self.extractor.fit(X_df)
+                leaf_embeddings = self.extractor.transform(X_df)
+                X_tensor = torch.tensor(leaf_embeddings, dtype=torch.float32)
+
+                # Enable MC Dropout: set model to train mode so dropout is active
+                self.maml_adapter.train()
+                mc_preds = []
+                with torch.no_grad():
+                    for _ in range(n_passes):
+                        logit = self.maml_adapter(X_tensor)
+                        prob = torch.sigmoid(logit).item()
+                        mc_preds.append(prob)
+                # Restore eval mode
+                self.maml_adapter.eval()
+
+                epistemic = float(np.var(mc_preds))
+                # Variance of a Bernoulli is at most 0.25 (at p=0.5); normalise
+                return min(epistemic / 0.25, 1.0)
+            except Exception as exc:
+                logger.debug("PyTorch MC Dropout failed, falling back to ensemble: %s", exc)
+
+        # Fallback: ensemble disagreement as epistemic uncertainty proxy
+        probs = self._ensemble_probabilities(feature_row)
+        if len(probs) < 2:
+            return 0.0
+        epistemic = float(np.var(probs))
+        return min(epistemic / 0.25, 1.0)
+
+    def compute_aleatoric_uncertainty(self, feature_row: pd.Series) -> float:
+        """Estimate aleatoric (data) uncertainty from mean prediction entropy.
+
+        Aleatoric uncertainty captures irreducible noise inherent in the sample
+        (i.e. the sample is ambiguous regardless of model capacity).
+
+        Returns the mean binary entropy of model predictions, normalised to [0, 1].
+        Entropy is maximised at p=0.5 (H=1 bit = log(2) nats); samples near
+        the decision boundary have high aleatoric uncertainty.
+
+        Parameters
+        ----------
+        feature_row:
+            Feature matrix row for the target wallet.
+
+        Returns
+        -------
+        float
+            Aleatoric uncertainty in [0, 1].  Higher → more inherently ambiguous.
+        """
+        probs = self._ensemble_probabilities(feature_row)
+        entropies = []
+        for p in probs:
+            p = np.clip(p, 1e-9, 1 - 1e-9)
+            h = -(p * np.log(p) + (1 - p) * np.log(1 - p))
+            entropies.append(h)
+        # Normalise: max binary entropy = log(2) ≈ 0.693
+        return float(np.mean(entropies) / np.log(2))
+
 
 def _score_one(wallet: str) -> dict:
     """Fetch a wallet's on-chain account data and return a risk score dict.
