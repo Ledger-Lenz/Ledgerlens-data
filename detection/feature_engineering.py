@@ -40,6 +40,68 @@ from detection.wallet_graph import (
 )
 from ingestion.data_models import AccountActivity
 
+# ---------------------------------------------------------------------------
+# Provenance tracking (Issue #244)
+# ---------------------------------------------------------------------------
+
+import json as _json
+import os as _os
+
+_PROVENANCE_ENABLED = _os.getenv("FEATURE_PROVENANCE_ENABLED", "false").lower() == "true"
+
+# Base window-aggregate Benford feature prefixes — provenance is only tracked
+# for these, not for derived ratios or calibrated variants.
+_PROVENANCE_FEATURE_PREFIXES = (
+    "benford_chi_square_",
+    "benford_mad_",
+    "benford_z_max_",
+)
+
+
+class ProvenanceTracker:
+    """Records which trade IDs (Horizon paging tokens) contributed to each feature.
+
+    When ``enabled=False`` (the default, controlled by ``FEATURE_PROVENANCE_ENABLED``),
+    all operations are no-ops and ``to_json()`` returns ``None`` — no storage
+    overhead is incurred.
+
+    Only base window-aggregate Benford features are tracked; derived features
+    (ratios, calibrated variants, GNN embeddings) are excluded.
+
+    Usage::
+
+        tracker = ProvenanceTracker()
+        tracker.record("benford_chi_square_24h", trade_ids=df["trade_id"].tolist())
+        provenance_blob = tracker.to_json()  # stored in risk_score DB
+    """
+
+    def __init__(self, enabled: bool = _PROVENANCE_ENABLED) -> None:
+        self.enabled = enabled
+        self._data: dict[str, list[str]] = {}
+
+    def record(self, feature_name: str, trade_ids: list[str]) -> None:
+        """Associate *trade_ids* with *feature_name*.
+
+        Only records when enabled and the feature is a base window-aggregate
+        (prefix matches ``_PROVENANCE_FEATURE_PREFIXES``).
+        """
+        if not self.enabled:
+            return
+        if not any(feature_name.startswith(p) for p in _PROVENANCE_FEATURE_PREFIXES):
+            return
+        self._data[feature_name] = list(trade_ids)
+
+    def to_json(self) -> str | None:
+        """Serialise provenance as a JSON string, or ``None`` when disabled."""
+        if not self.enabled:
+            return None
+        return _json.dumps(self._data)
+
+    def get(self, feature_name: str) -> list[str]:
+        """Return the trade IDs recorded for *feature_name* (empty list if none)."""
+        return self._data.get(feature_name, [])
+
+
 FEATURE_DESCRIPTIONS: dict[str, str] = {
     # Benford features — 5 windows (1h, 4h, 24h, 168h, 720h)
     **{
@@ -201,6 +263,7 @@ def compute_benford_features(
     liquidity_profiler=None,
     asset: str | None = None,
     precomputed_metrics: dict[int, BenfordMetrics] | None = None,
+    provenance: "ProvenanceTracker | None" = None,
 ) -> dict:
     """Flatten per-window Benford metrics into a feature row.
 
@@ -218,14 +281,43 @@ def compute_benford_features(
     When ``decompose=True``, also adds ``benford_residual_chi_square_{h}h``
     and ``benford_residual_mad_{h}h`` — Benford metrics on STL residuals.
     Residual features are set to ``NaN`` for insufficient-data windows.
+
+    When *provenance* is provided (and ``FEATURE_PROVENANCE_ENABLED=True``),
+    records the Horizon paging-token trade IDs that contributed to each
+    window's Benford aggregate.
     """
     per_window = precomputed_metrics or compute_benford_metrics_for_windows(wallet_trades)
+
+    # Pre-compute per-window trade ID sets for provenance recording.
+    _window_trade_ids: dict[int, list[str]] = {}
+    if provenance is not None and provenance.enabled and not wallet_trades.empty:
+        id_col = next(
+            (c for c in ("trade_id", "id", "paging_token") if c in wallet_trades.columns), None
+        )
+        if id_col is not None:
+            ts_col = next(
+                (c for c in ("ledger_close_time", "timestamp", "time") if c in wallet_trades.columns),
+                None,
+            )
+            for hours in per_window:
+                if ts_col is not None:
+                    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=hours)
+                    mask = pd.to_datetime(wallet_trades[ts_col], utc=True) >= cutoff
+                    ids = wallet_trades.loc[mask, id_col].astype(str).tolist()
+                else:
+                    ids = wallet_trades[id_col].astype(str).tolist()
+                _window_trade_ids[hours] = ids
 
     features: dict = {}
     for hours, metrics in per_window.items():
         features[f"benford_chi_square_{hours}h"] = metrics["chi_square"]
         features[f"benford_mad_{hours}h"] = metrics["mad"]
         features[f"benford_z_max_{hours}h"] = max(metrics["z_scores"].values(), default=0.0)
+        if provenance is not None and hours in _window_trade_ids:
+            ids = _window_trade_ids[hours]
+            provenance.record(f"benford_chi_square_{hours}h", ids)
+            provenance.record(f"benford_mad_{hours}h", ids)
+            provenance.record(f"benford_z_max_{hours}h", ids)
 
     if decompose and not wallet_trades.empty:
         for hours, res_metrics in _compute_residual_benford_for_windows(wallet_trades).items():

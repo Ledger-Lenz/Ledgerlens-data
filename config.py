@@ -218,6 +218,14 @@ class Config:
     AL_ROLLBACK_AUC_DROP: float = float(os.getenv("AL_ROLLBACK_AUC_DROP", "0.01"))
     AL_QUEUE_PATH: str = os.getenv("AL_QUEUE_PATH", "data/annotation_queue.json")
 
+    # Core-set selection (Issue #253)
+    ACTIVE_LEARNING_ALPHA: float = float(os.getenv("ACTIVE_LEARNING_ALPHA", "0.5"))
+    CORESET_MIN_DISTANCE: float = float(os.getenv("CORESET_MIN_DISTANCE", "0.1"))
+
+    # Active learning stopping criterion (Issue #256)
+    ACTIVE_LEARNING_EER_THRESHOLD: float = float(os.getenv("ACTIVE_LEARNING_EER_THRESHOLD", "0.001"))
+    ACTIVE_LEARNING_CONVERGENCE_WINDOW: int = int(os.getenv("ACTIVE_LEARNING_CONVERGENCE_WINDOW", "5"))
+
     # Wash Trade Simulation Engine
     GAN_ROUNDS: int = int(os.getenv("GAN_ROUNDS", "5"))
     GAN_PLATEAU_THRESHOLD: float = float(os.getenv("GAN_PLATEAU_THRESHOLD", "0.005"))

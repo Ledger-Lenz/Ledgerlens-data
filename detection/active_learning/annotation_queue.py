@@ -43,6 +43,7 @@ import json
 import os
 import stat
 import tempfile
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any
 
@@ -491,6 +492,177 @@ class AnnotationQueue:
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             df.to_parquet(output_path, index=False)
         return df
+
+
+# ---------------------------------------------------------------------------
+# Stopping criterion (Issue #256)
+# ---------------------------------------------------------------------------
+
+
+class StoppingCriterion:
+    """Active learning stopping criterion based on Expected Error Reduction (EER)
+    and rolling AUC improvement.
+
+    Convergence is declared when **either**:
+    - The EER of the highest-uncertainty unlabelled sample falls below
+      ``eer_threshold`` (default ``ACTIVE_LEARNING_EER_THRESHOLD``), OR
+    - The mean AUC improvement over the last ``convergence_window`` rounds
+      is below ``auc_improvement_threshold`` (default 0.005).
+
+    The check is designed to run at the end of each annotation batch (not
+    after each individual annotation).
+
+    Security: convergence reports log annotator IDs and counts only —
+    never raw label values.
+
+    Args:
+        eer_threshold: Stop when EER < this value (default 0.001).
+        convergence_window: Number of rounds to average for AUC trend (default 5).
+        auc_improvement_threshold: Min mean AUC improvement per round (default 0.005).
+    """
+
+    def __init__(
+        self,
+        eer_threshold: float | None = None,
+        convergence_window: int | None = None,
+        auc_improvement_threshold: float = 0.005,
+    ) -> None:
+        self.eer_threshold: float = eer_threshold if eer_threshold is not None else float(
+            getattr(config, "ACTIVE_LEARNING_EER_THRESHOLD", 0.001)
+        )
+        self.convergence_window: int = convergence_window if convergence_window is not None else int(
+            getattr(config, "ACTIVE_LEARNING_CONVERGENCE_WINDOW", 5)
+        )
+        self.auc_improvement_threshold = auc_improvement_threshold
+        # Rolling AUC history: deque of per-round AUC values
+        self._auc_history: deque[float] = deque(maxlen=self.convergence_window + 1)
+        self._round: int = 0
+
+    def record_round_auc(self, auc: float) -> None:
+        """Record the AUC after one annotation batch completes."""
+        self._auc_history.append(auc)
+        self._round += 1
+
+    def eer(self, model, unlabelled_pool: pd.DataFrame) -> float:
+        """Compute EER: expected error reduction for the highest-uncertainty sample.
+
+        Uses the current production model (no special model trained).  EER is
+        approximated as ``1 - max_class_probability`` for the most uncertain sample.
+
+        Args:
+            model: Fitted scikit-learn compatible model with ``predict_proba``.
+            unlabelled_pool: DataFrame of unlabelled candidates.
+
+        Returns:
+            EER estimate (float).  0.0 if pool is empty.
+        """
+        if unlabelled_pool.empty or model is None:
+            return 0.0
+
+        from detection.model_training import FEATURE_COLUMNS_EXCLUDE
+
+        feat_cols = [c for c in unlabelled_pool.columns if c not in FEATURE_COLUMNS_EXCLUDE]
+        X = unlabelled_pool[feat_cols].astype(float).fillna(0.0)
+        probs = model.predict_proba(X)  # (N, 2)
+        # EER ≈ 1 − max_prob for the most uncertain sample
+        max_probs = probs.max(axis=1)
+        return float(1.0 - max_probs.max())
+
+    def should_stop(
+        self,
+        model=None,
+        unlabelled_pool: "pd.DataFrame | None" = None,
+    ) -> bool:
+        """Return True if the stopping criterion has fired.
+
+        Checks both EER and rolling AUC trend.  Intended to be called at the
+        end of each annotation batch.
+        """
+        # EER check
+        if model is not None and unlabelled_pool is not None and not unlabelled_pool.empty:
+            eer_val = self.eer(model, unlabelled_pool)
+            if eer_val < self.eer_threshold:
+                logger.info(
+                    "StoppingCriterion: EER=%.6f < threshold=%.6f — convergence declared",
+                    eer_val,
+                    self.eer_threshold,
+                )
+                return True
+
+        # Rolling AUC improvement check
+        if len(self._auc_history) >= self.convergence_window + 1:
+            # compute round-over-round improvements for the last window rounds
+            history = list(self._auc_history)
+            improvements = [history[i] - history[i - 1] for i in range(1, len(history))]
+            mean_improvement = sum(improvements[-self.convergence_window:]) / self.convergence_window
+            if mean_improvement < self.auc_improvement_threshold:
+                logger.info(
+                    "StoppingCriterion: mean AUC improvement=%.6f < threshold=%.6f "
+                    "over last %d rounds — convergence declared",
+                    mean_improvement,
+                    self.auc_improvement_threshold,
+                    self.convergence_window,
+                )
+                return True
+
+        return False
+
+    def emit_convergence_report(
+        self,
+        queue_path: str,
+        db_path: str | None = None,
+    ) -> dict:
+        """Write a convergence report without including raw label values.
+
+        Logs annotator IDs and annotation counts only.
+
+        Returns the report dict (also written to ``reports/`` if *db_path* is set).
+        """
+        queue = _load_queue(queue_path)
+        annotated = [item for item in queue if item.get("status") == "annotated"]
+
+        # Count annotations per annotator (no label values)
+        annotator_counts: dict[str, int] = {}
+        for item in annotated:
+            aid = item.get("annotator_id", "unknown")
+            annotator_counts[aid] = annotator_counts.get(aid, 0) + 1
+
+        report: dict[str, Any] = {
+            "converged_at": datetime.now(UTC).isoformat(),
+            "rounds_completed": self._round,
+            "total_annotations": len(annotated),
+            "annotator_counts": annotator_counts,
+            "auc_history": list(self._auc_history),
+        }
+
+        # Dispatch alert via streaming alert dispatcher
+        try:
+            from streaming.alert_dispatcher import AlertDispatcher
+
+            dispatcher = AlertDispatcher(channel="stdout")
+            dispatcher.dispatch(
+                wallet="__convergence__",
+                pair_id="active_learning",
+                score=0,
+                benford_flag=False,
+                ml_flag=False,
+                confidence=0,
+            )
+        except Exception as exc:
+            logger.warning("Could not dispatch convergence alert: %s", exc)
+
+        # Persist report
+        import os
+
+        os.makedirs("reports", exist_ok=True)
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+        report_path = os.path.join("reports", f"al_convergence_{ts}.json")
+        with open(report_path, "w") as f:
+            import json as _json
+
+            _json.dump(report, f, indent=2)
+        logger.info("Convergence report written to %s", report_path)
+        return report
 
 
 # ---------------------------------------------------------------------------
