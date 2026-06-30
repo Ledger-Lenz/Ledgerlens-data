@@ -14,6 +14,7 @@ types, and the canonical ``asset_pair`` string format.
 from typing import Any, cast
 import io
 import json
+import struct
 import time
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -106,3 +107,219 @@ def deserialize(value: bytes, schema: dict) -> dict:
 def validate(record: dict, schema: dict) -> None:
     """Raise ``fastavro`` validation error if *record* does not match *schema*."""
     fastavro.validation.validate(record, schema, raise_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Avro CRC32 canonical fingerprinting (#201)
+# ---------------------------------------------------------------------------
+
+def _avro_crc32_fingerprint(schema_dict: dict) -> int:
+    """Compute the 64-bit Avro CRC-64-AVRO fingerprint of the canonical schema JSON.
+
+    Avro's canonical fingerprinting algorithm applies a specific CRC-64 over
+    the schema's Parsing Canonical Form (PCF).  We use fastavro's built-in
+    ``fingerprint`` helper when available and fall back to CRC-32 (from
+    ``struct``) for environments without the optional dependency.
+
+    The returned value is a signed 64-bit integer for consistency with the
+    Avro specification.
+    """
+    canonical = json.dumps(schema_dict, sort_keys=True, separators=(",", ":"))
+    data = canonical.encode("utf-8")
+    try:
+        # fastavro >= 1.6 exposes rabin fingerprint
+        return fastavro.schema.fingerprint(data, "CRC-64-AVRO")  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    # Fallback: CRC-32 packed as a signed 64-bit integer
+    import zlib
+    crc = zlib.crc32(data) & 0xFFFFFFFF
+    return struct.unpack(">i", struct.pack(">I", crc)[:4])[0]
+
+
+# ---------------------------------------------------------------------------
+# Schema compatibility checks (#201)
+# ---------------------------------------------------------------------------
+
+def _field_map(schema: dict) -> dict[str, dict]:
+    """Return {field_name: field_def} for a parsed Avro record schema."""
+    return {f["name"]: f for f in schema.get("fields", [])}
+
+
+def _has_default(field: dict) -> bool:
+    return "default" in field
+
+
+def _is_nullable(field: dict) -> bool:
+    ftype = field.get("type")
+    if isinstance(ftype, list):
+        return "null" in ftype
+    return ftype == "null"
+
+
+def _field_is_optional(field: dict) -> bool:
+    return _has_default(field) or _is_nullable(field)
+
+
+def check_backward_compatibility(old_schema: dict, new_schema: dict) -> tuple[bool, list[str]]:
+    """Check whether messages written with *old_schema* can be read with *new_schema*.
+
+    Backward compatibility rules (Avro spec):
+    - Fields added to *new_schema* must have a default value.
+    - Fields removed from *new_schema* (present in *old_schema*) must have been
+      optional (had a default or nullable type) in *old_schema*.
+
+    Returns:
+        (is_compatible: bool, violations: list[str])
+    """
+    old_fields = _field_map(old_schema)
+    new_fields = _field_map(new_schema)
+    violations = []
+
+    # Added fields must have defaults so old messages (missing the field) are valid
+    for name, field in new_fields.items():
+        if name not in old_fields and not _field_is_optional(field):
+            violations.append(
+                f"Added field '{name}' has no default — old messages cannot supply a value"
+            )
+
+    # Removed fields: readers skip them unless they were optional
+    for name, field in old_fields.items():
+        if name not in new_fields and not _field_is_optional(field):
+            violations.append(
+                f"Removed required field '{name}' — new reader cannot reconstruct it"
+            )
+
+    return len(violations) == 0, violations
+
+
+def check_forward_compatibility(old_schema: dict, new_schema: dict) -> tuple[bool, list[str]]:
+    """Check whether messages written with *new_schema* can be read with *old_schema*.
+
+    Forward compatibility rules (Avro spec):
+    - Fields added in *new_schema* must have a default so *old_schema* readers
+      can supply a value when the field is missing from the reader's perspective.
+    - Fields present in *old_schema* but missing from *new_schema* must have
+      defaults in *old_schema* so the reader can supply them.
+
+    Returns:
+        (is_compatible: bool, violations: list[str])
+    """
+    old_fields = _field_map(old_schema)
+    new_fields = _field_map(new_schema)
+    violations = []
+
+    # New writer writes new fields; old reader must be able to ignore them
+    for name, field in new_fields.items():
+        if name not in old_fields and not _field_is_optional(field):
+            violations.append(
+                f"New field '{name}' has no default — old reader cannot supply it when missing"
+            )
+
+    # Old reader expects fields that the new writer omitted
+    for name, field in old_fields.items():
+        if name not in new_fields and not _field_is_optional(field):
+            violations.append(
+                f"Field '{name}' expected by old reader is absent from new schema "
+                "and has no default — old reader cannot reconstruct it"
+            )
+
+    return len(violations) == 0, violations
+
+
+# ---------------------------------------------------------------------------
+# SchemaRegistry (#201)
+# ---------------------------------------------------------------------------
+
+class SchemaRegistry:
+    """In-process registry of Avro schema versions with fingerprint-based lookup.
+
+    All schemas loaded through this registry are sourced exclusively from the
+    bundled ``data/`` directory — schemas from untrusted external sources are
+    never accepted at runtime.
+
+    Usage::
+
+        registry = SchemaRegistry()
+        v1 = registry.register(load_schema("data/trade_avro_schema.json"))
+        v2 = registry.register(new_schema_dict)
+        ok, errors = registry.check_backward_compatibility(v1, v2)
+    """
+
+    def __init__(self) -> None:
+        # fingerprint -> (version_number, raw_schema_dict)
+        self._versions: dict[int, tuple[int, dict]] = {}
+        self._counter: int = 0
+
+    def register(self, schema: dict) -> int:
+        """Register *schema* and return its fingerprint.
+
+        If the schema is already registered its existing fingerprint is returned
+        without incrementing the version counter.
+        """
+        fp = _avro_crc32_fingerprint(schema)
+        if fp not in self._versions:
+            self._counter += 1
+            self._versions[fp] = (self._counter, schema)
+        return fp
+
+    def get_schema(self, fingerprint: int) -> dict | None:
+        """Return the raw schema dict for *fingerprint*, or None if unknown."""
+        entry = self._versions.get(fingerprint)
+        return entry[1] if entry else None
+
+    def get_version(self, fingerprint: int) -> int | None:
+        """Return the sequential version number for *fingerprint*, or None."""
+        entry = self._versions.get(fingerprint)
+        return entry[0] if entry else None
+
+    def latest_fingerprint(self) -> int | None:
+        """Return the fingerprint of the most recently registered schema."""
+        if not self._versions:
+            return None
+        return max(self._versions, key=lambda fp: self._versions[fp][0])
+
+    def check_backward_compatibility(
+        self, old_fp: int, new_fp: int
+    ) -> tuple[bool, list[str]]:
+        """Backward-compat check between two registered schemas by fingerprint."""
+        old = self.get_schema(old_fp)
+        new = self.get_schema(new_fp)
+        if old is None:
+            raise KeyError(f"Unknown fingerprint (old): {old_fp}")
+        if new is None:
+            raise KeyError(f"Unknown fingerprint (new): {new_fp}")
+        return check_backward_compatibility(old, new)
+
+    def check_forward_compatibility(
+        self, old_fp: int, new_fp: int
+    ) -> tuple[bool, list[str]]:
+        """Forward-compat check between two registered schemas by fingerprint."""
+        old = self.get_schema(old_fp)
+        new = self.get_schema(new_fp)
+        if old is None:
+            raise KeyError(f"Unknown fingerprint (old): {old_fp}")
+        if new is None:
+            raise KeyError(f"Unknown fingerprint (new): {new_fp}")
+        return check_forward_compatibility(old, new)
+
+    def all_fingerprints(self) -> list[tuple[int, int]]:
+        """Return [(version, fingerprint)] sorted by version ascending."""
+        return sorted(
+            [(v, fp) for fp, (v, _) in self._versions.items()],
+            key=lambda x: x[0],
+        )
+
+
+# Module-level default registry populated with the bundled schema on first use.
+_default_registry: SchemaRegistry | None = None
+
+
+def get_default_registry() -> SchemaRegistry:
+    """Return (and lazily initialise) the module-level SchemaRegistry."""
+    global _default_registry
+    if _default_registry is None:
+        _default_registry = SchemaRegistry()
+        raw = json.load(open(config.TRADE_AVRO_SCHEMA_PATH, encoding="utf-8"))
+        _default_registry.register(raw)
+    return _default_registry

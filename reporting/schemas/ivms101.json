@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ledgerlens.io/schemas/ivms101-ledgerlens-1.0.json",
+  "title": "IVMS101 LedgerLens Risk Export",
+  "description": "IVMS101-compatible JSON-LD structure for FATF Travel Rule compliance reporting. Extends the IVMS101 1.0 data standard with LedgerLens-specific risk indicators and pseudonymised wallet identifiers.",
+  "type": "object",
+  "required": [
+    "@context",
+    "@type",
+    "payloadMetadata",
+    "originator",
+    "beneficiary",
+    "originatingVASP",
+    "beneficiaryVASP",
+    "riskIndicators",
+    "transactionReference"
+  ],
+  "additionalProperties": false,
+  "definitions": {
+    "unavailableField": {
+      "description": "Sentinel used when a required IVMS101 field has no corresponding data in the detection output.",
+      "type": "object",
+      "required": ["value", "dataUnavailable"],
+      "properties": {
+        "value": {
+          "type": "null"
+        },
+        "dataUnavailable": {
+          "type": "boolean",
+          "const": true
+        },
+        "fieldName": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "stringOrUnavailable": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/definitions/unavailableField" }
+      ]
+    },
+    "numberOrUnavailable": {
+      "oneOf": [
+        { "type": "number" },
+        { "$ref": "#/definitions/unavailableField" }
+      ]
+    },
+    "objectOrUnavailable": {
+      "oneOf": [
+        { "type": "object" },
+        { "$ref": "#/definitions/unavailableField" }
+      ]
+    },
+    "arrayOrUnavailable": {
+      "oneOf": [
+        { "type": "array" },
+        { "$ref": "#/definitions/unavailableField" }
+      ]
+    },
+    "riskIndicator": {
+      "type": "object",
+      "required": ["code", "description", "severity"],
+      "additionalProperties": true,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^VA-\\d{3}$",
+          "description": "FATF virtual-asset risk indicator code."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+        },
+        "evidenceReference": {
+          "description": "Report ID or other reference linking to supporting evidence.",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "naturalPerson": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": {},
+        "geographicAddress": {},
+        "nationalIdentification": {},
+        "dateAndPlaceOfBirth": {},
+        "customerIdentification": {},
+        "countryOfResidence": {}
+      }
+    },
+    "originatorPerson": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "naturalPerson": { "$ref": "#/definitions/naturalPerson" },
+        "legalPerson": { "type": "object" }
+      }
+    }
+  },
+  "properties": {
+    "@context": {
+      "type": "string",
+      "description": "JSON-LD context URI for the IVMS101 schema."
+    },
+    "@type": {
+      "type": "string",
+      "description": "JSON-LD type; must identify this as an IVMS101 identity payload."
+    },
+    "payloadMetadata": {
+      "type": "object",
+      "required": ["reportId", "generatedAt", "reportingEntity", "schemaVersion"],
+      "additionalProperties": true,
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique identifier of the originating LedgerLens forensic report."
+        },
+        "generatedAt": {
+          "type": "string",
+          "description": "ISO 8601 UTC timestamp of report generation."
+        },
+        "reportingEntity": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the reporting VASP / system."
+        },
+        "schemaVersion": {
+          "type": "string",
+          "description": "IVMS101 LedgerLens export schema version."
+        },
+        "sourceReportSha256": {}
+      }
+    },
+    "originator": {
+      "type": "object",
+      "required": ["accountNumber", "originatorPersons"],
+      "additionalProperties": false,
+      "properties": {
+        "accountNumber": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Wallet addresses or pseudonymous identifiers for the flagged wallet.",
+          "items": {}
+        },
+        "originatorPersons": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/originatorPerson" }
+        }
+      }
+    },
+    "beneficiary": {
+      "type": "object",
+      "required": ["beneficiaryPersons", "accountNumber"],
+      "additionalProperties": false,
+      "properties": {
+        "beneficiaryPersons": {
+          "type": "array"
+        },
+        "accountNumber": {
+          "type": "array"
+        }
+      }
+    },
+    "originatingVASP": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "originatingVASP": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "beneficiaryVASP": {
+      "description": "Beneficiary VASP details; populated as data-unavailable sentinel when unknown.",
+      "oneOf": [
+        { "type": "object" },
+        { "$ref": "#/definitions/unavailableField" }
+      ]
+    },
+    "riskIndicators": {
+      "type": "array",
+      "description": "FATF risk indicator codes derived from LedgerLens detection output.",
+      "items": { "$ref": "#/definitions/riskIndicator" }
+    },
+    "transactionReference": {
+      "type": "object",
+      "required": ["reportId", "assetPair", "riskScore", "verdict", "scoreConfidenceInterval"],
+      "additionalProperties": false,
+      "properties": {
+        "reportId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "assetPair": {
+          "$ref": "#/definitions/stringOrUnavailable"
+        },
+        "riskScore": {
+          "$ref": "#/definitions/numberOrUnavailable",
+          "description": "Normalised risk score in [0, 1]."
+        },
+        "verdict": {
+          "$ref": "#/definitions/stringOrUnavailable"
+        },
+        "scoreConfidenceInterval": {
+          "description": "95% confidence interval of the calibrated risk score.",
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["lower", "upper"],
+              "properties": {
+                "lower": { "type": "number" },
+                "upper": { "type": "number" }
+              },
+              "additionalProperties": false
+            },
+            { "$ref": "#/definitions/unavailableField" }
+          ]
+        }
+      }
+    }
+  }
+}
