@@ -117,6 +117,8 @@ class Config:
     WASH_RING_RESOLUTION: float = float(os.getenv("WASH_RING_RESOLUTION", "1.0"))
     # Fixed seed keeps Louvain community detection deterministic in CI.
     WASH_RING_LOUVAIN_SEED: int = int(os.getenv("WASH_RING_LOUVAIN_SEED", "42"))
+    # Motif census timeout — partial results returned with census_truncated=True if exceeded.
+    MOTIF_CENSUS_TIMEOUT_SECONDS: float = float(os.getenv("MOTIF_CENSUS_TIMEOUT_SECONDS", "5"))
 
     # Distributed rate limiting for Horizon REST calls (ingestion/rate_limiter.py)
     HORIZON_MAX_RPS: int = min(100, int(os.getenv("HORIZON_MAX_RPS", "80")))
