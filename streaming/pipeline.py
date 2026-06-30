@@ -19,6 +19,8 @@ threads with a 5-second timeout, and returns.
 import signal
 import threading
 import time
+from collections import defaultdict
+from datetime import UTC, datetime
 
 from stellar_sdk import Asset as SdkAsset
 
@@ -32,6 +34,118 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+try:
+    from prometheus_client import Gauge
+
+    _WATERMARK_LAG = Gauge(
+        "watermark_lag_seconds",
+        "Seconds between current wall-clock time and the per-(wallet,pair) watermark",
+        ["wallet", "pair"],
+    )
+    _PROMETHEUS_AVAILABLE = True
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+
+
+class WatermarkManager:
+    """Tracks per-(wallet, pair) event-time watermarks and buffers late events.
+
+    The watermark for a (wallet, pair) key is defined as:
+        max_observed_timestamp(wallet, pair) - allowed_lateness_seconds
+
+    Events whose ``ledger_close_time`` falls before the current watermark are
+    classified as *late* and stored in ``_late_buffer`` so they can be replayed
+    into the correct historical window before its final aggregation.
+
+    Timestamps are sourced exclusively from ``trade.ledger_close_time``
+    (the Stellar ledger close time) to prevent client-supplied timestamp
+    spoofing from altering window assignment.
+
+    The watermark advances monotonically — a late event never causes it to
+    decrease.
+    """
+
+    def __init__(self, allowed_lateness_seconds: int | None = None) -> None:
+        self._allowed_lateness: int = (
+            allowed_lateness_seconds
+            if allowed_lateness_seconds is not None
+            else config.WATERMARK_ALLOWED_LATENESS_SECONDS
+        )
+        # (wallet, pair) -> max observed ledger_close_time as epoch seconds
+        self._max_ts: dict[tuple[str, str], float] = defaultdict(float)
+        # (wallet, pair) -> list of late Trade objects pending replay
+        self._late_buffer: dict[tuple[str, str], list] = defaultdict(list)
+        self._lock = threading.Lock()
+
+    def _pair_key(self, trade) -> tuple[str, str]:
+        return (trade.base_account, trade.base_asset.pair_id(trade.counter_asset))
+
+    def _ts(self, trade) -> float:
+        """Return epoch seconds from trade.ledger_close_time (always ledger time)."""
+        t = trade.ledger_close_time
+        if isinstance(t, datetime):
+            return t.timestamp()
+        # Already a numeric epoch value
+        return float(t)
+
+    def watermark(self, wallet: str, pair: str) -> float:
+        """Return the current watermark (epoch seconds) for (wallet, pair)."""
+        with self._lock:
+            return self._max_ts[(wallet, pair)] - self._allowed_lateness
+
+    def process(self, trade) -> tuple[bool, list]:
+        """Classify *trade* as on-time or late and update the watermark.
+
+        Returns:
+            (is_late, replayed_trades)
+            - is_late: True when trade.ledger_close_time < current watermark
+            - replayed_trades: list of previously buffered late trades that are
+              now safe to replay (their timestamps are newer than earlier late
+              events but still within the allowed lateness window)
+        """
+        wallet = trade.base_account
+        pair = trade.base_asset.pair_id(trade.counter_asset)
+        ts = self._ts(trade)
+
+        with self._lock:
+            current_max = self._max_ts[(wallet, pair)]
+            wm = current_max - self._allowed_lateness
+
+            if ts < wm:
+                # Late event — buffer it, watermark must not decrease
+                self._late_buffer[(wallet, pair)].append(trade)
+                self._emit_lag(wallet, pair, current_max)
+                return True, []
+
+            # On-time event — advance watermark monotonically
+            if ts > current_max:
+                self._max_ts[(wallet, pair)] = ts
+
+            new_wm = self._max_ts[(wallet, pair)] - self._allowed_lateness
+            replayed = self._drain_late_buffer(wallet, pair, new_wm)
+            self._emit_lag(wallet, pair, self._max_ts[(wallet, pair)])
+            return False, replayed
+
+    def _drain_late_buffer(self, wallet: str, pair: str, watermark: float) -> list:
+        """Return buffered late events whose timestamps are >= watermark."""
+        key = (wallet, pair)
+        buf = self._late_buffer[key]
+        if not buf:
+            return []
+        still_late = [t for t in buf if self._ts(t) < watermark]
+        replayable = [t for t in buf if self._ts(t) >= watermark]
+        self._late_buffer[key] = still_late
+        return sorted(replayable, key=self._ts)
+
+    def _emit_lag(self, wallet: str, pair: str, max_ts: float) -> None:
+        if not _PROMETHEUS_AVAILABLE:
+            return
+        lag = time.time() - (max_ts - self._allowed_lateness)
+        try:
+            _WATERMARK_LAG.labels(wallet=wallet, pair=pair).set(max(0.0, lag))
+        except Exception:
+            pass
+
 
 class StreamingPipeline:
     """Orchestrates one SSE thread per pair and wires the scoring pipeline."""
@@ -44,6 +158,7 @@ class StreamingPipeline:
         pairs: list[tuple[str, str]] | None = None,
         amm_pools: list[str] | None = None,
         role: str = "all",
+        watermark_manager: WatermarkManager | None = None,
     ):
         if role not in ("all", "producer", "worker"):
             raise ValueError(f"Unknown role: {role!r}")
@@ -58,6 +173,7 @@ class StreamingPipeline:
         self._role = role
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
+        self._watermark = watermark_manager if watermark_manager is not None else WatermarkManager()
 
     # ------------------------------------------------------------------
     # Public API
@@ -221,6 +337,35 @@ class StreamingPipeline:
             pairs.append((asset, xlm))
         return pairs
 
+    def _process_trade(self, trade) -> None:
+        """Apply watermark classification then score and dispatch."""
+        is_late, replayed = self._watermark.process(trade)
+        pair_id = trade.base_asset.pair_id(trade.counter_asset)
+        assert self._scorer is not None
+
+        if is_late:
+            logger.debug(
+                "Late event buffered: trade_id=%s ledger_close_time=%s",
+                trade.trade_id,
+                trade.ledger_close_time,
+            )
+            return
+
+        # Replay any late events that are now within the window before processing
+        # the on-time event so historical windows are updated in chronological order.
+        for late_trade in replayed:
+            self._buffer.update(late_trade)
+            for wallet in (late_trade.base_account, late_trade.counter_account):
+                score = self._scorer.score_wallet(wallet, self._buffer)
+                if score is not None:
+                    self._dispatcher.dispatch(wallet, score, pair_id)
+
+        self._buffer.update(trade)
+        for wallet in (trade.base_account, trade.counter_account):
+            score = self._scorer.score_wallet(wallet, self._buffer)
+            if score is not None:
+                self._dispatcher.dispatch(wallet, score, pair_id)
+
     def _stream_pair(self, base_asset: SdkAsset, counter_asset: SdkAsset) -> None:
         pair_label = (
             f"{base_asset.code}:{getattr(base_asset, 'issuer', None) or 'native'}"
@@ -231,13 +376,7 @@ class StreamingPipeline:
                 for trade in stream_trades(base_asset, counter_asset):
                     if self._stop_event.is_set():
                         return
-                    self._buffer.update(trade)
-                    pair_id = trade.base_asset.pair_id(trade.counter_asset)
-                    assert self._scorer is not None
-                    for wallet in (trade.base_account, trade.counter_account):
-                        score = self._scorer.score_wallet(wallet, self._buffer)
-                        if score is not None:
-                            self._dispatcher.dispatch(wallet, score, pair_id)
+                    self._process_trade(trade)
             except Exception as exc:
                 if self._stop_event.is_set():
                     return
@@ -253,9 +392,28 @@ class StreamingPipeline:
                 for trade in stream_amm_pool_trades(pool_id):
                     if self._stop_event.is_set():
                         return
-                    self._buffer.update(trade)
+                    is_late, replayed = self._watermark.process(trade)
                     pair_id = trade.base_asset.pair_id(trade.counter_asset)
                     assert self._scorer is not None
+
+                    if is_late:
+                        logger.debug(
+                            "Late AMM event buffered: pool=%s trade_id=%s",
+                            pool_id,
+                            trade.trade_id,
+                        )
+                        continue
+
+                    for late_trade in replayed:
+                        self._buffer.update(late_trade)
+                        for wallet in (late_trade.base_account, late_trade.counter_account):
+                            if not wallet:
+                                continue
+                            score = self._scorer.score_wallet(wallet, self._buffer)
+                            if score is not None:
+                                self._dispatcher.dispatch(wallet, score, pair_id)
+
+                    self._buffer.update(trade)
                     for wallet in (trade.base_account, trade.counter_account):
                         if not wallet:
                             continue

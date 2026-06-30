@@ -246,6 +246,22 @@ class Config:
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
 
+    # Watermark-based late-arrival handling (#199)
+    WATERMARK_ALLOWED_LATENESS_SECONDS: int = int(os.getenv("WATERMARK_ALLOWED_LATENESS_SECONDS", "120"))
+
+    # Model watermarking — trigger key must be 32 bytes (AES-256) (#200)
+    MODEL_WATERMARK_KEY: str = os.getenv("MODEL_WATERMARK_KEY", "")
+    MODEL_WATERMARK_TRIGGER_COUNT: int = int(os.getenv("MODEL_WATERMARK_TRIGGER_COUNT", "100"))
+    MODEL_WATERMARK_TRIGGER_PATH: str = os.getenv("MODEL_WATERMARK_TRIGGER_PATH", "models/watermark_triggers.enc")
+
+    # Multi-region Horizon failover (#202)
+    HORIZON_FAILOVER_URLS: list[str] = [
+        u.strip() for u in os.getenv("HORIZON_FAILOVER_URLS", "").split(",") if u.strip()
+    ]
+    HORIZON_HEALTH_CHECK_INTERVAL_SECONDS: int = int(os.getenv("HORIZON_HEALTH_CHECK_INTERVAL_SECONDS", "30"))
+    HORIZON_FAILOVER_TIMEOUT_SECONDS: int = int(os.getenv("HORIZON_FAILOVER_TIMEOUT_SECONDS", "10"))
+    HORIZON_DEV_MODE: bool = os.getenv("HORIZON_DEV_MODE", "").lower() in ("1", "true")
+
     @classmethod
     def validate(cls, require_onchain: bool = False):
         errors = []

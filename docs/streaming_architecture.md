@@ -692,3 +692,122 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 | `KAFKA_TOPIC_PATTERN` | `^ledgerlens\.trades\..*` | Worker regex subscription |
 | `KAFKA_LAG_ALERT_THRESHOLD` | `500` | Lag (messages) for CRITICAL log |
 | `KAFKA_METRICS_PORT` | `9100` | Prometheus scrape port |
+
+---
+
+## Watermark-Based Late-Arrival Handling (Issue #199)
+
+### Problem
+
+Stellar Horizon's SSE stream occasionally delivers trade events out of
+chronological order due to network reordering or Horizon replay behaviour.
+Events that arrive after their window has closed are silently dropped, causing
+Benford chi-square values to be systematically lower than the true value.
+
+### Solution: `WatermarkManager` (`streaming/pipeline.py`)
+
+A **watermark** is a monotonically increasing lower bound on event time.  For
+each *(wallet, pair)* key the watermark is defined as:
+
+```
+watermark(wallet, pair) = max_observed_ledger_close_time(wallet, pair)
+                          - WATERMARK_ALLOWED_LATENESS_SECONDS
+```
+
+Events whose `ledger_close_time` falls **before** the watermark are classified
+as *late* and stored in a per-key buffer.  When the watermark advances (because
+an on-time event is processed) late events that are now within the window are
+**replayed into the feature buffer in chronological order** before the on-time
+event is scored.
+
+### Security
+
+All timestamps are sourced from `trade.ledger_close_time` (the Stellar ledger
+close time confirmed by the network), never from client-supplied fields.  This
+prevents an adversary from spoofing timestamps to force events into a different
+window.
+
+### Prometheus metric
+
+| Metric | Type | Description |
+|---|---|---|
+| `watermark_lag_seconds{wallet, pair}` | Gauge | `current_time - watermark` for each (wallet, pair) key |
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `WATERMARK_ALLOWED_LATENESS_SECONDS` | `120` | Events this many seconds behind the watermark are buffered and replayed |
+
+### Trade-off: allowed lateness vs. memory
+
+| Small allowed lateness | Large allowed lateness |
+|---|---|
+| Low memory usage (small late buffer) | Higher memory usage |
+| Risk of dropping genuinely late events | More complete windows |
+| Suitable when Horizon replay lag is typically < 1 min | Suitable for high-jitter networks |
+
+---
+
+## Multi-Region Horizon Endpoint Failover (Issue #202)
+
+### Problem
+
+A single Horizon URL (configured via `HORIZON_URL`) is a single point of
+failure.  Downtime on one provider stops all ingestion.
+
+### Solution: `HorizonEndpointPool` (`ingestion/horizon_streamer.py`)
+
+`HorizonEndpointPool` maintains a configurable list of Horizon endpoints and
+routes ingestion to the healthiest one:
+
+```
+HORIZON_URL + HORIZON_FAILOVER_URLS
+        │
+        ▼
+HorizonEndpointPool
+  ├── Background health-check thread (GET / every 30 s)
+  │     marks endpoints healthy / unhealthy
+  │
+  ├── best_url() → lowest p95 latency among healthy endpoints
+  │
+  └── mark_unhealthy(url) → called on stream error → triggers failover
+        │
+        ▼
+  stream_trades() reconnects to new best_url()
+  (cursor preserved → no missed or duplicate events)
+```
+
+### Failover sequence
+
+1. Active stream raises `ConnectionError` / `TimeoutError` / `OSError`.
+2. `stream_trades` calls `pool.mark_unhealthy(current_url)`.
+3. Next iteration calls `pool.best_url()` which returns the lowest-latency
+   healthy endpoint.
+4. A new `Server` is created with the new URL and the stream resumes from
+   the last `paging_token` (ledger cursor).
+5. Failover completes within `HORIZON_FAILOVER_TIMEOUT_SECONDS` (default 10 s).
+
+### Security
+
+All `HORIZON_FAILOVER_URLS` must use `HTTPS`.  HTTP endpoints are rejected at
+pool construction with `ValueError` to prevent MITM attacks on Horizon
+responses.  Set `HORIZON_DEV_MODE=1` to allow HTTP in local development.
+
+### Stale-data handling
+
+If all healthy endpoints return data that is behind in ledger sequence, the
+`watermark_lag_seconds` Prometheus metric will rise above `WATERMARK_ALLOWED_LATENESS_SECONDS`.
+Operators should monitor this gauge and investigate which Horizon provider is
+lagging.  The pool does not automatically deprefer a lagging endpoint — that
+requires a custom health check that compares `ledger_close_time` values.
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `HORIZON_URL` | `https://horizon.stellar.org` | Primary Horizon endpoint |
+| `HORIZON_FAILOVER_URLS` | `` | Comma-separated additional Horizon URLs |
+| `HORIZON_HEALTH_CHECK_INTERVAL_SECONDS` | `30` | Probe interval per endpoint |
+| `HORIZON_FAILOVER_TIMEOUT_SECONDS` | `10` | HTTP probe + stream reconnect timeout |
+| `HORIZON_DEV_MODE` | `false` | Allow HTTP endpoints (development only) |
