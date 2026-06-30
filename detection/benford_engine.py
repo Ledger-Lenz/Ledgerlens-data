@@ -26,7 +26,6 @@ Second-digit Benford analysis (Issue #179):
 
 import hashlib
 import json
-import logging
 import math
 import os
 from dataclasses import dataclass, field

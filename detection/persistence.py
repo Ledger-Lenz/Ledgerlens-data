@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -42,6 +42,12 @@ class RiskScoreRecord(Base):
     # Stable wash-trading ring id ("ring_<hash>") grouping wallets in the same
     # detected community; NULL when the wallet is not part of any ring.
     ring_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True, default=None)
+    # JSON blob mapping feature_name → [trade_id, ...] for provenance tracking
+    # (Issue #244). NULL when FEATURE_PROVENANCE_ENABLED=False or not computed.
+    provenance_json: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    # True when this score has been certified robust via IBP at the standard
+    # evaluation epsilons (ε=0.01 and ε=0.05) — Issue #245. Internal only.
+    certified_robust: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )

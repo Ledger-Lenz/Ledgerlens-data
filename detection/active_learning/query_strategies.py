@@ -17,6 +17,7 @@ from typing import cast
 import numpy as np
 import pandas as pd
 
+from config import config
 from detection.model_training import FEATURE_COLUMNS_EXCLUDE
 
 
@@ -207,6 +208,93 @@ class CommitteeDisagreement(BaseQueryStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Hybrid: uncertainty + core-set diversity (Issue #253)
+# ---------------------------------------------------------------------------
+
+
+class CoresetHybrid(BaseQueryStrategy):
+    """Hybrid scorer: alpha × uncertainty + (1 - alpha) × coreset_distance.
+
+    Uses ``CoresetSelector`` (with hnswlib ANN) for the diversity term and
+    entropy for the uncertainty term.  ``alpha`` is read from
+    ``config.ACTIVE_LEARNING_ALPHA`` (default 0.5) but can be overridden via
+    the *alpha* kwarg at select time.
+
+    Embedding vectors are derived from model-scaled features and are **not**
+    stored or exported.
+    """
+
+    def select(
+        self,
+        pool: pd.DataFrame,
+        n_query: int,
+        model=None,
+        labelled_pool: pd.DataFrame | None = None,
+        alpha: float | None = None,
+    ) -> list[str]:
+        from detection.active_learning.coreset_selector import CoresetSelector
+
+        if alpha is None:
+            alpha = float(getattr(config, "ACTIVE_LEARNING_ALPHA", 0.5))
+
+        cols = _feature_cols(pool)
+        pool_X = pool[cols].astype(float).fillna(0.0).values.astype("float32")
+
+        # --- uncertainty score (entropy) ---
+        if model is not None:
+            probs = _proba(model, pool[cols].astype(float).fillna(0.0))
+            probs_clipped = np.clip(probs, 1e-10, 1.0)
+            uncertainty = -np.sum(probs_clipped * np.log2(probs_clipped), axis=1)
+            # Normalise to [0, 1]
+            u_max = uncertainty.max()
+            uncertainty = uncertainty / u_max if u_max > 0 else uncertainty
+        else:
+            uncertainty = np.zeros(len(pool), dtype=float)
+
+        # --- coreset distance ---
+        labelled_X: np.ndarray | None = None
+        if labelled_pool is not None and len(labelled_pool) > 0:
+            labelled_X = labelled_pool[_feature_cols(labelled_pool)].astype(float).fillna(0.0).values.astype("float32")
+
+        selector = CoresetSelector(
+            min_distance=float(getattr(config, "CORESET_MIN_DISTANCE", 0.1)),
+        )
+
+        # We need distance scores for ALL candidates, not just the top-k.
+        # Compute min-dist from each candidate to the labelled set.
+        if labelled_X is not None and len(labelled_X) > 0:
+            try:
+                import hnswlib  # type: ignore
+                index = hnswlib.Index(space="l2", dim=pool_X.shape[1])
+                index.init_index(max_elements=len(labelled_X), ef_construction=200, M=16)
+                index.add_items(labelled_X, list(range(len(labelled_X))))
+                index.set_ef(50)
+                _, sq_dists = index.knn_query(pool_X, k=1)
+                coreset_dist = np.sqrt(sq_dists[:, 0])
+            except Exception:
+                diff = pool_X[:, np.newaxis, :] - labelled_X[np.newaxis, :, :]
+                coreset_dist = np.sqrt((diff ** 2).sum(axis=2)).min(axis=1)
+        else:
+            # Cold-start: use pairwise distances within the pool itself
+            if len(pool_X) > 1:
+                diff = pool_X[:, np.newaxis, :] - pool_X[np.newaxis, :, :]
+                all_dists = np.sqrt((diff ** 2).sum(axis=2))
+                np.fill_diagonal(all_dists, np.inf)
+                coreset_dist = all_dists.min(axis=1)
+            else:
+                coreset_dist = np.ones(len(pool_X), dtype=float)
+
+        # Normalise coreset_dist to [0, 1]
+        d_max = coreset_dist.max()
+        coreset_dist_norm = coreset_dist / d_max if d_max > 0 else coreset_dist
+
+        # Combined score — higher is better
+        combined = alpha * uncertainty + (1.0 - alpha) * coreset_dist_norm
+        idx = np.argsort(-combined)[: min(n_query, len(pool))]
+        return cast(list[str], pool.iloc[idx]["wallet"].tolist())
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -217,6 +305,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseQueryStrategy]] = {
     "coreset": CoreSet,
     "badge": BADGE,
     "committee_disagreement": CommitteeDisagreement,
+    "coreset_hybrid": CoresetHybrid,
 }
 
 

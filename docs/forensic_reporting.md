@@ -341,3 +341,72 @@ Security note: `top_interactions` is an internal forensic report field. It is
 | `LEDGERLENS_CONTRACT_ID` | _(required for anchoring)_ | Contract ID of the `ledgerlens-score` Soroban contract. |
 | `LEDGERLENS_SUBMITTER_SECRET` | _(required for anchoring)_ | Secret key of the service account authorised to anchor reports. |
 | `SHAP_INTERACTIONS_ENABLED` | `false` | Enable SHAP pairwise interaction values in forensic reports (O(n·d²) cost). |
+
+---
+
+## Interactive HTML Report Format
+
+`detection/forensic_report_interactive.py` generates a self-contained HTML
+forensic report alongside the existing JSON/PDF formats.
+
+### Dependencies
+
+```
+plotly>=5.0        # interactive SHAP waterfall chart
+pyvis>=0.3         # wallet graph visualisation (optional — graceful degradation)
+```
+
+### Generating an HTML report
+
+```bash
+python -m scripts.generate_reports --input wallets.csv --output-format html \
+    --output-dir reports/forensic
+```
+
+Or from Python:
+
+```python
+from detection.forensic_report_interactive import generate_interactive_report
+
+generate_interactive_report(report.to_dict(), "reports/forensic/my_report.html")
+```
+
+### Self-contained requirement
+
+The HTML file embeds all JavaScript (Plotly, vis-network) inline; no external
+CDN requests are made.  Reports can be opened in an air-gapped environment.
+File size is < 5 MB for a standard report (≤ 100 trades, ≤ 50 graph nodes).
+
+### Interactive features
+
+| Feature | Interaction |
+|---|---|
+| SHAP waterfall chart | Hover for exact contribution values; click a bar to expand contributing trades in the drill-down panel below. |
+| Wallet graph | Zoom / pan / drag nodes; click a node to see its risk score and feature breakdown. |
+| Wallet address reveal | Double-click the wallet hash cell; enter your operator key to reveal the decrypted address (AES-GCM in production). |
+
+### Provenance drill-down
+
+Each SHAP feature bar is linked to the trades that contributed to that feature
+value.  Clicking a bar populates the "Provenance Drill-Down" section with a
+table of relevant trades, each showing its Ledger number, hashed counterparty
+addresses, amounts, and asset pair.
+
+### Security
+
+Raw wallet addresses are **not** present in the HTML source.  Each address is
+replaced with a JavaScript-decoded, operator-key-encrypted field.  The operator
+must enter the key at view time via a browser prompt.  The decryption key is
+never transmitted to any server.
+
+### File size budget
+
+| Component | Approximate size |
+|---|---|
+| Plotly JS bundle (minified) | ≤ 3.5 MB |
+| vis-network (via pyvis) | ≤ 0.8 MB |
+| Report data (100 trades, 50 nodes) | ≤ 0.2 MB |
+| **Total** | **≤ 4.5 MB** |
+
+If plotly is not installed, a plain HTML table fallback is rendered instead
+(< 0.1 MB).

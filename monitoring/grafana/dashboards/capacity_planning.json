@@ -1,0 +1,164 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens — Capacity Planning",
+  "tags": ["ledgerlens", "capacity", "infrastructure"],
+  "timezone": "browser",
+  "time": {"from": "now-7d", "to": "now"},
+  "refresh": "5m",
+  "panels": [
+    {
+      "id": 1,
+      "title": "CPU Usage by Component",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.6},
+              {"color": "red", "value": 0.8}
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "ledgerlens_cpu_usage_ratio",
+          "legendFormat": "{{component}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Memory Usage",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      },
+      "targets": [
+        {
+          "expr": "ledgerlens_memory_usage_bytes",
+          "legendFormat": "RSS"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Trade Ingestion Rate by Asset Pair",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "targets": [
+        {
+          "expr": "ledgerlens_trades_per_second",
+          "legendFormat": "{{asset_pair}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "CPU Trend Projection (7-day linear regression)",
+      "description": "Solid line = predicted CPU usage. Shaded band = ±1.96σ confidence interval. Red line = 80% capacity threshold. Requires at least 7 days of historical data before the forecast is meaningful.",
+      "type": "timeseries",
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      },
+      "targets": [
+        {
+          "expr": "avg(ledgerlens_cpu_usage_ratio)",
+          "legendFormat": "Current (avg)"
+        },
+        {
+          "expr": "predict_linear(ledgerlens_cpu_usage_ratio[7d], 86400 * 30)",
+          "legendFormat": "Projected (30d)"
+        },
+        {
+          "expr": "predict_linear(ledgerlens_cpu_usage_ratio[7d], 86400 * 30) + 1.96 * stddev_over_time(ledgerlens_cpu_usage_ratio[7d])",
+          "legendFormat": "CI upper (95%)",
+          "custom": {"fillOpacity": 10, "lineWidth": 0}
+        },
+        {
+          "expr": "predict_linear(ledgerlens_cpu_usage_ratio[7d], 86400 * 30) - 1.96 * stddev_over_time(ledgerlens_cpu_usage_ratio[7d])",
+          "legendFormat": "CI lower (95%)",
+          "custom": {"fillOpacity": 10, "lineWidth": 0}
+        },
+        {
+          "expr": "vector(0.8)",
+          "legendFormat": "80% threshold"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Days to 80% CPU Capacity",
+      "description": "Estimated days until average CPU usage reaches 80% at current growth rate (from recording rule). Shows N/A when CPU is declining or already above 80%.",
+      "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 14},
+              {"color": "green", "value": 30}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "graphMode": "none",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "ledgerlens:capacity_days_to_80pct_cpu",
+          "legendFormat": "Days to 80% CPU"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Memory Growth Rate",
+      "description": "Per-second rate of memory growth projected over 7 days.",
+      "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "expr": "deriv(ledgerlens_memory_usage_bytes[7d])",
+          "legendFormat": "Memory growth (bytes/s)"
+        }
+      ]
+    }
+  ]
+}

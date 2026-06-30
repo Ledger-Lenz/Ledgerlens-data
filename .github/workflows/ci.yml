@@ -55,6 +55,34 @@ jobs:
               print("verify_chain check passed.")
           EOF
 
+      - name: Validate Grafana dashboard JSON schema (Issue #242)
+        run: |
+          python - <<'EOF'
+          import json, pathlib, sys
+
+          REQUIRED_KEYS = {"schemaVersion", "title", "panels"}
+          errors = []
+          for f in pathlib.Path("monitoring/grafana/dashboards").glob("*.json"):
+              try:
+                  data = json.loads(f.read_text())
+              except json.JSONDecodeError as e:
+                  errors.append(f"{f}: invalid JSON — {e}")
+                  continue
+              missing = REQUIRED_KEYS - data.keys()
+              if missing:
+                  errors.append(f"{f}: missing required keys {missing}")
+              if not isinstance(data.get("panels"), list):
+                  errors.append(f"{f}: 'panels' must be a list")
+
+          if errors:
+              print("Grafana dashboard validation failures:")
+              for e in errors:
+                  print(" ", e)
+              sys.exit(1)
+          else:
+              print(f"All Grafana dashboards valid ({len(list(pathlib.Path('monitoring/grafana/dashboards').glob('*.json')))} files).")
+          EOF
+
       - name: Validate markdown links (Issue #263)
         run: |
           npm install -g markdown-link-check
@@ -64,3 +92,42 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  mutation-test:
+    name: Mutation Testing (≥80% score)
+    runs-on: ubuntu-latest
+    # Run mutation testing only on Python 3.11 to keep CI time under 15 minutes.
+    # It runs in parallel with the test matrix so it does not block PR feedback.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run mutation tests on core scoring path
+        # --paths-to-mutate limits scope to the three core modules so the job
+        # completes in < 15 minutes. Mutmut restores every mutant after testing,
+        # so no mutated code is ever persisted to disk or the workspace.
+        run: |
+          mutmut run \
+            --paths-to-mutate "detection/benford_engine.py,detection/feature_engineering.py,detection/model_inference.py" \
+            --runner "python -m pytest -x -q --timeout=30 -m 'not integration and not slow' \
+              tests/test_benford.py \
+              tests/test_benford_ci.py \
+              tests/test_feature_engineering.py \
+              tests/test_model_inference.py" \
+            --no-progress || true
+
+      - name: Print mutation results summary
+        run: mutmut results || true
+
+      - name: Enforce ≥80% mutation score threshold
+        # Exits 1 (failing the CI step) if fewer than 80% of mutations are killed.
+        # Prints surviving mutations so they can be opened as follow-up issues.
+        run: python scripts/check_mutation_score.py --threshold 80
