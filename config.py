@@ -168,6 +168,21 @@ class Config:
     KAFKA_METRICS_PORT: int = int(os.getenv("KAFKA_METRICS_PORT", "9100"))
     TRADE_AVRO_SCHEMA_PATH: str = os.getenv("TRADE_AVRO_SCHEMA_PATH", "data/trade_avro_schema.json")
 
+    # Account metadata streaming join (streaming/account_metadata_stream.py,
+    # streaming/pipeline.py MetadataJoinState)
+    # METADATA_TOPIC: dedicated Kafka topic for account metadata update events.
+    METADATA_TOPIC: str = os.getenv("METADATA_TOPIC", "ledgerlens.account_metadata")
+    # METADATA_JOIN_WINDOW_SECONDS: how long (seconds) a metadata update enriches
+    # incoming trade events.  After this window the update is considered stale and
+    # must be refreshed by a subsequent Horizon effect.  Default: 3600 (1 hour).
+    METADATA_JOIN_WINDOW_SECONDS: int = int(os.getenv("METADATA_JOIN_WINDOW_SECONDS", "3600"))
+    # METADATA_ACTIVE_WALLET_TTL_SECONDS: wallets that have had no trade activity
+    # for this many seconds are pruned from join state to keep memory bounded.
+    # Default: 86400 (24 hours) — matches the requirement spec.
+    METADATA_ACTIVE_WALLET_TTL_SECONDS: int = int(
+        os.getenv("METADATA_ACTIVE_WALLET_TTL_SECONDS", "86400")
+    )
+
     ALERT_CHANNEL: str = os.getenv("ALERT_CHANNEL", "stdout")
     ALERT_WEBHOOK_URL: str | None = os.getenv("ALERT_WEBHOOK_URL")
     ALERT_COOLDOWN_SECONDS: int = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))

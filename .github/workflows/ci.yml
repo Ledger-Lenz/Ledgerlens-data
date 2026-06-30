@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install ruff black
+          pip install ruff black nbconvert nbformat jupyter-client ipykernel
 
       - name: Lint
         run: |
@@ -89,6 +89,13 @@ jobs:
           markdown-link-check docs/security_threat_model.md
           markdown-link-check docs/security.md
           markdown-link-check CONTRIBUTING.md
+
+      - name: Execute Benford explainer notebook
+        run: |
+          cd notebooks
+          jupyter nbconvert --to notebook --execute \
+            --ExecutePreprocessor.timeout=120 \
+            --inplace benford_explainer.ipynb
 
       - name: Test
         run: pytest -q
