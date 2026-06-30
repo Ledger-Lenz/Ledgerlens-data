@@ -1,28 +1,31 @@
-# zk Attestation Design
+# ZK Attestation Design
 
-This repository now supports a V1 hash-commitment flow for on-chain score submissions.
+This repository supports two attestation tiers for on-chain score submissions.
 
-## V1
+## V1 — Hash Commitment
 
 The attestor computes three public values from the wallet submission:
 
-1. `trade_data_hash` from a canonical serialization of the public trade set.
-2. `model_version_hash` from the model parameters committed at deployment time.
+1. `trade_data_hash` — SHA-256 of the canonical serialisation of the public trade set.
+2. `model_version_hash` — SHA-256 of the model parameters committed at deployment.
 3. `commitment = SHA-256(wallet, trade_data_hash, model_version_hash, score)`.
 
-The contract client can submit the usual `RiskScore` fields plus the commitment metadata. The raw `submit_score` method remains available as a fallback when attestation is not required.
+The contract client submits the `RiskScore` fields plus the commitment metadata.
+Re-running the same computation over the same trade set yields the same receipt
+(deterministic because trade rows and columns are canonicalised before hashing).
 
-## Reproducibility
+## V2 — Benford MAD ZK Proof (Issue #194)
 
-The commitment is deterministic because trade rows and columns are canonicalized before hashing. Re-running the same score computation over the same trade set yields the same receipt.
+High-risk scores (> 70) include a `BenfordZKProof` in the alert payload.
+The proof attests — without revealing trade amounts — that the claimed MAD against
+Benford's expected distribution was computed correctly.
 
-## V2 zkVM path
+### Circuit Statement
 
-Future Risc Zero integration should keep the same public receipt shape, but replace the hash-commitment builder with a guest program that consumes:
+> Given trade amounts x₁, …, xₙ (committed to Merkle root R), the MAD of
+> leading-digit frequencies from Benford's expected distribution equals the
+> claimed value v, within ±0.001 tolerance.
 
-- `wallet`
-- `trade_data_hash`
-- `model_version_hash`
-- `score`
+### Proof System
 
 The guest should emit the public receipt values above and a proof artifact that Soroban can verify before accepting the attested score.

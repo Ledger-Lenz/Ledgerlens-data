@@ -34,6 +34,7 @@ plus ground-truth labels and provenance metadata.
 | `round_trip_frequency` | float | Proportion of trades that are round-trips |
 | `self_matching_rate` | float | Rate of self-matched buy/sell orders |
 | `order_cancellation_rate` | float | Fraction of manage-offer ops that were cancellations |
+| `counterparty_variance` | float | Normalised variance of per-counterparty volume (CV²); range [0, 1]; higher = more suspicious |
 | `volume_per_counterparty_ratio` | float | Total volume / number of unique counterparties |
 | `intra_minute_clustering` | float | Fraction of minute buckets with > 1 trade |
 | `off_hours_activity_ratio` | float | Proportion of trades in UTC 00:00–05:00 |

@@ -316,153 +316,140 @@ pytest tests/test_cluster_scoring.py -v
 Tests cover permutation invariance, cluster ID stability, correct return shape,
 high-risk ring produces score > 80, and DiffPool pooling to `n_clusters`.
 
+
 ---
 
-## Heterogeneous Graph Schema (Issue #186)
+## Contrastive Pre-training Strategy
 
-Wash trade rings on the Stellar DEX often span multiple asset pairs and involve
-both wallet-to-wallet and wallet-to-AMM-pool relationships.  A heterogeneous
-graph with distinct node types enables more expressive GNN representations than
-a single-type wallet graph.
+`detection/contrastive/` implements **SimCLR-style contrastive pre-training**
+for the `TransactionEncoder` (a 2-layer MLP encoder used before the GNN
+pooling stage).  The default random-augmentation approach is augmented with
+**domain-aware negative mining** that exploits labelled wash-trade structure
+to produce more discriminative embeddings.
 
-### Node types
+### Why domain-aware negatives?
 
-| Node type | Feature dim | Features |
+Standard SimCLR draws negatives uniformly at random from the mini-batch.  For
+wash-trade detection this is suboptimal: the encoder quickly learns to separate
+clearly different wallets but struggles to distinguish borderline wash-traders
+from high-frequency legitimate market makers — both produce high-volume,
+clustered trade patterns.  Domain-aware negatives address this by forcing the
+encoder to separate the most confusable pairs:
+
+- **Semi-hard negatives**: confirmed-clean wallets that are *currently closest*
+  to a wash-trade anchor in embedding space (hard in the model's representation,
+  correct in label).
+- **Ring positives**: wallet pairs from the same detected wash-trading ring are
+  pulled together as additional positives beyond the standard augmentation views.
+
+### Negative mining algorithm (`detection/contrastive/negative_miner.py`)
+
+```
+Input:  anchor embeddings  A  (batch × dim)
+        clean-wallet pool  C  (n_clean × dim)
+        epoch index        e
+
+1. L2-normalise A and C.
+2. Query FAISS HNSW index (built over C) for the k nearest neighbours
+   of each anchor.                              ← O(k log n_clean)
+3. Curriculum mix:
+     hard_fraction = min(e / curriculum_epochs, 1.0)
+     n_hard = round(hard_fraction × n_negatives)
+     n_easy = n_negatives − n_hard
+4. Return top-n_hard ANN results + n_easy random indices.
+```
+
+**Complexity**: HNSW query is O(k log n) vs O(n·k) brute-force, enabling
+large clean-wallet pools without training throughput degradation.  A brute-
+force cosine fallback is used automatically when `faiss` is not installed.
+
+**Privacy**: All wallet G-addresses are replaced with HMAC-SHA256 digests
+(keyed by `EVENT_HMAC_SECRET`) before entering the miner's data structures.
+Raw addresses never appear in training state, logs, or the ring registry.
+
+### Ring-positive construction
+
+`RingRegistry` stores hashed wallet IDs grouped by wash-trading ring
+(from Louvain community detection in `detection/wallet_graph.py`).  During
+each batch, `get_ring_positives(hashed_batch_ids)` returns `(i, j)` index
+pairs where wallets `i` and `j` are confirmed colluders.  A cosine-similarity
+auxiliary loss pulls these pairs together in embedding space.
+
+### Curriculum schedule
+
+```
+hard_fraction(epoch) = min(epoch / CONTRASTIVE_CURRICULUM_EPOCHS, 1.0)
+```
+
+| Epoch | hard_fraction | Negative source |
 |---|---|---|
-| `wallet` | 37 | Full wallet feature vector |
-| `asset` | 3 | `total_volume_30d`, `unique_traders_30d`, `benford_mad_30d` |
-| `amm_pool` | 3 | `tvl`, `fee_rate`, `volume_24h` |
+| 0 | 0.00 | 100 % random |
+| curriculum_epochs / 2 | 0.50 | 50 % hard, 50 % random |
+| curriculum_epochs | 1.00 | 100 % hard (ANN) |
+| > curriculum_epochs | 1.00 | 100 % hard (ANN) |
 
-Node features are fetched from the existing feature cache; they are **not**
-recomputed during graph construction.
+The warm-up prevents training instability when the encoder is still random:
+hard negatives are only informative once the embedding space has some
+structure.
 
-### Edge types
+**Configuration**:
 
-```
-(wallet) ──traded──────────────────► (asset)
-(wallet) ──provided_liquidity──────► (amm_pool)
-(wallet) ──co_traded_with──────────► (wallet)
-```
+| Variable | Default | Description |
+|---|---|---|
+| `CONTRASTIVE_CURRICULUM_EPOCHS` | `5` | Warm-up length (set to 0 for instant hard negatives) |
+| `EVENT_HMAC_SECRET` | (required) | HMAC key for wallet ID hashing |
 
-| Edge type | Meaning |
-|---|---|
-| `(wallet, traded, asset)` | Wallet traded the given asset |
-| `(wallet, provided_liquidity, amm_pool)` | Wallet provided liquidity to pool |
-| `(wallet, co_traded_with, wallet)` | Wallets co-active on the same pair within `co_trade_window_hours` |
-
-### Security
-
-Wallet addresses are **SHA-256-hashed** before being embedded as node IDs
-(`hash_wallet_ids=True`, default) to prevent re-identification from model
-artefacts.
-
-### API
-
-```python
-from detection.wallet_graph import build_hetero_graph
-from detection.gnn_encoder import HeteroGNNEncoder
-
-hetero_data = build_hetero_graph(
-    activities=account_activities,
-    trades=trades_df,
-    asset_features={"XLM:native": [1e6, 500, 0.03]},
-    amm_pool_features={"pool_abc": [2e5, 0.003, 5e4]},
-)
-
-encoder = HeteroGNNEncoder()
-embeddings = encoder.encode(hetero_data)
-# embeddings["wallet"]   → np.ndarray (N_wallets, embedding_dim)
-# embeddings["asset"]    → np.ndarray (N_assets,  embedding_dim)
-# embeddings["amm_pool"] → np.ndarray (N_pools,   embedding_dim)
-```
-
-### Performance target
-
-Graph construction must complete in < 5 seconds for graphs with up to 10,000
-wallet nodes.
-
----
-
-## Temporal Graph Attention Network (Issue #187)
-
-Wash trade rings evolve over time: participants join and leave, intensity
-changes, and rings may go dormant and re-activate.  `TemporalGNNEncoder`
-captures these dynamics by operating on **timestamped edges** using the TGAT
-architecture (Xu et al., 2020, ICLR).
-
-### Architecture
-
-```
-Trade edge (src_wallet, dst_wallet, amount, timestamp)
-        │
-        ▼
-_FunctionalTimeEncoding(delta_t)
-  delta_t = query_timestamp − neighbour_timestamp
-  FTE(Δt) = cos(w · Δt + b)   ← learnable w, b  (NOT sinusoidal)
-        │
-        ▼
-TemporalGraphAttentionLayer
-  Q = q_proj(src_feat)
-  K = k_proj([nbr_feat ‖ FTE(Δt)])
-  V = v_proj([nbr_feat ‖ FTE(Δt)])
-  ctx = softmax(Q Kᵀ / √d) · V
-  out = ReLU(out_proj([src_feat ‖ ctx]))
-        │
-        ▼
-Temporal embedding  (embedding_dim,)
-```
-
-**Time encoding** uses the **Functional Time Encoding (FTE)** from TGAT: a
-learnable linear projection of cosine-transformed time deltas.  Positional
-sinusoids are explicitly NOT used.
-
-### Memory module
-
-Each wallet maintains a bounded list of the last `max_edges_per_wallet`
-(default 200) observed trade edges in memory.  Memory is capped at **1 MB
-per wallet** to prevent unbounded growth.  The full state is JSON-serialisable
-for checkpointing.
-
-### Timestamp validation
-
-Trade timestamps are validated as **Unix seconds in [2015-01-01, 2040-01-01]**
-before encoding.  Values outside this range raise `ValueError` and are skipped
-during training to prevent adversarial time injection.
-
-### Training
+### Training the domain-aware encoder
 
 ```bash
-python -m detection.model_training \
-  --data-path data/synthetic_dataset.parquet \
-  --raw-trades-path data/raw_trades.parquet \
-  --with-temporal-gnn
+# Domain-aware pre-training on the synthetic dataset:
+python -m detection.contrastive.pretrain \
+    --data data/synthetic_dataset.parquet \
+    --epochs 20 \
+    --domain-sampling \
+    --curriculum-epochs 5 \
+    --output models/pretrained_encoder.pt
+
+# AUC benchmark (random vs domain-aware):
+python -m detection.contrastive.pretrain \
+    --data data/synthetic_dataset.parquet \
+    --epochs 10 \
+    --benchmark
 ```
 
-The encoder observes all trade edges from `--raw-trades-path`, then saves its
-state to `{MODEL_DIR}/temporal_gnn_encoder.json`.
+### Benchmark: random vs domain-aware AUC
 
-### API
+A linear probe (logistic regression on frozen encoder embeddings) is used
+to measure downstream classification quality on the synthetic dataset.
+
+| Pre-training strategy | Downstream AUC | Notes |
+|---|---|---|
+| Random augmentation (SimCLR) | baseline | No label information used |
+| Domain-aware (hard negatives + ring positives) | ≥ random AUC | Tested by `tests/test_negative_miner.py::TestAUCRegression` |
+
+The AUC regression test (`TestAUCRegression::test_domain_aware_auc_not_worse`)
+enforces that domain-aware pre-training does not degrade below the random
+baseline by more than 2 % on the synthetic dataset, with a tolerance for
+the variance introduced by short training runs.
+
+### Integration with downstream ML pipeline
+
+After pre-training, the encoder's hidden representation `h` (before the
+SimCLR projector head `z`) is used as an additional feature source:
 
 ```python
-from detection.gnn_encoder import TemporalGNNEncoder
-import json
+from detection.contrastive.encoder import TransactionEncoder
+import torch
 
-# Training
-tgnn = TemporalGNNEncoder(max_edges_per_wallet=200)
-tgnn.observe_edge(src_wallet, dst_wallet, src_features, dst_features, timestamp)
-state = tgnn.state_dict()
-with open("models/temporal_gnn_encoder.json", "w") as f:
-    json.dump(state, f)
+encoder = TransactionEncoder(input_dim=feature_dim)
+encoder.load_state_dict(torch.load("models/pretrained_encoder.pt", map_location="cpu"))
+encoder.eval()
 
-# Inference
-tgnn2 = TemporalGNNEncoder()
-with open("models/temporal_gnn_encoder.json") as f:
-    tgnn2.load_state_dict(json.load(f))
-emb = tgnn2.encode(wallet, query_timestamp)  # → np.ndarray (embedding_dim,)
+with torch.no_grad():
+    h, _ = encoder(feature_tensor)   # h: (batch, 256)
 ```
 
-### Reference
-
-Xu, D., Ruan, C., Körpeoglu, E., Kumar, S., & Achan, K. (2020). *Inductive
-Representation Learning on Temporal Graphs*. ICLR 2020.
-<https://arxiv.org/abs/2002.07962>
+The 256-dim `h` vectors can be appended to the tabular feature matrix
+before training the RF / XGBoost / LightGBM ensemble, similar to how
+`gnn_0 … gnn_31` GNN embeddings are appended (see
+`detection/gnn_encoder.py::compute_graph_embedding_features`).

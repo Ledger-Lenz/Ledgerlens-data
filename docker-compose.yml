@@ -8,6 +8,25 @@
 version: "3.8"
 
 services:
+  # ---------------------------------------------------------------------------
+  # Redis — feature store (#183) and distributed rate limiter
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
     environment:
@@ -46,12 +65,15 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       STREAMING_BACKEND: kafka
       ROLE: producer
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       WATCHED_ASSET_PAIRS: ${WATCHED_ASSET_PAIRS:-USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN}
       HORIZON_URL: ${HORIZON_URL:-https://horizon.stellar.org}
+      FEATURE_STORE_REDIS_URL: redis://redis:6379/1
     entrypoint: []
     command: ["python", "-m", "scripts.stream", "--backend", "kafka", "--role", "producer"]
 
@@ -60,6 +82,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       STREAMING_BACKEND: kafka
       ROLE: worker
@@ -67,6 +91,7 @@ services:
       KAFKA_CONSUMER_GROUP: ledgerlens-scorer
       KAFKA_METRICS_PORT: 9100
       KAFKA_LAG_ALERT_THRESHOLD: ${KAFKA_LAG_ALERT_THRESHOLD:-500}
+      FEATURE_STORE_REDIS_URL: redis://redis:6379/1
     entrypoint: []
     command: ["python", "-m", "scripts.stream", "--backend", "kafka", "--role", "worker"]
     expose:

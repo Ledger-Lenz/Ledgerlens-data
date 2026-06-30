@@ -169,6 +169,151 @@ class FGSMAttack(_GradientAttack):
         return self._to_row(x, feature_row, feature_cols)
 
 
+# ---------------------------------------------------------------------------
+# Feature-space FGSM for adversarial training (Issue #191)
+# ---------------------------------------------------------------------------
+
+# Per-feature lower bounds: features that cannot go below 0 (counts,
+# probabilities, positive metrics).  Any feature not listed here defaults to
+# clip_min=None (unconstrained on the lower end).
+_FEATURE_NON_NEGATIVE = {
+    "benford_chi_square",
+    "benford_mad",
+    "counterparty_concentration",
+    "round_trip_frequency",
+    "self_matching_rate",
+    "order_cancellation_rate",
+    "volume_to_counterparty_ratio",
+    "off_hours_ratio",
+    "volume_spike_frequency",
+    "intra_minute_clustering",
+    "cross_pair_synchrony",
+    "net_asset_flow_deviation",
+    "cross_pair_counterparty_overlap",
+    "pair_diversity_score",
+    "cross_pair_mad_consistency",
+    "in_wash_trading_ring",
+    "ring_size",
+    "ring_internal_density",
+    "account_age_days",
+}
+
+
+def _feature_clip_min(feature_name: str) -> float | None:
+    """Return the minimum valid value for a normalised feature column.
+
+    Benford chi-square and MAD must be >= 0. Rate/probability features
+    (0-1) are also non-negative. Features whose names contain a suffix
+    matching any key in `_FEATURE_NON_NEGATIVE` are given a lower bound
+    of 0. All other features are left unconstrained below.
+    """
+    lower = feature_name.lower()
+    if any(k in lower for k in _FEATURE_NON_NEGATIVE):
+        return 0.0
+    return None
+
+
+def feature_space_fgsm(
+    features: pd.Series,
+    epsilon: float,
+    scorer,
+    *,
+    feature_scale: dict | np.ndarray | None = None,
+    probe_fraction: float = DEFAULT_PROBE_FRACTION,
+) -> pd.Series:
+    """Apply FGSM perturbation in the normalised feature space.
+
+    Unlike `FGSMAttack.perturb` (which always attempts to *lower* the
+    score, i.e. evade detection), this function applies a **score-increasing**
+    FGSM step that is used during *adversarial training*: it makes the wash
+    example harder to classify correctly by finding the worst-case perturbation
+    that still keeps feature values physically realistic.
+
+    The perturbation direction is **towards higher scores** (sign of +gradient),
+    so the augmented example sits near the decision boundary from the *clean*
+    side — training on it improves the model's robustness in that neighbourhood.
+
+    Feature-space validity constraints applied post-perturbation:
+      * Features with ``_feature_clip_min`` values (e.g. chi-square, MAD,
+        non-negative rates) are clipped to their lower bound.
+      * The L-inf budget ``epsilon * scale[i]`` is enforced per feature so
+        perturbations stay physically plausible.
+      * ``account_age_days`` is immutable (scale forced to 0 if present in
+        ``feature_scale``).
+
+    Args:
+        features:      Feature row as a ``pd.Series`` (may include non-feature
+                       columns such as ``wallet``; these are passed through).
+        epsilon:       L-inf perturbation budget (in standardised units when
+                       ``feature_scale`` is provided, else raw feature units).
+        scorer:        Any object with ``score_continuous(pd.Series)`` and
+                       ``score_continuous_batch(pd.DataFrame)`` (e.g.
+                       ``RiskScorer``).
+        feature_scale: Per-feature standard deviation (dict or 1-D array
+                       aligned to the feature columns).  Defaults to all-ones.
+        probe_fraction: Fraction of budget used as finite-difference probe
+                        radius (see ``_GradientAttack``).
+
+    Returns:
+        A copy of ``features`` with the adversarially perturbed values.
+        Non-feature columns (``FEATURE_COLUMNS_EXCLUDE``) are unchanged.
+    """
+    if epsilon <= 0:
+        raise ValueError(f"epsilon must be positive, got {epsilon}")
+
+    feature_cols = [c for c in features.index if c not in FEATURE_COLUMNS_EXCLUDE]
+    if not feature_cols:
+        return features.copy()
+
+    # Build scale vector — account_age_days is immutable (frozen)
+    if feature_scale is None:
+        scale = np.ones(len(feature_cols))
+    elif isinstance(feature_scale, dict):
+        scale = np.array(
+            [
+                (0.0 if "account_age" in c else feature_scale.get(c, 1.0))
+                for c in feature_cols
+            ],
+            dtype=float,
+        )
+    else:
+        scale = np.array(feature_scale, dtype=float)
+        # Zero out account_age if present
+        for i, c in enumerate(feature_cols):
+            if "account_age" in c:
+                scale[i] = 0.0
+
+    # Compute finite-difference gradient (score-increasing direction)
+    attack = _GradientAttack(
+        scorer,
+        epsilon=epsilon,
+        feature_scale=scale,
+        clip_min=None,   # we apply per-feature clips manually below
+        clip_max=None,
+        probe_fraction=probe_fraction,
+    )
+    x0 = features[feature_cols].to_numpy(dtype=float)
+    grad = attack._score_gradient(x0, features, feature_cols, scale)
+
+    # FGSM step: move in the +gradient direction (harder to classify)
+    x = x0 + epsilon * scale * np.sign(grad)
+
+    # Enforce L-inf budget
+    lo = x0 - epsilon * scale
+    hi = x0 + epsilon * scale
+    x = np.clip(x, lo, hi)
+
+    # Per-feature physical validity clipping
+    for i, col in enumerate(feature_cols):
+        lb = _feature_clip_min(col)
+        if lb is not None:
+            x[i] = max(x[i], lb)
+
+    result = features.copy()
+    result[feature_cols] = x
+    return result
+
+
 class PGDAttack(_GradientAttack):
     """Projected Gradient Descent: iterated FGSM with L-inf projection.
 

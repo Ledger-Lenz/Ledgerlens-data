@@ -11,12 +11,15 @@ import shap
 
 from config import config
 from detection.differential_privacy import (
+
     feature_sensitivity,
     gaussian_sigma,
     load_shap_sensitivity,
     renyi_noise_multiplier,
 )
 from detection.model_training import FEATURE_COLUMNS_EXCLUDE
+from detection.feature_engineering import feature_dict_url as _feature_dict_url
+
 
 
 class ShapExplainer:
@@ -71,7 +74,8 @@ class ShapExplainer:
         )[:top_n]
 
         return [
-            {"feature": name, "contribution": float(value), "value": float(raw)}
+            {"feature": name, "contribution": float(value), "value": float(raw),
+             "dict_url": _feature_dict_url(name)}
             for name, value, raw in contributions
         ]
 
@@ -242,7 +246,8 @@ class ShapExplainer:
         )[:top_n]
 
         return [
-            {"feature": name, "contribution": float(value), "value": float(raw)}
+            {"feature": name, "contribution": float(value), "value": float(raw),
+             "dict_url": _feature_dict_url(name)}
             for name, value, raw in contributions
         ]
 
