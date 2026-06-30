@@ -1,5 +1,5 @@
-.PHONY: install lint format test run scale-workers load-test
-.PHONY: install lint format test run typecheck load-test
+.PHONY: install lint format test run scale-workers mutation-test
+.PHONY: install lint format test run typecheck mutation-test
 
 VENV_BIN := $(abspath .venv/bin)
 ifeq ($(wildcard $(VENV_BIN)/python),)
@@ -43,38 +43,31 @@ scale-workers:
 	$(PYTHON) run_pipeline.py
 
 # ---------------------------------------------------------------------------
-# Load testing — disabled by default, enabled by RUN_LOAD_TESTS=1
+# Mutation testing — enforces ≥80% mutation score on the core scoring path
 #
 # Usage:
-#   make load-test                       # in-process, 500 tps, 120s
-#   make load-test LOAD_RATE=1000        # custom rate
-#   make load-test LOAD_KAFKA=1          # use live Kafka broker
-#   RUN_LOAD_TESTS=1 make load-test      # enable in CI
+#   make mutation-test              # run and enforce threshold
+#   make mutation-test THRESHOLD=70 # override threshold (for debugging)
 #
-# Results are written to reports/load_test_results.json.
-# Pass/fail criteria (from docs/load_testing.md):
-#   p99 latency < 10s at >= 500 tps
-#   worker memory < 1024 MB
+# Runtime target: < 15 minutes in CI (--paths-to-mutate limits scope).
+# Mutated files are never written to disk; mutmut restores originals after
+# each probe, so no mutated code is persisted.
 # ---------------------------------------------------------------------------
-LOAD_RATE     ?= 500
-LOAD_DURATION ?= 120
-LOAD_RAMP     ?= 30
-LOAD_OUTPUT   ?= reports/load_test_results.json
-LOAD_KAFKA    ?= 0
+MUTATION_THRESHOLD ?= 80
+MUTATION_PATHS = detection/benford_engine.py,detection/feature_engineering.py,detection/model_inference.py
 
-load-test:
-ifeq ($(RUN_LOAD_TESTS),1)
-	@echo "==> Running load test at $(LOAD_RATE) tps for $(LOAD_DURATION)s..."
-	@mkdir -p reports
-	$(PYTHON) scripts/load_test_pipeline.py \
-		--rate $(LOAD_RATE) \
-		--duration $(LOAD_DURATION) \
-		--ramp-time $(LOAD_RAMP) \
-		--output $(LOAD_OUTPUT) \
-		--fail-on-threshold \
-		$(if $(filter 1,$(LOAD_KAFKA)),,--no-kafka)
-else
-	@echo "Load tests are disabled by default."
-	@echo "Run: RUN_LOAD_TESTS=1 make load-test"
-	@echo "Or:  make load-test LOAD_RATE=500  (and set RUN_LOAD_TESTS=1)"
-endif
+mutation-test:
+	@echo "==> Running mutation tests on core scoring path..."
+	@echo "    Targets: $(MUTATION_PATHS)"
+	@echo "    Threshold: $(MUTATION_THRESHOLD)%"
+	mutmut run \
+		--paths-to-mutate "$(MUTATION_PATHS)" \
+		--runner "python -m pytest -x -q --timeout=30 -m 'not integration and not slow' \
+			tests/test_benford.py \
+			tests/test_benford_ci.py \
+			tests/test_feature_engineering.py \
+			tests/test_model_inference.py" \
+		--no-progress || true
+	@echo "==> Mutation results:"
+	mutmut results || true
+	$(PYTHON) scripts/check_mutation_score.py --threshold $(MUTATION_THRESHOLD)

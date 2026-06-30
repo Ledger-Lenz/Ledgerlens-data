@@ -166,65 +166,61 @@ Each entry in `data/annotation_queue.json` carries an `annotation_hmac` field: H
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Model Inversion Attack Defence
+## Field-Level Encryption for Forensic Reports
 
-A model inversion attack allows an adversary to reconstruct features used in
-scoring by querying the model repeatedly and analyzing the gradients (or in
-discrete settings, the score deltas). In LedgerLens, an attacker could query
-the score for a wallet, remove one trade, re-query, and observe the delta to
-identify which individual trade was most anomalous. Repeated queries across
-variants reconstruct the full anomaly profile.
+Forensic reports (`detection/forensic_report.py`) contain raw Stellar wallet
+addresses that identify subjects under investigation.  To prevent premature
+exposure, wallet addresses should be encrypted at rest using AES-256-GCM
+field-level encryption provided by `utils/field_encryption.py`.
 
-### Output Perturbation (Laplace Mechanism)
+### Encryption Scheme
 
-`detection/model_inference.py::score()` applies **Laplace output perturbation**
-per external API call to defend against this attack. The mechanism:
+- **Algorithm**: AES-256-GCM (authenticated encryption with 128-bit tag).
+- **IV**: A fresh 12-byte random IV is generated per field per encryption call.
+  This guarantees that encrypting the same wallet address twice produces
+  different ciphertexts (IV-reuse attack prevention).
+- **Stored format**: `iv (12 bytes) || ciphertext || GCM tag (16 bytes)` as a
+  binary blob.
+- **Authentication**: Decryption raises `cryptography.exceptions.InvalidTag`
+  on any authentication failure.  Silent corruption is impossible.
 
-1. **Per-query random seed**: derived from `(caller_id, timestamp_bucket)` so
-   identical repeated queries produce different scores, preventing averaging.
-2. **Laplace noise**: drawn with scale `σ = sensitivity / ε`, where sensitivity
-   is the max score change from one trade (bounded at 100) and `ε` is the privacy
-   budget (default 1.0).
-3. **Clipping + rounding**: perturbed scores clipped to [0, 100] and rounded to
-   `SCORE_ROUNDING_GRANULARITY` (default 1 point).
+### Key Management
 
-**Internal pipeline calls** (e.g. `run_pipeline.py` → model training) use
-`caller_id="internal"` and are **not perturbed**, preserving model quality for
-batch operations.
+Set `FORENSIC_REPORT_ENCRYPTION_KEY` to a 64-character lowercase hex string
+representing 32 random bytes:
 
-### Query Rate-Limiting
-
-`detection/risk_score_store.py::RiskScoreStore` tracks queries per
-`(caller_id, wallet_id)` pair. Once a caller exceeds `MODEL_INVERSION_QUERY_LIMIT`
-queries (default 100) on a wallet, subsequent API requests for that wallet return
-**429 Too Many Requests**. This prevents sustained gradient-based attacks.
-
-| Config Variable | Default | Description |
-|---|---|---|
-| `MODEL_INVERSION_QUERY_LIMIT` | `100` | Max queries per (caller, wallet) before 429 |
-| `MODEL_INVERSION_DP_EPSILON` | `1.0` | Privacy budget ε for Laplace mechanism |
-| `SCORE_ROUNDING_GRANULARITY` | `1` | Quantize scores to this granularity |
-
-### Seeding Prevents Averaging
-
-The seed derivation `hash(caller_id + timestamp_bucket)` ensures:
-- **Different results for identical queries**: Attacker's repeated score queries
-  get different noisy values, so averaging them doesn't converge to the truth.
-- **Reproducibility within a time window**: For testing / audit, the same
-  `(caller_id, timestamp)` always produces the same noise.
-
-### Example: Attacker Scenario
-
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
-Attacker's intended attack:
-  Query 1: GET /score/G...wallet.../USDC:G.../XLM:native → score = 75
-  Remove last trade, re-query
-  Query 2: GET /score/G...wallet.../USDC:G.../XLM:native → score = 72
-  Delta = 3 points → identifies last trade as moderately anomalous
 
-With model inversion defence:
-  Query 1: score = 75 + Laplace(0, 100/ε) → 68 (noisy)
-  Query 2: score = 72 + Laplace(0, 100/ε) → 79 (different noise seed)
-  Delta = 11 points (includes noise) → cannot invert
-  After 100 queries: 429 Too Many Requests → rate limited
+- The key must be **exactly 32 bytes**; a shorter key raises a startup error.
+- If the variable is absent, a warning is emitted and plaintext is stored
+  (development only — never acceptable in production).
+- Store the key in a secrets manager (Vault, AWS Secrets Manager, etc.),
+  never in `.env` committed to version control.
+
+### Key Rotation
+
+To re-encrypt existing forensic reports when the key changes:
+
+1. Decrypt all stored blobs with the **old** key.
+2. Re-encrypt each field value with the **new** key.
+3. Atomically swap the updated blobs in the database.
+4. Revoke the old key.
+
+Run this as a migration script with the old key available as a temporary
+environment variable (e.g. `OLD_FORENSIC_KEY`), then set
+`FORENSIC_REPORT_ENCRYPTION_KEY` to the new key.
+
+### Export Authorisation
+
+Before generating a PDF that includes decrypted wallet addresses, call:
+
+```python
+from utils.field_encryption import check_export_permission
+
+check_export_permission(current_user.permissions)  # raises PermissionError if not authorised
 ```
+
+Only users with the `forensic_export` permission may trigger exports with
+decrypted addresses.

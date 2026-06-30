@@ -70,6 +70,9 @@ fastavro>=1.9.0
 # Cryptography (model artifact signing/verification)
 cryptography>=42.0.0
 
+# Active learning — approximate nearest-neighbour index (core-set selection, Issue #253)
+hnswlib>=0.8.0
+
 # Static type checking
 mypy>=1.10.0
 
@@ -84,8 +87,8 @@ pytest-timeout>=2.3.0
 hypothesis>=6.100.0
 factory-boy>=3.3.0
 
-# Load testing / memory sampling
-psutil>=5.9.0
+# Mutation testing
+mutmut==2.4.4
 
 # Forensic reporting
 jinja2>=3.1.0

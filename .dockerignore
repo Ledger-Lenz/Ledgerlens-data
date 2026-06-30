@@ -9,3 +9,4 @@ venv/
 *.db
 models/
 .claude/
+.mutmut-cache

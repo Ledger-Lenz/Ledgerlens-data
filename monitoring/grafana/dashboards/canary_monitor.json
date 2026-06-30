@@ -1,0 +1,181 @@
+{
+  "__inputs": [],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "description": "Canary vs Champion model score distribution monitoring (issue #240)",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "bucketSize": "auto",
+        "combine": false,
+        "fillOpacity": 80,
+        "gradientMode": "none",
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(ledgerlens_canary_score_delta_seconds_sum[5m]) / rate(ledgerlens_canary_score_delta_seconds_count[5m])",
+          "legendFormat": "Mean absolute score delta (5m)",
+          "refId": "A"
+        }
+      ],
+      "title": "Score Difference Distribution (Canary vs Champion)",
+      "type": "histogram"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.1 },
+              { "color": "red", "value": 0.25 }
+            ]
+          },
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "ledgerlens_canary_score_delta_seconds_count > 0",
+          "legendFormat": "Pairs logged",
+          "refId": "A"
+        }
+      ],
+      "title": "Score Pairs Logged",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 10 },
+              { "color": "red", "value": 15 }
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, rate(ledgerlens_canary_score_delta_seconds_bucket[10m]))",
+          "legendFormat": "p95 delta",
+          "refId": "A"
+        }
+      ],
+      "title": "p95 Score Delta (promotion fails if > 15)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "id": 4,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, rate(ledgerlens_canary_score_delta_seconds_bucket[5m]))",
+          "legendFormat": "p50 delta",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.95, rate(ledgerlens_canary_score_delta_seconds_bucket[5m]))",
+          "legendFormat": "p95 delta",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, rate(ledgerlens_canary_score_delta_seconds_bucket[5m]))",
+          "legendFormat": "p99 delta",
+          "refId": "C"
+        }
+      ],
+      "title": "Score Delta Quantiles Over Time",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["ledgerlens", "canary", "model-deployment"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "LedgerLens Canary Model Monitor",
+  "uid": "ledgerlens-canary-monitor",
+  "version": 1
+}
