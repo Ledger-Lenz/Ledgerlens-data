@@ -9,6 +9,17 @@ Reconnection on Horizon SSE failures is handled at two levels:
   2. _stream_pair() restarts the generator if stream_trades() raises after
      exhausting its own retries.
 
+Circuit breakers
+----------------
+Pass ``circuit_breakers`` to wrap the model-inference call with independent
+per-component ``CircuitBreaker`` instances.  Supported keys:
+  - ``"inference"``  — wraps ``scorer.score_wallet()``
+  - ``"db_write"``   — wraps ``dispatcher.dispatch()``
+  - ``"benford"``    — wraps any explicit Benford computation (future extension)
+
+When a circuit is OPEN the pipeline falls back to the last cached score for
+the wallet-pair so alert delivery can continue uninterrupted.
+
 Shutdown
 --------
 Call pipeline.run() from the main thread.  SIGINT (Ctrl-C) sets the internal
@@ -58,6 +69,9 @@ class StreamingPipeline:
         self._role = role
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
+        self._circuit_breakers: dict[str, CircuitBreaker] = circuit_breakers or {}
+        # Wallet → last successfully computed score (used as fallback when OPEN)
+        self._score_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -237,7 +251,7 @@ class StreamingPipeline:
                     for wallet in (trade.base_account, trade.counter_account):
                         score = self._scorer.score_wallet(wallet, self._buffer)
                         if score is not None:
-                            self._dispatcher.dispatch(wallet, score, pair_id)
+                            self._dispatch_with_cb(wallet, score, pair_id)
             except Exception as exc:
                 if self._stop_event.is_set():
                     return

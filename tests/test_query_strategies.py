@@ -225,6 +225,7 @@ def test_strategy_registry_has_all_six():
         "coreset",
         "badge",
         "committee_disagreement",
+        "coreset_hybrid",
     }
     assert expected == set(STRATEGY_REGISTRY.keys())
 

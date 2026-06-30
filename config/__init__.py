@@ -1,21 +1,17 @@
 """Configuration module.
 
-This package re-exports the ``config`` singleton from the top-level
-``config.py`` file so that ``from config import config`` works regardless
-of whether Python resolves ``config`` as this package or the ``.py`` file.
+Re-exports ``Config`` and ``config`` from the project-root ``config.py`` so
+that ``from config import config`` and ``from config import Config`` continue
+to work even though a ``config/`` sub-package also exists at the project root.
 """
+
 import importlib.util
-import os
-import sys
+import os as _os
 
-# Load config.py from the project root explicitly, bypassing the package shadow.
-_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_spec = importlib.util.spec_from_file_location("_config_module", os.path.join(_root, "config.py"))
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
+_root_config_path = _os.path.join(_os.path.dirname(__file__), "..", "config.py")
+_spec = importlib.util.spec_from_file_location("_config_root", _root_config_path)
+_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+_spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 
-# Re-export the public names so `from config import config` works.
-config = _mod.config
 Config = _mod.Config
-
-__all__ = ["config", "Config"]
+config = _mod.config

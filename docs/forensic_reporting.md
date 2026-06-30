@@ -344,120 +344,69 @@ Security note: `top_interactions` is an internal forensic report field. It is
 
 ---
 
-## Counterfactual Explanations (Issue #193)
+## Interactive HTML Report Format
 
-### What Are Counterfactuals?
+`detection/forensic_report_interactive.py` generates a self-contained HTML
+forensic report alongside the existing JSON/PDF formats.
 
-SHAP tells an investigator *what features drove the score*. Counterfactuals
-answer a different question:
+### Dependencies
 
-> **"What is the minimal change to this wallet's observable behaviour that
-> would reduce the risk score below the flag threshold (70)?"**
+```
+plotly>=5.0        # interactive SHAP waterfall chart
+pyvis>=0.3         # wallet graph visualisation (optional — graceful degradation)
+```
 
-For example: "Reduce counterparty concentration from 0.87 to 0.45 — trade
-with at least 3 distinct counterparties in the next 24 hours."
+### Generating an HTML report
 
-### Generating Counterfactuals
+```bash
+python -m scripts.generate_reports --input wallets.csv --output-format html \
+    --output-dir reports/forensic
+```
 
-Use `CounterfactualExplainer` from `detection/counterfactual_explainer.py`:
+Or from Python:
 
 ```python
-from detection.counterfactual_explainer import CounterfactualExplainer
-from detection.model_inference import RiskScorer
-import pandas as pd
+from detection.forensic_report_interactive import generate_interactive_report
 
-scorer = RiskScorer()
-X_train = pd.read_parquet("data/synthetic_dataset.parquet").drop(columns=["label", "wallet"])
-
-explainer = CounterfactualExplainer(
-    scorer,
-    X_train,
-    flag_threshold=70.0,   # score threshold to drop below
-    n_cfs=5,               # max diverse counterfactuals
-    timeout_seconds=10.0,  # hard time limit per wallet
-)
-
-feature_row = ...  # pd.Series of feature values for the wallet
-result = explainer.explain(feature_row, wallet="GABC...")
-
-for cf in result.counterfactuals:
-    print(f"CF {cf.cf_index}: predicted score {cf.predicted_score:.1f}")
-    for action in cf.actions:
-        print(f"  {action.interpretation}")
+generate_interactive_report(report.to_dict(), "reports/forensic/my_report.html")
 ```
 
-### Counterfactual Result Schema
+### Self-contained requirement
 
-```json
-{
-  "wallet": "GABC...",
-  "original_score": 87.0,
-  "flag_threshold": 70.0,
-  "n_requested": 5,
-  "n_found": 3,
-  "generation_time_seconds": 2.4,
-  "timed_out": false,
-  "counterfactuals": [
-    {
-      "cf_index": 0,
-      "predicted_score": 62.1,
-      "actions": [
-        {
-          "feature": "counterparty_concentration_ratio",
-          "original_value": 0.87,
-          "counterfactual_value": 0.45,
-          "delta": -0.42,
-          "interpretation": "Reduce counterparty concentration from 0.87 to 0.45 — trade with at least 2 distinct counterparties in the next 24 h."
-        }
-      ]
-    }
-  ]
-}
-```
+The HTML file embeds all JavaScript (Plotly, vis-network) inline; no external
+CDN requests are made.  Reports can be opened in an air-gapped environment.
+File size is < 5 MB for a standard report (≤ 100 trades, ≤ 50 graph nodes).
 
-### Feature Constraints
+### Interactive features
 
-The counterfactual generator enforces the following constraints:
-
-| Constraint | Features affected |
+| Feature | Interaction |
 |---|---|
-| **Immutable** (never modified) | `account_age_days`, `network_centrality`, `in_wash_trading_ring`, `ring_size`, `ring_internal_density` |
-| **Non-negative** (lower bound 0) | All Benford metrics, rate features, clustering features |
-| **Bounded** (training percentiles) | All mutable features: [1st, 99th] percentile of training distribution |
+| SHAP waterfall chart | Hover for exact contribution values; click a bar to expand contributing trades in the drill-down panel below. |
+| Wallet graph | Zoom / pan / drag nodes; click a node to see its risk score and feature breakdown. |
+| Wallet address reveal | Double-click the wallet hash cell; enter your operator key to reveal the decrypted address (AES-GCM in production). |
 
-### Limitations
+### Provenance drill-down
 
-Counterfactuals describe **achievable scores**, not necessarily achievable
-on-chain behaviour:
+Each SHAP feature bar is linked to the trades that contributed to that feature
+value.  Clicking a bar populates the "Provenance Drill-Down" section with a
+table of relevant trades, each showing its Ledger number, hashed counterparty
+addresses, amounts, and asset pair.
 
-- A counterfactual may suggest reducing `benford_mad_24h` from 0.025 to 0.005.
-  This is mathematically achievable, but may require the wallet to fundamentally
-  change its trading strategy over many days.
-- Counterfactuals are computed relative to the current model. If the model is
-  retrained, counterfactuals may change even if the wallet's behaviour does not.
-- Immutable features (account age) cannot decrease. If a wallet's high score is
-  primarily driven by a young account age, counterfactuals may not be able to
-  reduce the score below the threshold.
-- Counterfactuals are generated independently and do not guarantee simultaneous
-  achievability (e.g. CF 1 may contradict CF 2).
+### Security
 
-### Integration with Forensic Reports
+Raw wallet addresses are **not** present in the HTML source.  Each address is
+replaced with a JavaScript-decoded, operator-key-encrypted field.  The operator
+must enter the key at view time via a browser prompt.  The decryption key is
+never transmitted to any server.
 
-Counterfactuals are included in the forensic report Markdown template when
-`ForensicReport.counterfactual_result` is set. They appear in a dedicated
-"Counterfactual Explanations" section listing each CF's predicted score and
-the required on-chain actions.
+### File size budget
 
-To generate a report with counterfactuals:
+| Component | Approximate size |
+|---|---|
+| Plotly JS bundle (minified) | ≤ 3.5 MB |
+| vis-network (via pyvis) | ≤ 0.8 MB |
+| Report data (100 trades, 50 nodes) | ≤ 0.2 MB |
+| **Total** | **≤ 4.5 MB** |
 
-```python
-from detection.forensic_report import ForensicReport
-from detection.counterfactual_explainer import CounterfactualExplainer
-
-cf_result = explainer.explain(feature_row, wallet=wallet)
-report = ForensicReport(
-    ...,
-    counterfactual_result=cf_result,
-)
-print(report.to_markdown())
-```
+If plotly is not installed, a plain HTML table fallback is rendered instead
+(< 0.1 MB).

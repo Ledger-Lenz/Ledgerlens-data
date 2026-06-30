@@ -225,6 +225,14 @@ class Config:
     AL_ROLLBACK_AUC_DROP: float = float(os.getenv("AL_ROLLBACK_AUC_DROP", "0.01"))
     AL_QUEUE_PATH: str = os.getenv("AL_QUEUE_PATH", "data/annotation_queue.json")
 
+    # Core-set selection (Issue #253)
+    ACTIVE_LEARNING_ALPHA: float = float(os.getenv("ACTIVE_LEARNING_ALPHA", "0.5"))
+    CORESET_MIN_DISTANCE: float = float(os.getenv("CORESET_MIN_DISTANCE", "0.1"))
+
+    # Active learning stopping criterion (Issue #256)
+    ACTIVE_LEARNING_EER_THRESHOLD: float = float(os.getenv("ACTIVE_LEARNING_EER_THRESHOLD", "0.001"))
+    ACTIVE_LEARNING_CONVERGENCE_WINDOW: int = int(os.getenv("ACTIVE_LEARNING_CONVERGENCE_WINDOW", "5"))
+
     # Wash Trade Simulation Engine
     GAN_ROUNDS: int = int(os.getenv("GAN_ROUNDS", "5"))
     GAN_PLATEAU_THRESHOLD: float = float(os.getenv("GAN_PLATEAU_THRESHOLD", "0.005"))
@@ -249,9 +257,60 @@ class Config:
     FEDERATED_ASYNC_TRIGGER_SECONDS: int = int(os.getenv("FEDERATED_ASYNC_TRIGGER_SECONDS", "300"))
     FEDERATED_MAX_STALENESS: int = int(os.getenv("FEDERATED_MAX_STALENESS", "5"))
 
+    # Feature cache (detection/feature_cache.py) — in-memory TTL+LRU cache for
+    # per-wallet feature matrices used by the streaming scorer.
+    FEATURE_CACHE_TTL_SECONDS: int = int(os.getenv("FEATURE_CACHE_TTL_SECONDS", "30"))
+    FEATURE_CACHE_MAXSIZE: int = int(os.getenv("FEATURE_CACHE_MAXSIZE", "1000"))
+
     # Label quality estimation (#271)
     LABEL_QUALITY_NOISE_THRESHOLD: float = float(os.getenv("LABEL_QUALITY_NOISE_THRESHOLD", "0.1"))
     ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD: float = float(os.getenv("ANNOTATOR_NOISE_RATE_ALERT_THRESHOLD", "0.2"))
+
+    # ---------------------------------------------------------------------------
+    # Transformer sequence model (#182)
+    # ---------------------------------------------------------------------------
+    # Number of distinct asset-pair slots in the one-hot pair encoding.
+    # Increase this if the deployment monitors more than the default 32 pairs.
+    SEQ_MODEL_NUM_PAIRS: int = int(os.getenv("SEQ_MODEL_NUM_PAIRS", "32"))
+    # Dimension of the token embeddings and sequence-level output embedding.
+    SEQ_MODEL_EMBED_DIM: int = int(os.getenv("SEQ_MODEL_EMBED_DIM", "64"))
+    # Number of self-attention heads.  Must divide SEQ_MODEL_EMBED_DIM evenly.
+    SEQ_MODEL_NUM_HEADS: int = int(os.getenv("SEQ_MODEL_NUM_HEADS", "4"))
+    # Number of transformer encoder layers (2–4 is the sweet spot for latency).
+    SEQ_MODEL_NUM_LAYERS: int = int(os.getenv("SEQ_MODEL_NUM_LAYERS", "2"))
+    # Feed-forward expansion dimension inside each transformer layer.
+    SEQ_MODEL_FFN_DIM: int = int(os.getenv("SEQ_MODEL_FFN_DIM", "128"))
+    # Dropout probability applied during training (disabled at eval time).
+    SEQ_MODEL_DROPOUT: float = float(os.getenv("SEQ_MODEL_DROPOUT", "0.1"))
+    # Maximum allowed input sequence length.  Inputs longer than this are
+    # rejected before reaching the model to prevent memory exhaustion.
+    SEQ_MODEL_MAX_LENGTH: int = int(os.getenv("SEQ_MODEL_MAX_LENGTH", "512"))
+    # Whether to attempt loading the sequence model at inference time.
+    # Set to "false" to skip loading (e.g., before the first training run).
+    SEQ_MODEL_ENABLED: bool = os.getenv("SEQ_MODEL_ENABLED", "true").lower() in ("1", "true", "yes")
+
+    # ---------------------------------------------------------------------------
+    # Redis feature store (#183)
+    # ---------------------------------------------------------------------------
+    # Redis URL for the feature store.  Overrides the rate-limiter REDIS_URL when set.
+    # Format: redis://[:password@]host[:port][/db] or
+    #         rediss://[:password@]host[:port][/db]  (TLS)
+    FEATURE_STORE_REDIS_URL: str = os.getenv("FEATURE_STORE_REDIS_URL", os.getenv("REDIS_URL", "redis://localhost:6379/1"))
+    # Enable TLS for the feature store Redis connection.
+    # When FEATURE_STORE_REDIS_URL starts with rediss:// this is implied.
+    FEATURE_STORE_REDIS_TLS: bool = os.getenv("FEATURE_STORE_REDIS_TLS", "false").lower() in ("1", "true", "yes")
+    # Redis CA certificate path for TLS verification (optional).
+    FEATURE_STORE_REDIS_TLS_CA_CERT: str = os.getenv("FEATURE_STORE_REDIS_TLS_CA_CERT", "")
+    # Redis connection pool: maximum number of pooled connections.
+    FEATURE_STORE_REDIS_POOL_SIZE: int = int(os.getenv("FEATURE_STORE_REDIS_POOL_SIZE", "10"))
+    # Per-window TTLs (seconds) for cached feature vectors.
+    # Format: comma-separated "hours:seconds" pairs, e.g. "1:3600,4:14400,24:86400"
+    # When empty, a fixed 300-second TTL is used for all windows.
+    FEATURE_STORE_WINDOW_TTLS: str = os.getenv(
+        "FEATURE_STORE_WINDOW_TTLS", "1:3600,4:14400,24:86400,168:604800,720:2592000"
+    )
+    # Fallback to direct feature computation when Redis is unavailable.
+    FEATURE_STORE_FALLBACK_ENABLED: bool = os.getenv("FEATURE_STORE_FALLBACK_ENABLED", "true").lower() in ("1", "true", "yes")
 
     @classmethod
     def validate(cls, require_onchain: bool = False):

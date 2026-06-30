@@ -202,6 +202,139 @@ class LedgerLensContractClient:
         tx = self._client.invoke("get_score", params, simulate=True)
         return cast(dict[Any, Any], scval.to_native(tx.result()))
 
+    # ------------------------------------------------------------------
+    # Multi-sig governance (issue #238)
+    # ------------------------------------------------------------------
+
+    def propose_threshold_change(
+        self,
+        governance_contract_id: str,
+        new_threshold: int,
+        proposer_secret: str,
+    ) -> int:
+        """Submit a proposal to change RISK_SCORE_FLAG_THRESHOLD on-chain.
+
+        ``proposer_secret`` must correspond to one of the registered
+        governance keyholders.  The key is used only to sign the transaction
+        and is never stored by this client.
+
+        Returns the on-chain proposal_id (u64).
+        """
+        signer = Keypair.from_secret(proposer_secret)
+        governance_client = ContractClient(
+            contract_id=governance_contract_id,
+            rpc_url=self.rpc_url,
+            network_passphrase=self.network_passphrase,
+        )
+        params = [
+            scval.to_address(signer.public_key),
+            scval.to_uint32(int(new_threshold)),
+        ]
+        tx = governance_client.invoke(
+            "propose_threshold_change",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        result = tx.sign_and_submit()
+        return int(scval.to_native(result))
+
+    def approve_threshold_change(
+        self,
+        governance_contract_id: str,
+        proposal_id: int,
+        approver_secret: str,
+    ) -> bool:
+        """Cast an approval for an open threshold-change proposal.
+
+        Returns True if the approval triggered quorum and the threshold
+        was updated on-chain.
+        """
+        signer = Keypair.from_secret(approver_secret)
+        governance_client = ContractClient(
+            contract_id=governance_contract_id,
+            rpc_url=self.rpc_url,
+            network_passphrase=self.network_passphrase,
+        )
+        params = [
+            scval.to_address(signer.public_key),
+            scval.to_uint64(int(proposal_id)),
+        ]
+        tx = governance_client.invoke(
+            "approve_threshold_change",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        result = tx.sign_and_submit()
+        return bool(scval.to_native(result))
+
+    # ------------------------------------------------------------------
+    # Emergency pause (issue #241)
+    # ------------------------------------------------------------------
+
+    def initiate_emergency_pause(
+        self,
+        pause_contract_id: str,
+        reason: str,
+        signing_key: str,
+    ) -> int:
+        """Propose an emergency pause of the scoring oracle.
+
+        ``signing_key`` must be one of the 3 registered emergency keyholder
+        secrets.  It signs the Stellar transaction locally; it is never
+        transmitted or stored beyond the scope of this call.
+
+        Returns the on-chain pause proposal_id.
+        """
+        signer = Keypair.from_secret(signing_key)
+        pause_client = ContractClient(
+            contract_id=pause_contract_id,
+            rpc_url=self.rpc_url,
+            network_passphrase=self.network_passphrase,
+        )
+        params = [
+            scval.to_address(signer.public_key),
+            scval.to_string(reason),
+        ]
+        tx = pause_client.invoke(
+            "initiate_pause",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        result = tx.sign_and_submit()
+        return int(scval.to_native(result))
+
+    def approve_emergency_pause(
+        self,
+        pause_contract_id: str,
+        proposal_id: int,
+        signing_key: str,
+    ) -> bool:
+        """Cast the second approval to activate an emergency pause.
+
+        Returns True if quorum was reached and the contract is now paused.
+        """
+        signer = Keypair.from_secret(signing_key)
+        pause_client = ContractClient(
+            contract_id=pause_contract_id,
+            rpc_url=self.rpc_url,
+            network_passphrase=self.network_passphrase,
+        )
+        params = [
+            scval.to_address(signer.public_key),
+            scval.to_uint64(int(proposal_id)),
+        ]
+        tx = pause_client.invoke(
+            "approve_pause",
+            params,
+            source=signer.public_key,
+            signer=signer,
+        )
+        result = tx.sign_and_submit()
+        return bool(scval.to_native(result))
+
     def anchor_report(self, report: AnchorableReport) -> str:
         """Submit a forensic report's SHA-256 fingerprint to Soroban.
 
