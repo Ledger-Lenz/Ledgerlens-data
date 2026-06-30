@@ -9,6 +9,28 @@ Reconnection on Horizon SSE failures is handled at two levels:
   2. _stream_pair() restarts the generator if stream_trades() raises after
      exhausting its own retries.
 
+Streaming metadata join
+-----------------------
+``MetadataJoinState`` holds the latest ``AccountMetadataUpdate`` per wallet
+inside a configurable join window (``METADATA_JOIN_WINDOW_SECONDS``, default
+3600 s).  When a trade arrives, the involved wallets' metadata is fetched from
+join state and passed to the feature buffer so wallet-graph features reflect the
+current on-chain account state.
+
+When a metadata update arrives *after* the join window has closed for a wallet,
+the update is queued in ``_pending_updates``.  On the next scoring cycle for that
+wallet the pending update is promoted to active join state.
+
+Join state is bounded: wallets whose last trade was more than
+``METADATA_ACTIVE_WALLET_TTL_SECONDS`` ago (default 86 400 s / 24 h) are evicted
+from join state during a periodic housekeeping pass that runs every 5 minutes.
+This caps memory at O(active_wallets) regardless of how many distinct wallets the
+pipeline has ever seen.
+
+Join lag — the time between a metadata update arriving and the affected wallet's
+features being re-computed — is tracked as a Prometheus histogram
+(``metadata_join_lag_seconds``).
+
 Shutdown
 --------
 Call pipeline.run() from the main thread.  SIGINT (Ctrl-C) sets the internal
@@ -16,10 +38,14 @@ stop event via a signal handler; the main loop wakes up, joins all worker
 threads with a 5-second timeout, and returns.
 """
 
+from __future__ import annotations
+
 import signal
 import threading
 import time
+from typing import TYPE_CHECKING
 
+from prometheus_client import Histogram
 from stellar_sdk import Asset as SdkAsset
 
 from config import config
@@ -30,11 +56,261 @@ from streaming.feature_buffer import FeatureBuffer
 from streaming.streaming_scorer import StreamingScorer
 from utils.logging import get_logger
 
+if TYPE_CHECKING:
+    from streaming.account_metadata_stream import AccountMetadataUpdate
+
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Prometheus metric — join lag histogram
+# ---------------------------------------------------------------------------
+
+#: Time (seconds) from a metadata update arriving in ``MetadataJoinState``
+#: to the next scoring cycle in which the updated metadata is actually used.
+#: Measures the end-to-end freshness of the join.
+METADATA_JOIN_LAG = Histogram(
+    "metadata_join_lag_seconds",
+    "Seconds between an account metadata update arriving and the affected "
+    "wallet's features being re-scored with the new metadata",
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600),
+)
+
+
+# ---------------------------------------------------------------------------
+# Stateful join state
+# ---------------------------------------------------------------------------
+
+
+class MetadataJoinState:
+    """Thread-safe store of the latest account metadata per wallet.
+
+    Join window semantics
+    ~~~~~~~~~~~~~~~~~~~~~
+    An ``AccountMetadataUpdate`` enriches trade events for
+    ``METADATA_JOIN_WINDOW_SECONDS`` after it arrives.  Once that window
+    expires the entry is treated as *stale* and removed from active state.
+
+    Late-arrival handling
+    ~~~~~~~~~~~~~~~~~~~~~
+    If a metadata update arrives for a wallet that has no active join entry
+    (either the wallet has never been seen, or its previous entry expired),
+    the update is stored in ``_pending_updates``.  On the next call to
+    ``get_metadata`` for that wallet the pending update is promoted to active
+    state so it enriches the next scoring cycle.
+
+    Memory bounding
+    ~~~~~~~~~~~~~~~
+    ``evict_inactive_wallets()`` should be called periodically (e.g., every
+    5 minutes).  It removes join state for wallets whose last trade timestamp
+    is older than ``METADATA_ACTIVE_WALLET_TTL_SECONDS``.  This prevents
+    unbounded memory growth for wallets that stopped trading.
+    """
+
+    def __init__(
+        self,
+        join_window_seconds: int | None = None,
+        active_wallet_ttl_seconds: int | None = None,
+    ) -> None:
+        self._join_window = (
+            join_window_seconds
+            if join_window_seconds is not None
+            else config.METADATA_JOIN_WINDOW_SECONDS
+        )
+        self._active_wallet_ttl = (
+            active_wallet_ttl_seconds
+            if active_wallet_ttl_seconds is not None
+            else config.METADATA_ACTIVE_WALLET_TTL_SECONDS
+        )
+        self._lock = threading.RLock()
+        # wallet_id → (AccountMetadataUpdate, arrival_time: float)
+        self._active: dict[str, tuple[AccountMetadataUpdate, float]] = {}
+        # wallet_id → (AccountMetadataUpdate, arrival_time: float)
+        # Holds updates that arrived after the join window; promoted on next
+        # get_metadata() call for the wallet.
+        self._pending_updates: dict[str, tuple[AccountMetadataUpdate, float]] = {}
+        # wallet_id → last trade timestamp (monotonic clock, seconds).
+        self._last_trade_at: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Apply incoming metadata update
+    # ------------------------------------------------------------------
+
+    def apply_update(self, update: AccountMetadataUpdate) -> None:
+        """Store *update* in active or pending state.
+
+        If the wallet has an active join entry that is still within the
+        join window, the entry is *replaced* with the newer update.
+
+        If the wallet has no active entry (first time seen, or previous
+        entry expired), the update goes into ``_pending_updates`` so it
+        does not discard in-flight join work for other wallets sharing state.
+        """
+        wallet = update.account_id
+        arrival = time.monotonic()
+
+        with self._lock:
+            existing = self._active.get(wallet)
+            if existing is not None:
+                # Replace active entry with the newer update regardless of
+                # whether the window has expired — this ensures the latest
+                # metadata is always reflected.
+                self._active[wallet] = (update, arrival)
+                logger.debug(
+                    "Metadata join: updated active entry for wallet %s (effect=%s)",
+                    wallet,
+                    update.effect_type,
+                )
+            else:
+                # No active entry — queue as pending; will be promoted on
+                # next get_metadata() call for this wallet.
+                self._pending_updates[wallet] = (update, arrival)
+                logger.debug(
+                    "Metadata join: queued pending update for wallet %s (effect=%s)",
+                    wallet,
+                    update.effect_type,
+                )
+
+    # ------------------------------------------------------------------
+    # Retrieve metadata for a wallet (called on every trade event)
+    # ------------------------------------------------------------------
+
+    def get_metadata(self, wallet: str) -> AccountMetadataUpdate | None:
+        """Return the latest metadata for *wallet*, or ``None`` if unavailable.
+
+        Side effects
+        ------------
+        * Records a trade event for *wallet* (updates ``_last_trade_at``).
+        * Promotes any pending update to active state.
+        * Evicts the active entry if its join window has expired.
+        * Observes join lag on the Prometheus histogram when a pending or
+          newly-promoted entry is used for the first time.
+        """
+        now_mono = time.monotonic()
+
+        with self._lock:
+            self._last_trade_at[wallet] = now_mono
+
+            # 1. Promote pending update if present.
+            if wallet in self._pending_updates:
+                pending, pending_arrival = self._pending_updates.pop(wallet)
+                self._active[wallet] = (pending, pending_arrival)
+                lag = now_mono - pending_arrival
+                METADATA_JOIN_LAG.observe(lag)
+                logger.debug(
+                    "Metadata join: promoted pending update for wallet %s "
+                    "(lag=%.2fs, effect=%s)",
+                    wallet,
+                    lag,
+                    pending.effect_type,
+                )
+
+            # 2. Check whether the active entry is still within its window.
+            entry = self._active.get(wallet)
+            if entry is None:
+                return None
+
+            active_update, arrival = entry
+            age = now_mono - arrival
+            if age > self._join_window:
+                # Window expired — evict and return None.  The next metadata
+                # update for this wallet will be admitted via _pending_updates.
+                del self._active[wallet]
+                logger.debug(
+                    "Metadata join: join window expired for wallet %s (age=%.0fs > window=%ds)",
+                    wallet,
+                    age,
+                    self._join_window,
+                )
+                return None
+
+            return active_update
+
+    # ------------------------------------------------------------------
+    # Re-score trigger: wallets with fresh metadata updates
+    # ------------------------------------------------------------------
+
+    def wallets_needing_rescore(self) -> list[str]:
+        """Return wallets whose metadata changed since the last scoring cycle.
+
+        A wallet is returned when its active metadata was updated (arrival
+        time updated) within the last ``_join_window`` seconds and the
+        wallet has had at least one trade event.
+
+        The caller is responsible for re-computing features and scoring the
+        returned wallets.
+        """
+        now_mono = time.monotonic()
+        result = []
+        with self._lock:
+            for wallet, (_, arrival) in list(self._active.items()):
+                if wallet in self._last_trade_at and (now_mono - arrival) <= self._join_window:
+                    result.append(wallet)
+        return result
+
+    # ------------------------------------------------------------------
+    # Housekeeping: evict stale wallet state
+    # ------------------------------------------------------------------
+
+    def evict_inactive_wallets(self) -> int:
+        """Remove join state for wallets inactive for > active_wallet_ttl seconds.
+
+        Returns the number of wallets evicted.  Intended to be called
+        periodically (e.g., every 5 minutes) from a housekeeping thread.
+        """
+        now_mono = time.monotonic()
+        evicted = 0
+        with self._lock:
+            inactive = [
+                w
+                for w, last in self._last_trade_at.items()
+                if now_mono - last > self._active_wallet_ttl
+            ]
+            for wallet in inactive:
+                self._active.pop(wallet, None)
+                self._pending_updates.pop(wallet, None)
+                del self._last_trade_at[wallet]
+                evicted += 1
+        if evicted:
+            logger.info(
+                "Metadata join: evicted %d inactive wallet(s) from join state", evicted
+            )
+        return evicted
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def active_wallet_count(self) -> int:
+        with self._lock:
+            return len(self._active)
+
+    def pending_update_count(self) -> int:
+        with self._lock:
+            return len(self._pending_updates)
 
 
 class StreamingPipeline:
-    """Orchestrates one SSE thread per pair and wires the scoring pipeline."""
+    """Orchestrates one SSE thread per pair and wires the scoring pipeline.
+
+    Metadata join
+    ~~~~~~~~~~~~~
+    When *metadata_join_state* is provided, each trade event triggers a lookup
+    of the involved wallets' latest ``AccountMetadataUpdate`` from join state.
+    The update is passed to ``FeatureBuffer.apply_metadata`` so wallet-graph
+    features reflect the current on-chain account state rather than the static
+    snapshot loaded at pipeline startup.
+
+    A background housekeeping thread runs every
+    ``_HOUSEKEEPING_INTERVAL_SECONDS`` (300 s) to evict stale join state for
+    wallets that have been inactive for more than
+    ``METADATA_ACTIVE_WALLET_TTL_SECONDS``.
+
+    When *metadata_stream* is provided, the pipeline will also watch every
+    wallet that appears in trade events, dynamically subscribing to their
+    Horizon effects feed via ``AccountMetadataStream.add_wallet()``.
+    """
+
+    _HOUSEKEEPING_INTERVAL_SECONDS = 300
 
     def __init__(
         self,
@@ -44,6 +320,8 @@ class StreamingPipeline:
         pairs: list[tuple[str, str]] | None = None,
         amm_pools: list[str] | None = None,
         role: str = "all",
+        metadata_join_state: MetadataJoinState | None = None,
+        metadata_stream=None,  # AccountMetadataStream | None
     ):
         if role not in ("all", "producer", "worker"):
             raise ValueError(f"Unknown role: {role!r}")
@@ -55,9 +333,13 @@ class StreamingPipeline:
         self._amm_pools = (
             list(amm_pools) if amm_pools is not None else list(config.WATCHED_AMM_POOLS)
         )
-        self._role = role
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
+        self._metadata_join_state: MetadataJoinState | None = metadata_join_state
+        self._metadata_stream = metadata_stream
+        # Track wallets we have already subscribed to effects for.
+        self._subscribed_wallets: set[str] = set()
+        self._subscribed_wallets_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,6 +391,16 @@ class StreamingPipeline:
             )
             t.start()
             self._worker_threads.append(t)
+
+        # Start the metadata join housekeeping thread (evicts stale wallets).
+        if self._metadata_join_state is not None:
+            hk = threading.Thread(
+                target=self._run_housekeeping,
+                name="metadata-housekeeping",
+                daemon=True,
+            )
+            hk.start()
+            self._worker_threads.append(hk)
 
         logger.info(
             "Streaming pipeline running with %d SDEX pair(s) and %d AMM pool(s)",
@@ -221,6 +513,71 @@ class StreamingPipeline:
             pairs.append((asset, xlm))
         return pairs
 
+    def _subscribe_wallet(self, wallet: str) -> None:
+        """Subscribe *wallet* to Horizon effects via ``AccountMetadataStream``.
+
+        No-ops when the metadata stream is not configured or the wallet is
+        already subscribed.  Safe to call from any thread.
+        """
+        if self._metadata_stream is None:
+            return
+        with self._subscribed_wallets_lock:
+            if wallet in self._subscribed_wallets:
+                return
+            self._subscribed_wallets.add(wallet)
+        self._metadata_stream.add_wallet(wallet)
+
+    def _enrich_from_metadata(self, wallet: str) -> None:
+        """Look up latest metadata for *wallet* and apply it to the feature buffer.
+
+        Called on every trade event involving *wallet*.  When join state has
+        a valid, in-window metadata entry the buffer's ``apply_metadata``
+        method (if it exists) is called so wallet-graph features reflect the
+        current on-chain account state.
+
+        Also ensures the wallet is subscribed to Horizon effects so future
+        updates are received promptly.
+        """
+        self._subscribe_wallet(wallet)
+        if self._metadata_join_state is None:
+            return
+        metadata = self._metadata_join_state.get_metadata(wallet)
+        if metadata is not None and hasattr(self._buffer, "apply_metadata"):
+            try:
+                self._buffer.apply_metadata(wallet, metadata)
+            except Exception as exc:
+                logger.warning(
+                    "apply_metadata failed for wallet %s: %s", wallet, exc
+                )
+
+    def _trigger_rescore_from_metadata(self, pair_id: str) -> None:
+        """Re-score wallets whose metadata changed since the last trade event.
+
+        This is called periodically (or after each metadata update) to ensure
+        wallets whose account state changed mid-window are re-scored promptly
+        even if no new trade has arrived for them.
+        """
+        if self._metadata_join_state is None or self._scorer is None:
+            return
+        for wallet in self._metadata_join_state.wallets_needing_rescore():
+            start = time.perf_counter()
+            score = self._scorer.score_wallet(wallet, self._buffer)
+            lag = time.perf_counter() - start
+            METADATA_JOIN_LAG.observe(lag)
+            if score is not None:
+                self._dispatcher.dispatch(wallet, score, pair_id)
+
+    def _run_housekeeping(self) -> None:
+        """Background thread: evict stale join state every housekeeping interval."""
+        while not self._stop_event.is_set():
+            # Sleep in short increments so the thread exits promptly on stop.
+            for _ in range(self._HOUSEKEEPING_INTERVAL_SECONDS * 10):
+                if self._stop_event.is_set():
+                    return
+                time.sleep(0.1)
+            if self._metadata_join_state is not None:
+                self._metadata_join_state.evict_inactive_wallets()
+
     def _stream_pair(self, base_asset: SdkAsset, counter_asset: SdkAsset) -> None:
         pair_label = (
             f"{base_asset.code}:{getattr(base_asset, 'issuer', None) or 'native'}"
@@ -235,6 +592,8 @@ class StreamingPipeline:
                     pair_id = trade.base_asset.pair_id(trade.counter_asset)
                     assert self._scorer is not None
                     for wallet in (trade.base_account, trade.counter_account):
+                        # Enrich with latest metadata before scoring.
+                        self._enrich_from_metadata(wallet)
                         score = self._scorer.score_wallet(wallet, self._buffer)
                         if score is not None:
                             self._dispatcher.dispatch(wallet, score, pair_id)
@@ -259,6 +618,8 @@ class StreamingPipeline:
                     for wallet in (trade.base_account, trade.counter_account):
                         if not wallet:
                             continue
+                        # Enrich with latest metadata before scoring.
+                        self._enrich_from_metadata(wallet)
                         score = self._scorer.score_wallet(wallet, self._buffer)
                         if score is not None:
                             self._dispatcher.dispatch(wallet, score, pair_id)
