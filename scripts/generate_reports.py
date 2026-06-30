@@ -121,7 +121,8 @@ def _score_wallet(
 
     # Write report
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    ext = "csv" if output_format == "csv" else "json"
+    _ext_map = {"csv": "csv", "html": "html"}
+    ext = _ext_map.get(output_format, "json")
 
     if output_file == "-":
         # --- stdout ---
@@ -146,6 +147,10 @@ def _score_wallet(
 
     if output_format == "csv":
         write_csv_report(str(out_path), report)
+    elif output_format == "html":
+        from detection.forensic_report_interactive import generate_interactive_report
+
+        generate_interactive_report(report.to_dict(), str(out_path))
     else:
         write_report_secure(str(out_path), json.dumps(report.to_dict(), indent=2))
     return str(out_path)
@@ -153,7 +158,7 @@ def _score_wallet(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bulk forensic report generator")
-    parser.add_argument("--input", required=True, help="CSV file with wallet[,pair] rows")
+    parser.add_argument("--input", default=None, help="CSV file with wallet[,pair] rows (required unless --simulate)")
     parser.add_argument("--pair", default="XLM:native", help="Default asset pair")
     parser.add_argument(
         "--since",
@@ -169,9 +174,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-format",
-        choices=["json", "csv"],
+        choices=["json", "csv", "html"],
         default="json",
-        help="Export format for forensic reports: json (default) or csv",
+        help="Export format for forensic reports: json (default), csv, or html (interactive)",
     )
     parser.add_argument(
         "--output-file",
@@ -183,11 +188,68 @@ def parse_args() -> argparse.Namespace:
             "(<path>_<wallet>_<ts>.<ext>)."
         ),
     )
+    parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help=(
+            "Run the incident-response playbook against --wallet without waiting "
+            "for a live alert.  Requires --wallet; ignores --input."
+        ),
+    )
+    parser.add_argument(
+        "--wallet",
+        default=None,
+        help="Stellar account ID to use with --simulate.",
+    )
     return parser.parse_args()
+
+
+def _run_simulate(args: argparse.Namespace) -> None:
+    """Execute incident-response playbook simulation and generate a report."""
+    if not args.wallet:
+        print("Error: --simulate requires --wallet <WALLET_ADDRESS>", file=sys.stderr)
+        sys.exit(1)
+
+    from monitoring.incident_responder import IncidentResponder
+
+    responder = IncidentResponder()
+    incident = responder.simulate(
+        wallet=args.wallet,
+        risk_score=95,
+        alert_type="high_risk_wallet",
+    )
+    if incident is None:
+        print("Simulation produced no incident (duplicate suppressed or below threshold).", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+    report_dict = incident.to_dict()
+
+    if args.output_format == "html":
+        from detection.forensic_report_interactive import generate_interactive_report
+
+        out_path = output_dir / f"simulate_{args.wallet[:12]}_{ts}.html"
+        generate_interactive_report(report_dict, str(out_path))
+    else:
+        out_path = output_dir / f"simulate_{args.wallet[:12]}_{ts}.json"
+        out_path.write_text(json.dumps(report_dict, indent=2), encoding="utf-8")
+
+    print(f"Simulation complete: incident_id={incident.incident_id} report={out_path}")
 
 
 def main() -> None:
     args = parse_args()
+
+    if args.simulate:
+        _run_simulate(args)
+        return
+
+    if not args.input:
+        print("Error: --input is required when --simulate is not set", file=sys.stderr)
+        sys.exit(1)
 
     # Load wallets from CSV
     wallets: list[tuple[str, str]] = []

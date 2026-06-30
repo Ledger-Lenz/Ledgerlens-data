@@ -72,6 +72,16 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["all", "producer", "worker"],
         help="Kafka role: 'producer' (SSE→Kafka), 'worker' (scorer), or 'all'",
     )
+    parser.add_argument(
+        "--fixed-batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Disable adaptive micro-batch sizing and use a fixed batch of N. "
+            "Useful for debugging PID oscillation (Issue #243)."
+        ),
+    )
     return parser
 
 
@@ -92,6 +102,9 @@ def main() -> None:
     if not (args.backend == "kafka" and args.role == "producer"):
         scorer = StreamingScorer()
         scorer.min_trades = args.min_trades
+        if args.fixed_batch_size is not None:
+            logger.info("Adaptive batch sizing disabled; fixed batch size = %d", args.fixed_batch_size)
+            scorer._fixed_batch_size = args.fixed_batch_size
 
         if not scorer._risk_scorer.models:
             logger.error(

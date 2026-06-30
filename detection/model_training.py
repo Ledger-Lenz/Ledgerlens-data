@@ -23,9 +23,11 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from datetime import UTC, datetime
 
 import joblib
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from imblearn.over_sampling import SMOTE
@@ -50,6 +52,424 @@ MODEL_REGISTRY = {
 FEATURE_COLUMNS_EXCLUDE = {"wallet", "label", "profile"}
 PSI_N_BINS = 10
 PSI_EPSILON = 1e-4
+
+# ---------------------------------------------------------------------------
+# Feature schema validation helpers for incremental training
+# ---------------------------------------------------------------------------
+
+# Inclusive per-feature bounds used to reject out-of-range samples.
+# Bounds deliberately wide to capture legitimate extreme values; they
+# primarily guard against corrupted or spoofed feature rows.
+_FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
+    # Benford features — chi-square / MAD are non-negative; Z-scores bounded
+    "benford_chi_square_1h": (0.0, 1e6),
+    "benford_chi_square_4h": (0.0, 1e6),
+    "benford_chi_square_24h": (0.0, 1e6),
+    "benford_chi_square_168h": (0.0, 1e6),
+    "benford_chi_square_720h": (0.0, 1e6),
+    "benford_mad_1h": (0.0, 1.0),
+    "benford_mad_4h": (0.0, 1.0),
+    "benford_mad_24h": (0.0, 1.0),
+    "benford_mad_168h": (0.0, 1.0),
+    "benford_mad_720h": (0.0, 1.0),
+    # Ratio / proportion features
+    "counterparty_concentration_ratio": (0.0, 1.0),
+    "self_matching_rate": (0.0, 1.0),
+    "order_cancellation_rate": (0.0, 1.0),
+    "cross_pair_trade_synchrony": (0.0, 1.0),
+    "net_asset_flow_deviation": (0.0, 1e9),
+    "cross_pair_counterparty_overlap": (0.0, 1.0),
+    "pair_diversity_score": (0.0, 1.0),
+    # Ring detection — non-negative integers / bounded floats
+    "ring_size": (0.0, 1e6),
+    "ring_internal_density": (0.0, 1.0),
+}
+
+
+def validate_incremental_samples(
+    X: pd.DataFrame,
+    reference_feature_columns: list[str],
+) -> pd.DataFrame:
+    """Validate *X* against the reference feature schema for incremental training.
+
+    Checks performed:
+    1. All columns in *reference_feature_columns* are present in *X* (unknown
+       columns are silently dropped so the caller always gets a correctly shaped
+       matrix).
+    2. Any row with a NaN in a reference feature column is dropped with a
+       WARNING, because LightGBM's ``continue_training`` does not handle NaNs
+       in the label array (feature NaNs are fine for tree splits, but we reject
+       them conservatively here to match the full-retrain path).
+    3. Any row whose value for a feature listed in ``_FEATURE_BOUNDS`` falls
+       outside its declared [low, high] range is dropped with a WARNING.
+
+    Returns:
+        A filtered copy of *X* containing only the *reference_feature_columns*,
+        with invalid rows removed.
+
+    Raises:
+        ValueError: if *X* has no columns in common with *reference_feature_columns*
+            (indicates a completely wrong feature schema).
+    """
+    unknown_cols = set(X.columns) - set(reference_feature_columns)
+    if unknown_cols:
+        logger.warning(
+            "incremental validation: dropping %d unknown column(s): %s",
+            len(unknown_cols),
+            sorted(unknown_cols),
+        )
+
+    missing_cols = set(reference_feature_columns) - set(X.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Incremental training data is missing {len(missing_cols)} required "
+            f"feature column(s): {sorted(missing_cols)}"
+        )
+
+    X_valid = X[reference_feature_columns].copy()
+
+    # Drop rows with NaN in any reference column
+    nan_mask = X_valid.isnull().any(axis=1)
+    n_nan = int(nan_mask.sum())
+    if n_nan:
+        logger.warning(
+            "incremental validation: dropping %d row(s) with NaN values", n_nan
+        )
+        X_valid = X_valid[~nan_mask]
+
+    # Drop rows with out-of-range values
+    oor_mask = pd.Series(False, index=X_valid.index)
+    for col, (low, high) in _FEATURE_BOUNDS.items():
+        if col not in X_valid.columns:
+            continue
+        col_oor = (X_valid[col] < low) | (X_valid[col] > high)
+        n_oor = int(col_oor.sum())
+        if n_oor:
+            logger.warning(
+                "incremental validation: %d row(s) out of range for '%s' [%.4g, %.4g]",
+                n_oor,
+                col,
+                low,
+                high,
+            )
+        oor_mask = oor_mask | col_oor
+
+    n_total_oor = int(oor_mask.sum())
+    if n_total_oor:
+        logger.warning(
+            "incremental validation: dropping %d row(s) with out-of-range feature values",
+            n_total_oor,
+        )
+        X_valid = X_valid[~oor_mask]
+
+    if X_valid.empty:
+        raise ValueError(
+            "All incremental training samples were rejected by schema validation. "
+            "Check feature schema compatibility."
+        )
+
+    return X_valid
+
+
+# ---------------------------------------------------------------------------
+# Incremental LightGBM training
+# ---------------------------------------------------------------------------
+
+
+def incremental_train_lightgbm(
+    existing_model: LGBMClassifier,
+    new_data: pd.DataFrame,
+    n_new_trees: int = 100,
+    reference_feature_columns: list[str] | None = None,
+    learning_rate: float | None = None,
+) -> LGBMClassifier:
+    """Append *n_new_trees* new decision trees to *existing_model* using only
+    *new_data*, without modifying the existing trees.
+
+    This wraps LightGBM's ``init_model`` / ``keep_training_at_end`` mechanism
+    (the ``continue_training`` API).  The underlying Booster is extracted from
+    the scikit-learn wrapper, additional trees are trained via a second Booster
+    fit, and the result is re-wrapped in a new ``LGBMClassifier`` so the
+    scikit-learn interface remains intact downstream.
+
+    Design notes
+    ────────────
+    • **Catastrophic forgetting mitigation**: new trees are appended *after*
+      all existing trees, never replacing them.  The combined model retains
+      the full decision boundary learned during the original full retrain; new
+      trees provide incremental corrections for the shifted distribution.
+    • **Feature schema validation**: if *reference_feature_columns* is
+      provided, :func:`validate_incremental_samples` is called first to drop
+      unknown columns and reject out-of-range / NaN rows before training.
+    • **Learning rate**: defaults to half the original model's learning rate so
+      new trees make smaller updates, reducing the risk of overspecialisation
+      to recent data.
+
+    Args:
+        existing_model:
+            A fitted ``LGBMClassifier`` that is already attached to a Booster
+            (i.e. ``existing_model.booster_`` is not ``None``).
+        new_data:
+            A labelled ``pd.DataFrame`` with feature columns matching those
+            used at original training time plus a ``"label"`` column.
+        n_new_trees:
+            Number of additional trees to append.  Must be ≥ 1.
+        reference_feature_columns:
+            Ordered list of feature column names from the original training run.
+            When supplied, unknown / missing columns and invalid rows are
+            rejected before training.  Pass ``None`` to skip validation (not
+            recommended in production).
+        learning_rate:
+            Learning rate for the new trees.  Defaults to half the original
+            model's ``learning_rate`` parameter.
+
+    Returns:
+        A new ``LGBMClassifier`` instance with the combined Booster (original
+        trees + new trees).  The ``feature_name_``, ``n_features_in_``, and
+        ``classes_`` attributes are copied from the original model.
+
+    Raises:
+        ValueError: if *existing_model* has not been fitted, if *new_data* is
+            empty after validation, or if *n_new_trees* < 1.
+    """
+    if n_new_trees < 1:
+        raise ValueError(f"n_new_trees must be >= 1, got {n_new_trees}")
+
+    if not hasattr(existing_model, "booster_") or existing_model.booster_ is None:
+        raise ValueError(
+            "existing_model has not been fitted yet (booster_ is None). "
+            "Train it with fit() before calling incremental_train_lightgbm()."
+        )
+
+    # --- feature schema validation -----------------------------------------
+    if reference_feature_columns is not None:
+        X_new = validate_incremental_samples(new_data, reference_feature_columns)
+    else:
+        exclude = FEATURE_COLUMNS_EXCLUDE
+        feature_cols = [c for c in new_data.columns if c not in exclude]
+        X_new = new_data[feature_cols].copy()
+
+    if "label" not in new_data.columns:
+        raise ValueError("new_data must contain a 'label' column")
+
+    y_new = new_data.loc[X_new.index, "label"]
+
+    if X_new.empty:
+        raise ValueError("new_data is empty after schema validation")
+
+    logger.info(
+        "incremental_train_lightgbm: %d samples, %d new trees",
+        len(X_new),
+        n_new_trees,
+    )
+
+    # --- determine learning rate -------------------------------------------
+    orig_lr = existing_model.get_params().get("learning_rate", 0.1)
+    if orig_lr is None or orig_lr <= 0:
+        orig_lr = 0.1
+    incr_lr = learning_rate if learning_rate is not None else orig_lr / 2.0
+    # Clamp to a sensible range
+    incr_lr = float(np.clip(incr_lr, 1e-4, 1.0))
+
+    # --- build incremental Booster -----------------------------------------
+    existing_booster: lgb.Booster = existing_model.booster_
+
+    train_set = lgb.Dataset(X_new, label=y_new, free_raw_data=False)
+
+    # Carry forward the original model's core params; override only what
+    # needs to change for the incremental pass.
+    orig_params = existing_model.get_params()
+    incr_params: dict = {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "learning_rate": incr_lr,
+        "n_estimators": n_new_trees,
+        "verbosity": -1,
+        "num_threads": orig_params.get("n_jobs", -1) or -1,
+    }
+    # Carry through tree-structure hyper-params if present
+    for key in ("num_leaves", "max_depth", "min_child_samples", "subsample", "colsample_bytree"):
+        if orig_params.get(key) is not None:
+            incr_params[key] = orig_params[key]
+
+    # ``init_model`` seeds the new Booster from the existing one; LightGBM
+    # will add exactly ``num_boost_round`` trees on top of it.
+    new_booster = lgb.train(
+        params=incr_params,
+        train_set=train_set,
+        num_boost_round=n_new_trees,
+        init_model=existing_booster,
+        keep_training_booster=True,
+    )
+
+    # --- wrap in a new LGBMClassifier --------------------------------------
+    # Build a new LGBMClassifier with the same hyper-params but replace its
+    # Booster with the incrementally-trained one.
+    new_clf = LGBMClassifier(**{k: v for k, v in orig_params.items() if k != "random_state"})
+    new_clf.random_state = existing_model.random_state  # type: ignore[attr-defined]
+
+    # Manually attach booster so sklearn predict_proba works
+    new_clf._Booster = new_booster  # noqa: SLF001
+    new_clf.fitted_ = True  # noqa: SLF001
+
+    # Copy metadata attributes scikit-learn sets during fit()
+    for attr in ("feature_name_", "n_features_in_", "classes_", "_n_classes", "_le",
+                 "_class_map", "_n_features", "_objective"):
+        if hasattr(existing_model, attr):
+            setattr(new_clf, attr, getattr(existing_model, attr))
+
+    # The public booster_ property reads _Booster
+    assert new_clf.booster_ is not None, "Booster attachment failed"
+
+    total_trees = new_booster.num_trees()
+    logger.info(
+        "incremental_train_lightgbm: done — total trees after update: %d", total_trees
+    )
+
+    return new_clf
+
+
+# ---------------------------------------------------------------------------
+# Staleness detector
+# ---------------------------------------------------------------------------
+
+
+class IncrementalTrainingStalenessDetector:
+    """Thread-safe counter that triggers a full retrain after
+    *max_incremental_rounds* consecutive incremental updates.
+
+    The staleness cap guards against **catastrophic forgetting**: each
+    incremental pass appends new trees tuned to the most recent data; after
+    many rounds the model accumulates a long tail of specialised trees that
+    increasingly overfit to recent patterns at the expense of older ones.
+    Forcing a full retrain on a combined historical + recent dataset resets
+    the tree structure and restores broad coverage.
+
+    Usage::
+
+        detector = IncrementalTrainingStalenessDetector()
+
+        # called after each successful incremental training pass
+        if detector.increment():          # returns True when cap is hit
+            retrain_from_scratch(...)
+            detector.reset()
+        else:
+            promote_incremental_model(...)
+
+    The state is also persisted to *state_path* (JSON) so it survives process
+    restarts (e.g. between cron runs of ``retrain_if_drifted.py``).
+    """
+
+    DEFAULT_STATE_PATH = os.path.join("models", "incremental_staleness_state.json")
+
+    def __init__(
+        self,
+        max_rounds: int | None = None,
+        state_path: str | None = None,
+    ) -> None:
+        try:
+            from config import config as _cfg  # late import to allow unit-test mocking
+            self._max_rounds: int = (
+                max_rounds
+                if max_rounds is not None
+                else int(getattr(_cfg, "MAX_INCREMENTAL_ROUNDS", 10))
+            )
+        except Exception:  # pragma: no cover
+            self._max_rounds = max_rounds if max_rounds is not None else 10
+
+        self._state_path = state_path or self.DEFAULT_STATE_PATH
+        self._lock = threading.Lock()
+        self._rounds: int = 0
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def rounds(self) -> int:
+        """Number of incremental rounds since the last full retrain."""
+        with self._lock:
+            return self._rounds
+
+    @property
+    def max_rounds(self) -> int:
+        return self._max_rounds
+
+    def increment(self) -> bool:
+        """Record one incremental training round.
+
+        Returns:
+            ``True`` if the staleness cap has been reached and a full retrain
+            should be triggered; ``False`` otherwise.
+        """
+        with self._lock:
+            self._rounds += 1
+            stale = self._rounds >= self._max_rounds
+            self._save_state_locked()
+            logger.info(
+                "staleness_detector: round=%d/%d stale=%s",
+                self._rounds,
+                self._max_rounds,
+                stale,
+            )
+            return stale
+
+    def reset(self) -> None:
+        """Reset the round counter after a full retrain."""
+        with self._lock:
+            self._rounds = 0
+            self._save_state_locked()
+            logger.info("staleness_detector: counter reset after full retrain")
+
+    def is_stale(self) -> bool:
+        """Return ``True`` if incremental training has run >= *max_rounds* times."""
+        with self._lock:
+            return self._rounds >= self._max_rounds
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _load_state(self) -> None:
+        if os.path.exists(self._state_path):
+            try:
+                with open(self._state_path) as f:
+                    state = json.load(f)
+                self._rounds = int(state.get("rounds", 0))
+                logger.debug(
+                    "staleness_detector: loaded state rounds=%d from %s",
+                    self._rounds,
+                    self._state_path,
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning(
+                    "staleness_detector: could not load state from %s: %s — starting fresh",
+                    self._state_path,
+                    exc,
+                )
+                self._rounds = 0
+
+    def _save_state_locked(self) -> None:
+        """Must be called with self._lock held."""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self._state_path)), exist_ok=True)
+            with open(self._state_path, "w") as f:
+                json.dump(
+                    {
+                        "rounds": self._rounds,
+                        "max_rounds": self._max_rounds,
+                        "updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.warning(
+                "staleness_detector: could not persist state to %s: %s",
+                self._state_path,
+                exc,
+            )
 
 
 def compute_feature_distributions(
@@ -423,6 +843,17 @@ def parse_args() -> argparse.Namespace:
         default="data/raw_trades.parquet",
         help="Path to raw trades Parquet file for Benford window optimization"
     )
+    parser.add_argument(
+        "--adv-training",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable FGSM-based adversarial training (Issue #191). "
+            "Overridden by ADV_TRAINING_ENABLED env var when set to 'true'. "
+            "Epochs / epsilon / ratio are controlled by ADV_TRAINING_EPOCHS, "
+            "ADV_TRAINING_EPSILON, and ADV_TRAINING_RATIO."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -586,6 +1017,58 @@ def main() -> None:
 
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
+
+    # FGSM adversarial training (Issue #191)
+    adv_training_enabled = config.ADV_TRAINING_ENABLED or args.adv_training
+    if adv_training_enabled:
+        try:
+            from detection.adversarial.robustness import run_adversarial_training
+            from detection.model_inference import RiskScorer
+
+            logger.info(
+                "ADV_TRAINING_ENABLED=true — starting FGSM adversarial training loop "
+                "(epochs=%d epsilon=%.3f ratio=%.2f)",
+                config.ADV_TRAINING_EPOCHS,
+                config.ADV_TRAINING_EPSILON,
+                config.ADV_TRAINING_RATIO,
+            )
+            adv_report = run_adversarial_training(
+                df,
+                epochs=config.ADV_TRAINING_EPOCHS,
+                epsilon=config.ADV_TRAINING_EPSILON,
+                adv_ratio=config.ADV_TRAINING_RATIO,
+                test_size=args.test_size,
+                random_state=args.random_state,
+                model_dir=model_dir,
+            )
+
+            # Enforce clean accuracy degradation constraint (<= 3 pp)
+            if not adv_report.get("clean_degradation_within_tolerance", True):
+                logger.warning(
+                    "ADV TRAINING: clean accuracy degradation (%.4f) exceeds 3 pp tolerance. "
+                    "Consider reducing ADV_TRAINING_EPSILON or ADV_TRAINING_RATIO.",
+                    adv_report.get("clean_accuracy_degradation", float("nan")),
+                )
+            else:
+                logger.info(
+                    "ADV TRAINING: clean_auc %.4f→%.4f  adversarial_auc %.4f→%.4f  "
+                    "(within 3 pp clean degradation tolerance)",
+                    adv_report["clean_auc_initial"],
+                    adv_report["clean_auc_final"],
+                    adv_report["adversarial_auc_initial"],
+                    adv_report["adversarial_auc_final"],
+                )
+
+            # Persist adversarial training report
+            os.makedirs("reports", exist_ok=True)
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            adv_report_path = f"reports/adversarial_training_{ts}.json"
+            with open(adv_report_path, "w") as f:
+                json.dump(adv_report, f, indent=2)
+            logger.info("Adversarial training report written to %s", adv_report_path)
+
+        except Exception as _adv_exc:
+            logger.error("Adversarial training step failed: %s", _adv_exc, exc_info=True)
 
     # Compute DP-noised aggregate statistics and log privacy budget consumed.
     try:

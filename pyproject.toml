@@ -32,3 +32,24 @@ markers = [
     "integration: marks tests as live Testnet integration tests (deselect with '-m not integration')",
     "slow: marks tests that run PPO training (deselect with '-m not slow')",
 ]
+
+# ---------------------------------------------------------------------------
+# mutmut — mutation testing configuration
+# ---------------------------------------------------------------------------
+# Run with: make mutation-test
+# Or manually: mutmut run --paths-to-mutate detection/benford_engine.py,...
+# ---------------------------------------------------------------------------
+[tool.mutmut]
+# Limit mutation scope to the core scoring path — keeps CI runtime under 15 min.
+# detection/model_inference.py is intentionally excluded here: it has heavy
+# integration fixtures (train_models, tmp_path_factory) that make mutmut's
+# subprocess-based runner very slow. The Makefile target passes it explicitly
+# via --paths-to-mutate instead so we can time-box it separately.
+paths_to_mutate = "detection/benford_engine.py,detection/feature_engineering.py"
+tests_dir = "tests/"
+# Run only the fast unit tests during mutation (skip integration + slow marks)
+runner = "python -m pytest -x -q --timeout=30 -m 'not integration and not slow' tests/test_benford.py tests/test_benford_ci.py tests/test_feature_engineering.py tests/test_model_inference.py"
+# Do not mutate import blocks, type annotations, or docstrings
+dict_synonyms = ""
+# Avoid mutating auto-generated files or vendored code
+exclude_list = "tests/,scripts/,data/"

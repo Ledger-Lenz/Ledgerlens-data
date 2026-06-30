@@ -166,188 +166,61 @@ Each entry in `data/annotation_queue.json` carries an `annotation_hmac` field: H
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Model Inversion Attack Defence
+## Field-Level Encryption for Forensic Reports
 
-A model inversion attack allows an adversary to reconstruct features used in
-scoring by querying the model repeatedly and analyzing the gradients (or in
-discrete settings, the score deltas). In LedgerLens, an attacker could query
-the score for a wallet, remove one trade, re-query, and observe the delta to
-identify which individual trade was most anomalous. Repeated queries across
-variants reconstruct the full anomaly profile.
+Forensic reports (`detection/forensic_report.py`) contain raw Stellar wallet
+addresses that identify subjects under investigation.  To prevent premature
+exposure, wallet addresses should be encrypted at rest using AES-256-GCM
+field-level encryption provided by `utils/field_encryption.py`.
 
-### Output Perturbation (Laplace Mechanism)
+### Encryption Scheme
 
-`detection/model_inference.py::score()` applies **Laplace output perturbation**
-per external API call to defend against this attack. The mechanism:
+- **Algorithm**: AES-256-GCM (authenticated encryption with 128-bit tag).
+- **IV**: A fresh 12-byte random IV is generated per field per encryption call.
+  This guarantees that encrypting the same wallet address twice produces
+  different ciphertexts (IV-reuse attack prevention).
+- **Stored format**: `iv (12 bytes) || ciphertext || GCM tag (16 bytes)` as a
+  binary blob.
+- **Authentication**: Decryption raises `cryptography.exceptions.InvalidTag`
+  on any authentication failure.  Silent corruption is impossible.
 
-1. **Per-query random seed**: derived from `(caller_id, timestamp_bucket)` so
-   identical repeated queries produce different scores, preventing averaging.
-2. **Laplace noise**: drawn with scale `σ = sensitivity / ε`, where sensitivity
-   is the max score change from one trade (bounded at 100) and `ε` is the privacy
-   budget (default 1.0).
-3. **Clipping + rounding**: perturbed scores clipped to [0, 100] and rounded to
-   `SCORE_ROUNDING_GRANULARITY` (default 1 point).
+### Key Management
 
-**Internal pipeline calls** (e.g. `run_pipeline.py` → model training) use
-`caller_id="internal"` and are **not perturbed**, preserving model quality for
-batch operations.
-
-### Query Rate-Limiting
-
-`detection/risk_score_store.py::RiskScoreStore` tracks queries per
-`(caller_id, wallet_id)` pair. Once a caller exceeds `MODEL_INVERSION_QUERY_LIMIT`
-queries (default 100) on a wallet, subsequent API requests for that wallet return
-**429 Too Many Requests**. This prevents sustained gradient-based attacks.
-
-| Config Variable | Default | Description |
-|---|---|---|
-| `MODEL_INVERSION_QUERY_LIMIT` | `100` | Max queries per (caller, wallet) before 429 |
-| `MODEL_INVERSION_DP_EPSILON` | `1.0` | Privacy budget ε for Laplace mechanism |
-| `SCORE_ROUNDING_GRANULARITY` | `1` | Quantize scores to this granularity |
-
-### Seeding Prevents Averaging
-
-The seed derivation `hash(caller_id + timestamp_bucket)` ensures:
-- **Different results for identical queries**: Attacker's repeated score queries
-  get different noisy values, so averaging them doesn't converge to the truth.
-- **Reproducibility within a time window**: For testing / audit, the same
-  `(caller_id, timestamp)` always produces the same noise.
-
-### Example: Attacker Scenario
-
-```
-Attacker's intended attack:
-  Query 1: GET /score/G...wallet.../USDC:G.../XLM:native → score = 75
-  Remove last trade, re-query
-  Query 2: GET /score/G...wallet.../USDC:G.../XLM:native → score = 72
-  Delta = 3 points → identifies last trade as moderately anomalous
-
-With model inversion defence:
-  Query 1: score = 75 + Laplace(0, 100/ε) → 68 (noisy)
-  Query 2: score = 72 + Laplace(0, 100/ε) → 79 (different noise seed)
-  Delta = 11 points (includes noise) → cannot invert
-  After 100 queries: 429 Too Many Requests → rate limited
-```
-
----
-
-## Differential Privacy Budget Strategy (Issue #195)
-
-### Overview
-
-Every DP mechanism consumes part of the total privacy budget (epsilon, δ).
-Once the cumulative epsilon exceeds the configured cap, the DP guarantee becomes
-vacuous and the system must pause new training/inference queries until an
-authorised operator performs a budget rollover.
-
-LedgerLens tracks budget via `detection/privacy/budget_tracker.py`.
-
-### Composition theorem used
-
-Budget composition follows **Rényi Differential Privacy (RDP)** additive
-composition: the total epsilon at Rényi order α is the sum of individual
-epsilons at the same order.  This provides tight bounds for the Gaussian
-mechanism used by Opacus DP-SGD and is a valid upper bound for heterogeneous
-mechanisms.
-
-For tighter finite-data bounds, the **PRV (Privacy Random Variable) accountant**
-can be substituted; it achieves near-optimal composition at the cost of O(n²)
-computation over the number of training steps.  The RDP accountant is the
-current default because it is sufficient for LedgerLens's update frequency
-(daily retraining) and adds negligible overhead.
-
-### Budget tracking architecture
-
-| Mechanism | Epsilon source | Tracked separately |
-|---|---|---|
-| DP-SGD training round | `achieved_epsilon` from Opacus PrivacyEngine | Yes (`kind=training`) |
-| Inference-time DP query | Per-query sensitivity / noise ratio | Yes (`kind=inference`) |
-
-All consumption events are appended to the `dp_budget_events` database table
-using an **append-only log pattern** (INSERT only, no UPDATE/DELETE).  The table
-includes a SHA-256 hash chain (`prev_log_hash → log_hash`) so tampering with
-historical entries is detectable.
-
-### Alert threshold rationale
-
-`DP_BUDGET_ALERT_THRESHOLD` (default 10.0 epsilon units) gives the operations
-team time to act before the budget is fully exhausted.  At the default total of
-100.0 epsilon, the alert fires with 10 % of budget remaining — roughly the
-equivalent of one more full training run at the standard ε=8.0 target.
-
-### Budget rollover
-
-A budget rollover resets the cumulative epsilon to 0 for a new major model
-version.  It requires an explicit operator confirmation string
-(`CONFIRM_ROLLOVER_<version>`) to prevent accidental resets.  The old budget
-log is preserved in the database; a synthetic `rollover` event records the
-version transition.
-
-### Querying current budget
+Set `FORENSIC_REPORT_ENCRYPTION_KEY` to a 64-character lowercase hex string
+representing 32 random bytes:
 
 ```bash
-python scripts/query_privacy_budget.py
-python scripts/query_privacy_budget.py --json
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
----
+- The key must be **exactly 32 bytes**; a shorter key raises a startup error.
+- If the variable is absent, a warning is emitted and plaintext is stored
+  (development only — never acceptable in production).
+- Store the key in a secrets manager (Vault, AWS Secrets Manager, etc.),
+  never in `.env` committed to version control.
 
-## Audit Trail Tamper Detection — Merkle Chain (Issue #196)
+### Key Rotation
 
-### Design
+To re-encrypt existing forensic reports when the key changes:
 
-Every audit log entry (risk score computation, model decision, alert event) is
-committed to an in-memory Merkle chain implemented in `AuditMerkleChain` in
-`detection/audit_trail.py`.
+1. Decrypt all stored blobs with the **old** key.
+2. Re-encrypt each field value with the **new** key.
+3. Atomically swap the updated blobs in the database.
+4. Revoke the old key.
 
-Each entry carries:
-- Its **sequential index** within the chain.
-- The **SHA-256 hash of the entry content** (canonical JSON).
-- The **previous Merkle root** (before this entry was appended).
-- The **new Merkle root** (after including this entry).
+Run this as a migration script with the old key available as a temporary
+environment variable (e.g. `OLD_FORENSIC_KEY`), then set
+`FORENSIC_REPORT_ENCRYPTION_KEY` to the new key.
 
-The Merkle tree is a binary tree over leaf hashes `SHA-256("<index>:<content_hash>")`,
-with duplicate-last-leaf padding for odd-length layers.
+### Export Authorisation
 
-### Storage
+Before generating a PDF that includes decrypted wallet addresses, call:
 
-Merkle roots are written to a **separate** `audit_merkle_roots` database table,
-making root tampering independently detectable:
+```python
+from utils.field_encryption import check_export_permission
 
-- Tampering with an entry's content changes the leaf hash → the recomputed root
-  differs from the stored in-entry root.
-- Tampering with the stored in-entry root → the separate-table root differs.
-- Tampering with the separate-table root → the in-entry root differs.
+check_export_permission(current_user.permissions)  # raises PermissionError if not authorised
+```
 
-All three attack surfaces are caught by `verify_chain()`.
-
-### Security constraints
-
-- **SHA-256 exclusively** — MD5 and SHA-1 are not used anywhere in the chain.
-- The `audit_merkle_roots` table uses INSERT-only access at the application
-  level; the application user must not hold UPDATE or DELETE privileges on
-  this table.  Migration SQL:
-
-  ```sql
-  REVOKE UPDATE, DELETE ON audit_merkle_roots FROM ledgerlens_app;
-  ```
-
-- `verify_chain()` completes in O(n) time where n is the number of entries
-  being verified.
-
-### Crash recovery
-
-If the process crashes between writing the audit entry and updating the Merkle
-root, the entry exists without a corresponding root record.  On restart,
-`verify_chain()` will raise `TamperDetectedError` for the missing root.
-Operators should re-run verification from the last known-good index and replay
-the missing root insertion before resuming normal operation.
-
-### What a tamper detection event requires from the operator
-
-1. **Stop all writes** to the audit log immediately.
-2. Run `verify_chain(start_index=0)` to identify the first failing index.
-3. Compare the stored entry against backup copies of the audit log.
-4. Escalate to the security team if a discrepancy is confirmed.
-5. Do not resume normal operation until the root cause is identified and all
-   modified entries are restored from a trusted backup.
+Only users with the `forensic_export` permission may trigger exports with
+decrypted addresses.
