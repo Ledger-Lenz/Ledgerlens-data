@@ -245,6 +245,15 @@ FEATURE_DESCRIPTIONS: dict[str, str] = {
         "specific operations (low entropy); humans diversify (high entropy). Values <1.5 "
         "indicate bot-like clustering."
     ),
+    # Trade pattern features (continued)
+    "counterparty_variance": (
+        "Variance of per-counterparty trade volume normalised by mean volume squared "
+        "(dimensionless coefficient of variation squared, CV²). Wash-trade rings that "
+        "use decoy counterparties show high variance: the primary counterparty receives "
+        "most volume while decoys receive a tiny fraction each, inflating the apparent "
+        "counterparty count while disguising true concentration. "
+        "Range: [0, 1] (clipped). Higher = more suspicious."
+    ),
 }
 
 
@@ -495,6 +504,11 @@ def compute_trade_pattern_features(
           ``round_trip_frequency``.
         - ``order_cancellation_rate``: Fraction of the wallet's manage-offer
           operations that were cancellations.
+        - ``counterparty_variance``: Variance of per-counterparty trade volume
+          normalised by mean volume squared (dimensionless CV²). Values near
+          0 indicate balanced multi-counterparty trading; values near 1
+          indicate extreme concentration with decoy counterparties.
+          Range: [0, 1] (clipped). Higher = more suspicious.
 
     Raises:
         KeyError: If required columns (e.g., ``base_account``,
@@ -509,6 +523,7 @@ def compute_trade_pattern_features(
             "net_roundtrip_ratio": 0.0,
             "self_matching_rate": 0.0,
             "order_cancellation_rate": order_cancellation_rate,
+            "counterparty_variance": 0.0,
         }
 
     counterparty_col = wallet_trades["base_account"].where(
@@ -525,12 +540,33 @@ def compute_trade_pattern_features(
 
     self_matching_rate = round_trip_frequency  # same accounts trading with themselves
 
+    # counterparty_variance — worked example from docs/contributor_feature_guide.md
+    # Normalised variance (CV²) of per-counterparty volume. Wash-trade rings that
+    # use decoy counterparties will show high variance: the primary counterparty
+    # receives most volume while decoys receive a tiny fraction each.
+    if len(volume_by_counterparty) >= 2:
+        mean_vol = float(volume_by_counterparty.mean())
+        var_vol = float(volume_by_counterparty.var(ddof=0))
+        counterparty_variance = (var_vol / (mean_vol ** 2)) if mean_vol > 0 else 0.0
+        counterparty_variance = max(0.0, min(1.0, counterparty_variance))
+    else:
+        counterparty_variance = 0.0
+
+    if not (0.0 <= counterparty_variance <= 1.0):
+        logger.warning(
+            "counterparty_variance out of expected range [0, 1]: %.4f for wallet %s — clamping",
+            counterparty_variance,
+            wallet,
+        )
+        counterparty_variance = max(0.0, min(1.0, counterparty_variance))
+
     return {
         "counterparty_concentration_ratio": float(concentration),
         "round_trip_frequency": float(round_trip_frequency),
         "net_roundtrip_ratio": float(round_trip_frequency),
         "self_matching_rate": float(self_matching_rate),
         "order_cancellation_rate": order_cancellation_rate,
+        "counterparty_variance": float(counterparty_variance),
     }
 
 
@@ -1130,6 +1166,79 @@ def compute_bot_fingerprint_features(
             "bot_trust_line_latency": 0.0,
             "bot_interval_regularity": 0.0,
             "bot_op_entropy": 0.0,
+        }
+
+
+def compute_payment_path_features(
+    wallet: str,
+    path_flows: list | None = None,
+) -> dict:
+    """Compute payment path analysis features for a wallet.
+
+    Wraps ``ingestion.payment_path_analyzer.compute_path_payment_round_trip_frequency``
+    and returns a single feature measuring how often multi-hop payment paths
+    form a closed (round-trip) cycle — a strong wash-trade signal.
+
+    Args:
+        wallet: Stellar account ID being scored.
+        path_flows: List of ``ReconstructedPathFlow`` dicts produced by
+            ``ingestion.payment_path_analyzer.reconstruct_path_flow``.
+            When ``None`` or empty, returns zero-valued features.
+
+    Returns:
+        A dictionary with:
+
+        - ``path_payment_round_trip_frequency``: Fraction of path payments
+          where the destination account equals the source account.
+          Range: [0.0, 1.0].  Higher = more suspicious.
+    """
+    if not path_flows:
+        return {"path_payment_round_trip_frequency": 0.0}
+
+    try:
+        from ingestion.payment_path_analyzer import compute_path_payment_round_trip_frequency
+
+        freq = compute_path_payment_round_trip_frequency(wallet, path_flows)
+        return {"path_payment_round_trip_frequency": float(freq)}
+    except Exception as exc:
+        logger.warning("compute_payment_path_features failed for %s: %s", wallet, exc)
+        return {"path_payment_round_trip_frequency": 0.0}
+
+
+def compute_ts_decomposition_features(wallet_trades: pd.DataFrame) -> dict:
+    """Compute STL-based time-series decomposition features for a wallet.
+
+    Delegates to ``detection.ts_decomposition.compute_ts_features`` which
+    runs STL (Seasonal-Trend decomposition via LOESS) on the hourly volume
+    series and returns three features.
+
+    Args:
+        wallet_trades: Trades involving the wallet.  Must contain
+            ``ledger_close_time`` and ``amount`` columns.
+
+    Returns:
+        A dictionary with:
+
+        - ``volume_trend_slope``: Normalised linear regression slope of
+          the hourly volume series.  ``NaN`` → 0.0 in ``build_feature_vector``.
+        - ``volume_seasonality_strength``: Fraction of variance explained by
+          the seasonal component.  Range: [0.0, 1.0].
+        - ``volume_residual_anomaly``: Fraction of hourly bins whose STL
+          residual exceeds mean + 2 std.  Range: [0.0, 1.0].
+
+    All three features are ``NaN`` (coerced to 0.0) when fewer than 48
+    hourly bins are available.
+    """
+    try:
+        from detection.ts_decomposition import compute_ts_features
+
+        return compute_ts_features(wallet_trades)
+    except Exception as exc:
+        logger.warning("compute_ts_decomposition_features failed: %s", exc)
+        return {
+            "volume_trend_slope": 0.0,
+            "volume_seasonality_strength": 0.0,
+            "volume_residual_anomaly": 0.0,
         }
 
 

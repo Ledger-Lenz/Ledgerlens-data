@@ -97,6 +97,11 @@ All security-relevant PRs must reference the threat model and document which mit
 - New feature columns added to `detection/feature_engineering.py` must be
   documented in the README's feature tables and accounted for in
   `detection/model_training.py::FEATURE_COLUMNS_EXCLUDE` handling.
+- **Adding a new ML feature?** Follow the end-to-end guide in
+  [`docs/contributor_feature_guide.md`](docs/contributor_feature_guide.md).
+  It covers naming conventions, function signatures, range validation,
+  dataset card updates, SHAP integration, and required test patterns —
+  with a complete worked example using `counterparty_variance`.
 
 ## Reporting issues
 
