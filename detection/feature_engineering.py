@@ -1258,6 +1258,8 @@ def build_feature_vector(
     path_flows: list | None = None,
     kge_encoder=None,
     wallet_counterparties: list[str] | None = None,
+    seq_model=None,
+    pair_vocab: dict | None = None,
 ) -> dict:
     """Assemble the full feature row for a single wallet.
 
@@ -1308,6 +1310,31 @@ def build_feature_vector(
         features.update(compute_graph_embedding_features(wallet, funding_graph, gnn_encoder))
     else:
         features.update({f"gnn_{i}": 0.0 for i in range(config.GNN_EMBEDDING_DIM)})
+
+    # Sequence model embedding features (#182) — graceful zero-fallback when model absent.
+    # The embedding is concatenated to the feature vector before being passed to the
+    # ensemble calibrator.  Before the first training run, all-zeros are returned so the
+    # feature schema stays consistent.
+    if seq_model is not None and config.SEQ_MODEL_ENABLED:
+        try:
+            from detection.trade_sequence_transformer import build_sequence_embedding
+
+            seq_embedding = build_sequence_embedding(
+                wallet_trades,
+                seq_model,
+                pair_vocab=pair_vocab,
+            )
+        except Exception as _e:
+            logger.warning("Sequence embedding failed for wallet %s: %s", wallet, _e)
+            seq_embedding = None
+    else:
+        seq_embedding = None
+
+    if seq_embedding is None:
+        seq_embedding = __import__("numpy").zeros(config.SEQ_MODEL_EMBED_DIM, dtype="float32")
+
+    for i, v in enumerate(seq_embedding):
+        features[f"seq_{i}"] = float(v)
 
     return {k: (0.0 if isinstance(v, float) and pd.isna(v) else v) for k, v in features.items()}
 
