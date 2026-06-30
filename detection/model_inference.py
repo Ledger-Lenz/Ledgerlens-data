@@ -39,6 +39,7 @@ import pandas as pd
 
 from config import config
 from detection.conformal import ConformalCalibrator
+from detection.differential_privacy import laplace_scale, add_laplace_noise
 from detection.list_override import ListOverride
 from detection.model_training import (
     FEATURE_COLUMNS_EXCLUDE,
@@ -58,7 +59,7 @@ _CONSENSUS_WINDOW = 10  # two models must be within this many points of each oth
 # installed or not yet wired to an exporter)
 # ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter
+    from prometheus_client import Counter, Summary
 
     bft_divergence_detected_total: Counter | None = Counter(
         "bft_divergence_detected_total",
@@ -68,9 +69,14 @@ try:
         "ledgerlens_cluster_scored_total",
         "Total number of wallet clusters scored by score_cluster()",
     )
+    ledgerlens_canary_score_delta: Summary | None = Summary(
+        "ledgerlens_canary_score_delta_seconds",
+        "Absolute score difference between canary and champion model per wallet",
+    )
 except Exception:  # pragma: no cover
     bft_divergence_detected_total = None
     ledgerlens_cluster_scored_total = None
+    ledgerlens_canary_score_delta = None
 
 
 def _increment_bft_counter() -> None:
@@ -197,12 +203,14 @@ class RiskScorer:
         self.list_override = ListOverride()
         self.metadata = self._load_metadata()
         self.models = self._load_models()
+        self.selected_features: list[str] | None = self._load_selected_features()
         self.calibrators: dict[str, ConformalCalibrator] = {}
         self._load_calibrators()
         from detection.meta_learner import LeafEmbeddingExtractor
 
         self.extractor = LeafEmbeddingExtractor(self.models)
         self.maml_adapter, self.proto_classifier = self._load_meta_learners()
+        self.seq_model = self._load_seq_model()
 
     def _load_calibrators(self) -> None:
         """Load conformal calibration artifacts for each model.
@@ -333,6 +341,32 @@ class RiskScorer:
                 data = json.load(f)
             return data.get("selected_features")
         return None
+
+    def _load_seq_model(self):
+        """Load the transformer sequence model if enabled and available.
+
+        Returns the model in eval mode, or ``None`` when the feature is
+        disabled (``SEQ_MODEL_ENABLED=false``) or before the first training
+        run (artifact absent).  Never raises — a missing artifact is a
+        normal pre-training state.
+        """
+        if not config.SEQ_MODEL_ENABLED:
+            return None
+        try:
+            from detection.trade_sequence_transformer import TradeSequenceTransformer
+
+            model = TradeSequenceTransformer.load(
+                model_dir=self.model_dir,
+                verify_integrity=True,
+            )
+            model.eval()
+            return model
+        except Exception as exc:
+            logger.info(
+                "Sequence model not loaded (this is expected before first training run): %s",
+                exc,
+            )
+            return None
 
     def _ensemble_probabilities(self, feature_row: pd.Series) -> list[float]:
         """Per-model wash-trade probabilities for a single feature row.
@@ -598,6 +632,117 @@ class RiskScorer:
         """Score every row in a feature matrix."""
         scores = feature_matrix.apply(self.score, axis=1, result_type="expand")
         return pd.concat([feature_matrix[["wallet"]], scores], axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Canary deployment monitoring (issue #240)
+# ---------------------------------------------------------------------------
+
+_CANARY_P95_DELTA_LIMIT = 15.0  # promotion readiness threshold
+
+
+class ModelCanaryMonitor:
+    """Log per-wallet champion/canary score pairs and check promotion readiness.
+
+    During the shadow period both the champion (production) model and the
+    canary (candidate) model score every wallet.  This class records those
+    pairs in-memory (or to a supplied DB table via ``log_score_pair``) so
+    operators can inspect the delta distribution before promoting.
+
+    Parameters
+    ----------
+    champion_version:
+        Human-readable identifier for the current production model.
+    canary_version:
+        Human-readable identifier for the candidate model under evaluation.
+    """
+
+    def __init__(self, champion_version: str, canary_version: str) -> None:
+        self.champion_version = champion_version
+        self.canary_version = canary_version
+        self._pairs: list[dict] = []
+
+    def log_score_pair(
+        self,
+        wallet_id_hash: str,
+        champion_score: float,
+        canary_score: float,
+    ) -> None:
+        """Record a (champion, canary) score pair for a hashed wallet ID.
+
+        Wallet addresses are never stored; callers must pass a pre-hashed ID
+        (e.g. ``hashlib.sha256(wallet.encode()).hexdigest()``).
+
+        Also updates the Prometheus summary metric with the absolute delta.
+        """
+        delta = abs(canary_score - champion_score)
+        self._pairs.append(
+            {
+                "wallet_id_hash": wallet_id_hash,
+                "champion_score": champion_score,
+                "canary_score": canary_score,
+                "delta": delta,
+                "champion_version": self.champion_version,
+                "canary_version": self.canary_version,
+            }
+        )
+        if ledgerlens_canary_score_delta is not None:
+            try:
+                ledgerlens_canary_score_delta.observe(delta)
+            except Exception:
+                pass
+
+    def score_pairs(self) -> list[dict]:
+        """Return all logged score pairs for the current canary version."""
+        return list(self._pairs)
+
+    def disagreement_rate(self, band_threshold: float = 15.0) -> float:
+        """Fraction of wallets where |canary - champion| > band_threshold."""
+        if not self._pairs:
+            return 0.0
+        disagreements = sum(1 for p in self._pairs if p["delta"] > band_threshold)
+        return disagreements / len(self._pairs)
+
+    def top_divergent_wallets(self, n: int = 10) -> list[dict]:
+        """Return the n wallets with the largest score divergence."""
+        return sorted(self._pairs, key=lambda p: p["delta"], reverse=True)[:n]
+
+    def promotion_readiness(self) -> dict:
+        """Compute a promotion readiness summary.
+
+        Returns a dict with ``ready`` (bool) and diagnostic fields.
+        The check fails (``ready=False``) if the p95 absolute score delta
+        exceeds ``_CANARY_P95_DELTA_LIMIT`` (15 points).
+        """
+        if not self._pairs:
+            return {
+                "ready": False,
+                "reason": "no score pairs logged",
+                "pair_count": 0,
+            }
+
+        deltas = sorted(p["delta"] for p in self._pairs)
+        n = len(deltas)
+        p95_index = min(int(n * 0.95), n - 1)
+        p95_delta = deltas[p95_index]
+        mean_delta = sum(deltas) / n
+        disagreement = self.disagreement_rate()
+
+        ready = p95_delta <= _CANARY_P95_DELTA_LIMIT
+        return {
+            "ready": ready,
+            "pair_count": n,
+            "p95_delta": round(p95_delta, 2),
+            "mean_delta": round(mean_delta, 2),
+            "disagreement_rate": round(disagreement, 4),
+            "champion_version": self.champion_version,
+            "canary_version": self.canary_version,
+            "reason": (
+                None
+                if ready
+                else f"p95 score delta {p95_delta:.1f} exceeds limit {_CANARY_P95_DELTA_LIMIT}"
+            ),
+        }
 
 
 def _score_one(wallet: str) -> dict:

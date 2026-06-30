@@ -1,0 +1,333 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens — SLO Dashboard",
+  "tags": ["ledgerlens", "slo", "observability"],
+  "timezone": "browser",
+  "time": {"from": "now-24h", "to": "now"},
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "asset_pair",
+        "type": "query",
+        "label": "Asset Pair (optional)",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(ledgerlens_risk_score_distribution_bucket, asset_pair)",
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Scoring Latency — P50, P95, P99 (seconds)",
+      "description": "End-to-end scoring latency percentiles. Target: p99 < 5s.",
+      "type": "graph",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ledgerlens_score_duration_seconds_bucket{asset_pair=~\"$asset_pair\"}[5m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ledgerlens_score_duration_seconds_bucket{asset_pair=~\"$asset_pair\"}[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ledgerlens_score_duration_seconds_bucket{asset_pair=~\"$asset_pair\"}[5m])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "Latency (seconds)",
+          "logBase": 1,
+          "min": 0,
+          "show": true
+        }
+      ],
+      "thresholds": [
+        {
+          "value": 5,
+          "colorMode": "critical",
+          "op": "gt",
+          "fill": true,
+          "line": true,
+          "yaxis": "left"
+        }
+      ],
+      "legend": {"alignAsTable": true, "current": true, "max": true, "avg": true, "values": true}
+    },
+    {
+      "id": 2,
+      "title": "Recall on Confirmed Wash Trades",
+      "description": "Fraction of manually-confirmed wash trading events that the system detected (scored >= 70). Target: >= 0.85.",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "(\n  sum(increase(ledgerlens_confirmed_wash_trades_total{asset_pair=~\"$asset_pair\"}[24h]))\n  /\n  (\n    sum(increase(ledgerlens_confirmed_wash_trades_total{asset_pair=~\"$asset_pair\"}[24h]))\n    + sum(increase(ledgerlens_false_negative_wash_trades_total{asset_pair=~\"$asset_pair\"}[24h]))\n    + 0.0001\n  )\n)",
+          "legendFormat": "recall",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "displayMode": "lcd",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {
+              "color": "red",
+              "value": null
+            },
+            {
+              "color": "yellow",
+              "value": 0.7
+            },
+            {
+              "color": "green",
+              "value": 0.85
+            }
+          ]
+        }
+      },
+      "unit": "percentunit",
+      "decimals": 3
+    },
+    {
+      "id": 3,
+      "title": "False Positive Rate on Clean Wallets",
+      "description": "Fraction of manually-confirmed clean wallets that the system flagged as suspicious. Target: < 0.05 (< 5%).",
+      "type": "stat",
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "(\n  sum(increase(ledgerlens_false_positive_wallets_total{asset_pair=~\"$asset_pair\"}[24h]))\n  /\n  (\n    sum(increase(ledgerlens_confirmed_clean_wallets_total{asset_pair=~\"$asset_pair\"}[24h]))\n    + 0.0001\n  )\n)",
+          "legendFormat": "false_positive_rate",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "displayMode": "lcd",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {
+              "color": "green",
+              "value": null
+            },
+            {
+              "color": "yellow",
+              "value": 0.05
+            },
+            {
+              "color": "red",
+              "value": 0.1
+            }
+          ]
+        }
+      },
+      "unit": "percentunit",
+      "decimals": 3
+    },
+    {
+      "id": 4,
+      "title": "Benford Computation Throughput (pairs/second)",
+      "description": "Rate of Benford computations across all asset pairs. Indicates data ingestion and feature computation capacity.",
+      "type": "graph",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(rate(ledgerlens_benford_computation_total{asset_pair=~\"$asset_pair\"}[5m])) by (asset_pair)",
+          "legendFormat": "{{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "ops",
+          "label": "Computations/sec",
+          "logBase": 1,
+          "min": 0,
+          "show": true
+        }
+      ],
+      "legend": {"alignAsTable": true, "current": true, "max": true, "avg": true, "values": true}
+    },
+    {
+      "id": 5,
+      "title": "Alert Threshold Drift (RL Controller)",
+      "description": "Difference between the current adaptive threshold (RL controller) and its 30-day rolling mean. Positive = currently more permissive; negative = currently stricter.",
+      "type": "graph",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "(\n  ledgerlens_rl_threshold_current{asset_pair=~\"$asset_pair\"}\n  -\n  avg_over_time(ledgerlens_rl_threshold_current{asset_pair=~\"$asset_pair\"}[30d])\n)",
+          "legendFormat": "{{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Threshold Drift (points)",
+          "logBase": 1,
+          "show": true
+        }
+      ],
+      "legend": {"alignAsTable": true, "current": true, "max": true, "avg": true, "values": true}
+    },
+    {
+      "id": 6,
+      "title": "Confirmed Wash Trades (24h cumulative)",
+      "description": "Cumulative count of manually-confirmed wash trading events in the last 24 hours per asset pair.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(ledgerlens_confirmed_wash_trades_total{asset_pair=~\"$asset_pair\"}[24h]))",
+          "legendFormat": "confirmed_wash_trades",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "unit": "short",
+      "decimals": 0
+    },
+    {
+      "id": 7,
+      "title": "Confirmed Clean Wallets (24h cumulative)",
+      "description": "Cumulative count of manually-confirmed clean/non-fraudulent wallets in the last 24 hours per asset pair.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(ledgerlens_confirmed_clean_wallets_total{asset_pair=~\"$asset_pair\"}[24h]))",
+          "legendFormat": "confirmed_clean_wallets",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "unit": "short",
+      "decimals": 0
+    },
+    {
+      "id": 8,
+      "title": "Scoring Errors (24h)",
+      "description": "Count of scoring errors in the last 24 hours (indicates system health issues).",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(ledgerlens_scoring_errors_total{asset_pair=~\"$asset_pair\"}[24h]))",
+          "legendFormat": "errors",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {
+              "color": "green",
+              "value": null
+            },
+            {
+              "color": "yellow",
+              "value": 1
+            },
+            {
+              "color": "red",
+              "value": 5
+            }
+          ]
+        }
+      },
+      "unit": "short",
+      "decimals": 0
+    },
+    {
+      "id": 9,
+      "title": "P99 Latency Exceeding 5s Alert Status",
+      "description": "Alert fires when p99 scoring latency > 5s for 10+ minutes. Green = all clear; red = alert active.",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "ALERTS{alertname=\"ScoringLatencyP99High\",asset_pair=~\"$asset_pair\"}",
+          "legendFormat": "{{asset_pair}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {
+              "color": "green",
+              "value": null
+            },
+            {
+              "color": "red",
+              "value": 1
+            }
+          ]
+        }
+      },
+      "unit": "short",
+      "decimals": 0
+    }
+  ]
+}
