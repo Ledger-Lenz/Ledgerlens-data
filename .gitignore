@@ -14,4 +14,7 @@ models/optuna_studies.db
 models/best_params_*.json
 reports/
 
+# mutmut mutation testing cache
+.mutmut-cache
+
 .DS_Store
