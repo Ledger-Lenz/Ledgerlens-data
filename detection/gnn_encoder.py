@@ -439,6 +439,117 @@ class GNNEncoder:
 
 
 # ---------------------------------------------------------------------------
+# Heterogeneous GNN encoder (Issue #186)
+# ---------------------------------------------------------------------------
+
+if _TORCH_AVAILABLE:
+
+    class _HeteroGNNModel(nn.Module):
+        """HeteroConv GNN operating on wallet/asset/amm_pool HeteroData graphs."""
+
+        def __init__(self, hidden_channels: int, out_channels: int) -> None:
+            super().__init__()
+            from torch_geometric.nn import HeteroConv, SAGEConv as _SAGEConv
+
+            self.conv1 = HeteroConv(
+                {
+                    ("wallet", "traded", "asset"): _SAGEConv((-1, -1), hidden_channels, aggr="mean"),
+                    ("wallet", "provided_liquidity", "amm_pool"): _SAGEConv(
+                        (-1, -1), hidden_channels, aggr="mean"
+                    ),
+                    ("wallet", "co_traded_with", "wallet"): _SAGEConv(
+                        (-1, -1), hidden_channels, aggr="mean"
+                    ),
+                },
+                aggr="sum",
+            )
+            self.conv2 = HeteroConv(
+                {
+                    ("wallet", "traded", "asset"): _SAGEConv((-1, -1), out_channels, aggr="mean"),
+                    ("wallet", "provided_liquidity", "amm_pool"): _SAGEConv(
+                        (-1, -1), out_channels, aggr="mean"
+                    ),
+                    ("wallet", "co_traded_with", "wallet"): _SAGEConv(
+                        (-1, -1), out_channels, aggr="mean"
+                    ),
+                },
+                aggr="sum",
+            )
+
+        def forward(self, x_dict, edge_index_dict):
+            x_dict = self.conv1(x_dict, edge_index_dict)
+            x_dict = {k: F.relu(v) for k, v in x_dict.items()}
+            x_dict = self.conv2(x_dict, edge_index_dict)
+            return x_dict
+
+else:
+    _HeteroGNNModel = None  # type: ignore[assignment,misc]
+
+
+class HeteroGNNEncoder:
+    """Heterogeneous GNN encoder for wallet/asset/amm_pool graphs.
+
+    Accepts a ``torch_geometric.data.HeteroData`` object (as produced by
+    ``detection.wallet_graph.build_hetero_graph``) and returns per-node-type
+    embedding dicts.
+
+    Parameters
+    ----------
+    embedding_dim:
+        Output embedding dimensionality (default: ``config.GNN_EMBEDDING_DIM``).
+    hidden_dim:
+        Hidden layer size (default: ``config.GNN_HIDDEN_DIM``).
+    random_state:
+        Seed for reproducible weight initialisation.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int | None = None,
+        hidden_dim: int | None = None,
+        random_state: int = 42,
+    ) -> None:
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("torch and torch_geometric are required for HeteroGNNEncoder")
+        self.embedding_dim = embedding_dim or config.GNN_EMBEDDING_DIM
+        self.hidden_dim = hidden_dim or config.GNN_HIDDEN_DIM
+
+        torch.manual_seed(random_state)
+        self._model = _HeteroGNNModel(
+            hidden_channels=self.hidden_dim,
+            out_channels=self.embedding_dim,
+        )
+        self._model.eval()
+
+    def encode(self, hetero_data) -> dict:
+        """Run a forward pass and return embeddings as ``{node_type: np.ndarray}``.
+
+        Parameters
+        ----------
+        hetero_data:
+            A ``HeteroData`` produced by ``build_hetero_graph``.
+
+        Returns
+        -------
+        dict
+            Maps node type string → ``np.ndarray`` of shape ``(N, embedding_dim)``.
+        """
+        if not _TORCH_AVAILABLE or self._model is None:
+            raise RuntimeError("torch and torch_geometric are required")
+
+        x_dict = {k: hetero_data[k].x for k in hetero_data.node_types if hetero_data[k].x is not None}
+        edge_index_dict = {
+            et: hetero_data[et].edge_index
+            for et in hetero_data.edge_types
+        }
+
+        with torch.no_grad():
+            out = self._model(x_dict, edge_index_dict)
+
+        return {k: v.cpu().numpy().astype(np.float32) for k, v in out.items()}
+
+
+# ---------------------------------------------------------------------------
 # Contrastive pre-training (used by model_training --with-gnn)
 # ---------------------------------------------------------------------------
 
@@ -541,6 +652,299 @@ def pretrain_gnn_contrastive(
     encoder._embedding_cache.clear()
     logger.info("GNN pre-training complete — final loss: %.6f", loss_curve[-1] if loss_curve else 0)
     return loss_curve
+
+
+# ---------------------------------------------------------------------------
+# Temporal GNN (Issue #187) — TGAT-style time-aware attention layer
+# ---------------------------------------------------------------------------
+
+# Unix-second bounds for timestamp validation
+_TS_MIN = 1420070400   # 2015-01-01T00:00:00Z
+_TS_MAX = 2208988800   # 2040-01-01T00:00:00Z
+
+# Per-wallet memory cap in bytes (~1 MB)
+_WALLET_MEMORY_MAX_BYTES = 1 * 1024 * 1024
+
+
+def _validate_timestamp(ts: float) -> float:
+    """Clamp and validate a trade timestamp (Unix seconds, 2015–2040)."""
+    if not (_TS_MIN <= ts <= _TS_MAX):
+        raise ValueError(
+            f"Trade timestamp {ts} out of plausible range [{_TS_MIN}, {_TS_MAX}]"
+        )
+    return float(ts)
+
+
+if _TORCH_AVAILABLE:
+
+    class _FunctionalTimeEncoding(nn.Module):
+        """Functional Time Encoding (FTE) from TGAT (Xu et al., 2020, ICLR).
+
+        Maps a scalar time delta to a ``d``-dimensional vector using a learnable
+        linear projection of cosine-transformed basis functions — NOT positional
+        sinusoids.
+        """
+
+        def __init__(self, d: int) -> None:
+            super().__init__()
+            self.d = d
+            # Learnable basis frequencies and phase offset
+            self.w = nn.Parameter(torch.randn(d))
+            self.b = nn.Parameter(torch.zeros(d))
+
+        def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
+            # delta_t: (...,) → (..., d)
+            delta_t = delta_t.unsqueeze(-1)              # (..., 1)
+            return torch.cos(self.w * delta_t + self.b)  # (..., d)
+
+    class TemporalGraphAttentionLayer(nn.Module):
+        """Single TGAT-style temporal attention layer.
+
+        For each target node the layer:
+        1. Computes time deltas between the target timestamp and each neighbour
+           timestamp.
+        2. Encodes deltas via FTE.
+        3. Concatenates the neighbour feature with its time encoding and projects
+           to a query/key/value triple.
+        4. Computes attention weights and produces a context vector.
+        5. Concatenates the context with the target's own feature and applies a
+           final linear projection.
+
+        Parameters
+        ----------
+        in_dim:
+            Input node feature dimensionality.
+        time_dim:
+            Dimensionality of the FTE time encoding.
+        out_dim:
+            Output embedding dimensionality.
+        n_heads:
+            Number of attention heads.
+        """
+
+        def __init__(
+            self,
+            in_dim: int,
+            time_dim: int,
+            out_dim: int,
+            n_heads: int = 2,
+        ) -> None:
+            super().__init__()
+            self.in_dim = in_dim
+            self.time_dim = time_dim
+            self.out_dim = out_dim
+            self.n_heads = n_heads
+            head_dim = out_dim // n_heads
+
+            self.time_enc = _FunctionalTimeEncoding(time_dim)
+            proj_in = in_dim + time_dim
+            self.q_proj = nn.Linear(in_dim, head_dim * n_heads)
+            self.k_proj = nn.Linear(proj_in, head_dim * n_heads)
+            self.v_proj = nn.Linear(proj_in, head_dim * n_heads)
+            self.out_proj = nn.Linear(in_dim + head_dim * n_heads, out_dim)
+            self._scale = head_dim ** -0.5
+
+        def forward(
+            self,
+            src_feat: torch.Tensor,
+            nbr_feats: torch.Tensor,
+            delta_ts: torch.Tensor,
+        ) -> torch.Tensor:
+            """Compute attention-weighted context for *src_feat*.
+
+            Parameters
+            ----------
+            src_feat : (D,)   — target node feature
+            nbr_feats : (K, D) — neighbour node features
+            delta_ts : (K,)   — time deltas (target_ts - neighbour_ts), seconds
+
+            Returns
+            -------
+            torch.Tensor
+                Shape ``(out_dim,)``.
+            """
+            if nbr_feats.size(0) == 0:
+                return F.relu(self.out_proj(
+                    torch.cat([src_feat, torch.zeros(self.out_proj.in_features - self.in_dim)])
+                ))
+
+            time_emb = self.time_enc(delta_ts)                 # (K, time_dim)
+            nbr_with_time = torch.cat([nbr_feats, time_emb], dim=-1)  # (K, in_dim + time_dim)
+
+            Q = self.q_proj(src_feat.unsqueeze(0))             # (1, H*head_dim)
+            K = self.k_proj(nbr_with_time)                     # (K, H*head_dim)
+            V = self.v_proj(nbr_with_time)                     # (K, H*head_dim)
+
+            B, H, hd = 1, self.n_heads, self.out_dim // self.n_heads
+            Q = Q.view(B, H, hd)
+            K = K.view(-1, H, hd).permute(1, 0, 2)            # (H, K, hd)
+            V = V.view(-1, H, hd).permute(1, 0, 2)            # (H, K, hd)
+
+            attn = torch.softmax(
+                (Q.permute(1, 0, 2) @ K.transpose(-2, -1)) * self._scale, dim=-1
+            )                                                   # (H, 1, K)
+            ctx = (attn @ V).squeeze(-2).view(1, H * hd)       # (1, out_dim)
+
+            combined = torch.cat([src_feat.unsqueeze(0), ctx], dim=-1)  # (1, in_dim + out_dim)
+            return F.relu(self.out_proj(combined)).squeeze(0)   # (out_dim,)
+
+else:
+    _FunctionalTimeEncoding = None      # type: ignore[assignment,misc]
+    TemporalGraphAttentionLayer = None  # type: ignore[assignment]
+
+
+class TemporalGNNEncoder:
+    """TGAT-style encoder that produces temporally-aware wallet embeddings.
+
+    The encoder maintains a per-wallet edge memory of the last ``max_edges_per_wallet``
+    timestamped trade edges.  Memory state is bounded to ``_WALLET_MEMORY_MAX_BYTES``
+    per wallet and is fully serialisable for checkpointing.
+
+    Trade timestamps are validated as Unix seconds in [2015, 2040] before
+    encoding to prevent adversarial time injection.
+
+    Parameters
+    ----------
+    in_dim:
+        Input feature dimensionality (default: 5 — same as ``GNNEncoder``).
+    time_dim:
+        Time encoding dimension (default: 16).
+    out_dim:
+        Output embedding dimensionality (default: ``config.GNN_EMBEDDING_DIM``).
+    n_heads:
+        Attention heads (default: 2).
+    max_edges_per_wallet:
+        Maximum timestamped edges retained per wallet (default: 200).
+    random_state:
+        Seed for reproducible weight initialisation.
+
+    Reference
+    ---------
+    Xu et al. (2020) — Inductive Representation Learning on Temporal Graphs
+    (TGAT), ICLR 2020.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = 5,
+        time_dim: int = 16,
+        out_dim: int | None = None,
+        n_heads: int = 2,
+        max_edges_per_wallet: int = 200,
+        random_state: int = 42,
+    ) -> None:
+        if not _TORCH_AVAILABLE:
+            raise RuntimeError("torch and torch_geometric are required for TemporalGNNEncoder")
+
+        self.in_dim = in_dim
+        self.time_dim = time_dim
+        self.out_dim = out_dim or config.GNN_EMBEDDING_DIM
+        self.max_edges_per_wallet = max_edges_per_wallet
+
+        torch.manual_seed(random_state)
+        self._layer = TemporalGraphAttentionLayer(
+            in_dim=in_dim,
+            time_dim=time_dim,
+            out_dim=self.out_dim,
+            n_heads=n_heads,
+        )
+        self._layer.eval()
+
+        # Memory: wallet → list of (src_feat, dst_feat, timestamp)
+        # Stored as lists of floats to stay serialisable (no tensors).
+        self._memory: dict[str, list[tuple[list[float], list[float], float]]] = {}
+
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+
+    def observe_edge(
+        self,
+        src_wallet: str,
+        dst_wallet: str,
+        src_features: "list[float] | np.ndarray",
+        dst_features: "list[float] | np.ndarray",
+        timestamp: float,
+    ) -> None:
+        """Record a timestamped edge into the per-wallet memory.
+
+        Raises ``ValueError`` if ``timestamp`` is outside the valid range.
+        The memory is capped at ``max_edges_per_wallet`` entries to bound RAM
+        and at ``_WALLET_MEMORY_MAX_BYTES`` bytes.
+        """
+        timestamp = _validate_timestamp(timestamp)
+        entry = (list(src_features), list(dst_features), timestamp)
+
+        for wallet in (src_wallet, dst_wallet):
+            history = self._memory.setdefault(wallet, [])
+            history.append(entry)
+            if len(history) > self.max_edges_per_wallet:
+                history.pop(0)
+            # Hard byte cap — trim oldest until under limit
+            import sys
+
+            while history and sys.getsizeof(history) > _WALLET_MEMORY_MAX_BYTES:
+                history.pop(0)
+
+    def encode(self, wallet: str, query_timestamp: float) -> np.ndarray:
+        """Produce a temporal embedding for *wallet* at *query_timestamp*.
+
+        Parameters
+        ----------
+        wallet:
+            Wallet address (must have at least one entry in memory to be
+            non-trivial; returns zeros otherwise).
+        query_timestamp:
+            The reference time (Unix seconds) for computing time deltas.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(out_dim,)``, dtype ``float32``.
+        """
+        query_timestamp = _validate_timestamp(query_timestamp)
+        history = self._memory.get(wallet, [])
+
+        src_feat = torch.zeros(self.in_dim, dtype=torch.float32)
+        if not history:
+            return np.zeros(self.out_dim, dtype=np.float32)
+
+        nbr_feats_list = []
+        delta_ts_list = []
+        for src_f, _dst_f, ts in history:
+            nbr_feats_list.append(src_f)
+            delta_ts_list.append(query_timestamp - ts)
+
+        nbr_feats = torch.tensor(nbr_feats_list, dtype=torch.float32)
+        delta_ts = torch.tensor(delta_ts_list, dtype=torch.float32)
+
+        with torch.no_grad():
+            emb = self._layer(src_feat, nbr_feats, delta_ts)
+
+        return emb.cpu().numpy().astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Serialisation (for checkpointing)
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        """Return a JSON-serialisable state dict for checkpointing."""
+        return {
+            "layer": {k: v.tolist() for k, v in self._layer.state_dict().items()},
+            "memory": {w: list(entries) for w, entries in self._memory.items()},
+            "config": {
+                "in_dim": self.in_dim,
+                "time_dim": self.time_dim,
+                "out_dim": self.out_dim,
+                "max_edges_per_wallet": self.max_edges_per_wallet,
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore from a dict returned by :meth:`state_dict`."""
+        layer_tensors = {k: torch.tensor(v) for k, v in state["layer"].items()}
+        self._layer.load_state_dict(layer_tensors)
+        self._memory = {w: [tuple(e) for e in entries] for w, entries in state["memory"].items()}
 
 
 # ---------------------------------------------------------------------------

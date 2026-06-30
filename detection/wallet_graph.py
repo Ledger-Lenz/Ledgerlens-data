@@ -517,178 +517,164 @@ def _avg_funding_depth(graph: nx.DiGraph, members: list[str]) -> float:
     return float(sum(depths) / len(depths)) if depths else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Incremental wallet graph (Issue #203)
-# ---------------------------------------------------------------------------
+def build_hetero_graph(
+    activities: "Iterable[AccountActivity] | None" = None,
+    trades: "pd.DataFrame | None" = None,
+    asset_features: "Mapping[str, Sequence[float]] | None" = None,
+    amm_pool_features: "Mapping[str, Sequence[float]] | None" = None,
+    *,
+    co_trade_window_hours: float = 24.0,
+    hash_wallet_ids: bool = True,
+):
+    """Build a heterogeneous graph with wallet, asset, and AMM pool node types.
 
+    Node types
+    ----------
+    - ``wallet``   — 37-feature vector (zeros when wallet_features not supplied)
+    - ``asset``    — (total_volume_30d, unique_traders_30d, benford_mad_30d)
+    - ``amm_pool`` — (tvl, fee_rate, volume_24h)
 
-class IncrementalWalletGraph:
-    """Thread-safe in-memory wallet graph with incremental edge updates.
+    Edge types
+    ----------
+    - ``(wallet, traded, asset)``               — wallet traded the asset
+    - ``(wallet, provided_liquidity, amm_pool)`` — wallet provided pool liquidity
+    - ``(wallet, co_traded_with, wallet)``       — wallets co-active on the same pair
 
-    Wallet IDs are normalised to lowercase on ingestion to prevent duplicate
-    nodes from capitalisation variants.  The graph stores a ``last_seen``
-    timestamp on every edge so that :meth:`remove_stale_edges` can identify
-    and evict edges that have not been refreshed within the configured window.
+    Wallet addresses are SHA-256-hashed before use as node IDs when
+    ``hash_wallet_ids=True`` (default) to prevent re-identification from model
+    artefacts.
 
-    Prometheus gauges ``wallet_graph_nodes_total`` and
-    ``wallet_graph_edges_total`` are updated on every mutating operation.
-    ``wallet_graph_stale_edges_total`` is updated after each stale-removal pass.
+    Returns a ``torch_geometric.data.HeteroData`` object.
     """
+    try:
+        import torch
+        from torch_geometric.data import HeteroData
+    except ImportError as exc:
+        raise ImportError("PyG output requires torch and torch-geometric") from exc
 
-    def __init__(self) -> None:
-        self._graph: nx.DiGraph = nx.DiGraph()
-        self._lock = threading.Lock()
+    import hashlib
 
-    # ------------------------------------------------------------------
-    # Mutating operations
-    # ------------------------------------------------------------------
+    def _hash_wallet(w: str) -> str:
+        if not hash_wallet_ids:
+            return w
+        return hashlib.sha256(w.encode("utf-8")).hexdigest()
 
-    def add_trade_edge(self, src_wallet: str, dst_wallet: str, trade: dict) -> None:
-        """Add or refresh a directed trade edge. O(1) amortised per edge.
+    wallet_set: set[str] = set()
+    asset_set: set[str] = set()
+    pool_set: set[str] = set()
 
-        ``trade`` may contain ``ledger_close_time`` (str, pd.Timestamp, or
-        datetime) which is stored as ``last_seen`` for staleness tracking.
-        """
-        src = src_wallet.lower()
-        dst = dst_wallet.lower()
-        ts = _parse_edge_timestamp(trade.get("ledger_close_time", datetime.now(UTC)))
-        ts_str = ts.isoformat()
+    traded_edges: list[tuple[str, str]] = []
+    liquidity_edges: list[tuple[str, str]] = []
+    co_traded_edges: list[tuple[str, str]] = []
 
-        with self._lock:
-            if self._graph.has_edge(src, dst):
-                attrs = self._graph[src][dst]
-                attrs["weight"] = attrs.get("weight", 1) + 1
-                attrs["last_seen"] = ts_str
-            else:
-                self._graph.add_edge(
-                    src,
-                    dst,
-                    edge_type="co_trade",
-                    weight=1,
-                    timestamp=ts_str,
-                    last_seen=ts_str,
+    if activities is not None:
+        for act in activities:
+            wallet_set.add(_hash_wallet(act.account_id))
+
+    if trades is not None and not trades.empty:
+        required = {"base_account", "counter_account", "ledger_close_time"}
+        if required.issubset(trades.columns):
+            frame = trades.copy()
+            frame["ledger_close_time"] = pd.to_datetime(frame["ledger_close_time"], utc=True)
+
+            for _, row in frame.iterrows():
+                bw = _hash_wallet(str(row["base_account"]))
+                cw = _hash_wallet(str(row["counter_account"]))
+                wallet_set.update((bw, cw))
+
+                for asset_col in ("base_asset", "counter_asset"):
+                    if asset_col in row and pd.notna(row.get(asset_col)):
+                        asset_id = str(row[asset_col])
+                        asset_set.add(asset_id)
+                        traded_edges.append((bw, asset_id))
+                        traded_edges.append((cw, asset_id))
+
+                if "pool_id" in row and pd.notna(row.get("pool_id")):
+                    pool_id = str(row["pool_id"])
+                    pool_set.add(pool_id)
+                    liquidity_edges.append((bw, pool_id))
+                    liquidity_edges.append((cw, pool_id))
+
+            if "pair_id" not in frame.columns and {"base_asset", "counter_asset"}.issubset(
+                frame.columns
+            ):
+                frame["pair_id"] = (
+                    frame["base_asset"].astype(str) + "/" + frame["counter_asset"].astype(str)
                 )
-            self._update_gauges()
 
-    def remove_stale_edges(self, max_age_hours: float | None = None) -> int:
-        """Remove edges whose ``last_seen`` is older than *max_age_hours*.
+            if "pair_id" in frame.columns:
+                window = pd.Timedelta(hours=co_trade_window_hours)
+                for _, pair_df in frame.groupby("pair_id", sort=False):
+                    records = pair_df.sort_values("ledger_close_time").to_dict("records")
+                    for li, left in enumerate(records):
+                        left_time = left["ledger_close_time"]
+                        active = {
+                            _hash_wallet(str(left["base_account"])),
+                            _hash_wallet(str(left["counter_account"])),
+                        }
+                        for right in records[li + 1 :]:
+                            if right["ledger_close_time"] - left_time > window:
+                                break
+                            active.update((
+                                _hash_wallet(str(right["base_account"])),
+                                _hash_wallet(str(right["counter_account"])),
+                            ))
+                        for a, b in combinations(sorted(active), 2):
+                            co_traded_edges.append((a, b))
+                            co_traded_edges.append((b, a))
 
-        Defaults to ``config.GRAPH_STALE_EDGE_MAX_AGE_HOURS`` (168 h / 7 days).
-        Isolated nodes that result from edge removal are also pruned.
-        Returns the number of edges removed.
-        """
-        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
-        cutoff = datetime.now(UTC) - timedelta(hours=hours)
+    wallet_idx = {w: i for i, w in enumerate(sorted(wallet_set))}
+    asset_idx = {a: i for i, a in enumerate(sorted(asset_set))}
+    pool_idx = {p: i for i, p in enumerate(sorted(pool_set))}
 
-        with self._lock:
-            stale = [
-                (u, v)
-                for u, v, d in self._graph.edges(data=True)
-                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
-            ]
-            self._graph.remove_edges_from(stale)
-            isolated = list(nx.isolates(self._graph))
-            self._graph.remove_nodes_from(isolated)
-            count = len(stale)
-            self._update_gauges(stale_count=count)
+    _WALLET_FEAT_DIM = 37
+    _ASSET_FEAT_DIM = 3   # total_volume_30d, unique_traders_30d, benford_mad_30d
+    _POOL_FEAT_DIM = 3    # tvl, fee_rate, volume_24h
 
-        return count
+    data = HeteroData()
 
-    # ------------------------------------------------------------------
-    # Subgraph extraction
-    # ------------------------------------------------------------------
+    import torch
 
-    def get_ego_subgraph(self, wallet_id: str, hops: int = 2) -> nx.DiGraph:
-        """Return the *hops*-hop ego subgraph for *wallet_id*.
+    data["wallet"].x = torch.zeros((len(wallet_idx), _WALLET_FEAT_DIM), dtype=torch.float32)
 
-        Uses BFS over the underlying undirected view so both incoming and
-        outgoing edges contribute neighbourhood.  Designed to run in < 10 ms
-        for wallets with up to 500 direct neighbours at ``hops=2``.
+    asset_x = torch.zeros((len(asset_idx), _ASSET_FEAT_DIM), dtype=torch.float32)
+    if asset_features:
+        for asset, feats in asset_features.items():
+            if asset in asset_idx:
+                asset_x[asset_idx[asset]] = torch.tensor(
+                    list(feats)[:_ASSET_FEAT_DIM], dtype=torch.float32
+                )
+    data["asset"].x = asset_x
 
-        Returns an empty DiGraph when the wallet is not in the graph.
-        """
-        node = wallet_id.lower()
-        with self._lock:
-            if node not in self._graph:
-                return nx.DiGraph()
+    pool_x = torch.zeros((len(pool_idx), _POOL_FEAT_DIM), dtype=torch.float32)
+    if amm_pool_features:
+        for pool, feats in amm_pool_features.items():
+            if pool in pool_idx:
+                pool_x[pool_idx[pool]] = torch.tensor(
+                    list(feats)[:_POOL_FEAT_DIM], dtype=torch.float32
+                )
+    data["amm_pool"].x = pool_x
 
-            visited: set[str] = {node}
-            frontier: set[str] = {node}
-            undirected = self._graph.to_undirected(as_view=True)
-            for _ in range(hops):
-                next_frontier: set[str] = set()
-                for n in frontier:
-                    for nb in undirected.neighbors(n):
-                        if nb not in visited:
-                            visited.add(nb)
-                            next_frontier.add(nb)
-                if not next_frontier:
-                    break
-                frontier = next_frontier
+    def _edge_index(pairs: list[tuple[str, str]], src_map: dict, dst_map: dict):
+        valid = [(src_map[s], dst_map[d]) for s, d in pairs if s in src_map and d in dst_map]
+        if not valid:
+            return torch.empty((2, 0), dtype=torch.long)
+        return torch.tensor(valid, dtype=torch.long).t().contiguous()
 
-            return self._graph.subgraph(visited).copy()
+    data["wallet", "traded", "asset"].edge_index = _edge_index(
+        traded_edges, wallet_idx, asset_idx
+    )
+    data["wallet", "provided_liquidity", "amm_pool"].edge_index = _edge_index(
+        liquidity_edges, wallet_idx, pool_idx
+    )
+    data["wallet", "co_traded_with", "wallet"].edge_index = _edge_index(
+        co_traded_edges, wallet_idx, wallet_idx
+    )
 
-    # ------------------------------------------------------------------
-    # Metrics accessors
-    # ------------------------------------------------------------------
-
-    @property
-    def node_count(self) -> int:
-        with self._lock:
-            return self._graph.number_of_nodes()
-
-    @property
-    def edge_count(self) -> int:
-        with self._lock:
-            return self._graph.number_of_edges()
-
-    def stale_edge_count(self, max_age_hours: float | None = None) -> int:
-        """Count edges that would be removed by :meth:`remove_stale_edges`."""
-        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
-        cutoff = datetime.now(UTC) - timedelta(hours=hours)
-        with self._lock:
-            return sum(
-                1
-                for _, _, d in self._graph.edges(data=True)
-                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
-            )
-
-    def graph_metrics(self, max_age_hours: float | None = None) -> dict:
-        """Return ``{nodes, edges, stale_edges}`` in a single lock acquisition."""
-        hours = max_age_hours if max_age_hours is not None else config.GRAPH_STALE_EDGE_MAX_AGE_HOURS
-        cutoff = datetime.now(UTC) - timedelta(hours=hours)
-        with self._lock:
-            stale = sum(
-                1
-                for _, _, d in self._graph.edges(data=True)
-                if _parse_edge_timestamp(d.get("last_seen", d.get("timestamp"))) < cutoff
-            )
-            return {
-                "nodes": self._graph.number_of_nodes(),
-                "edges": self._graph.number_of_edges(),
-                "stale_edges": stale,
-            }
-
-    # ------------------------------------------------------------------
-    # Read-only graph access
-    # ------------------------------------------------------------------
-
-    def snapshot(self) -> nx.DiGraph:
-        """Return a copy of the current graph (safe for read-only callers)."""
-        with self._lock:
-            return self._graph.copy()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _update_gauges(self, stale_count: int | None = None) -> None:
-        if _graph_nodes_total is not None:
-            _graph_nodes_total.set(self._graph.number_of_nodes())
-        if _graph_edges_total is not None:
-            _graph_edges_total.set(self._graph.number_of_edges())
-        if stale_count is not None and _graph_stale_edges_total is not None:
-            _graph_stale_edges_total.set(stale_count)
+    data._wallet_idx = wallet_idx
+    data._asset_idx = asset_idx
+    data._pool_idx = pool_idx
+    return data
 
 
 def build_co_trade_graph(trades: pd.DataFrame, window_hours: float = 24.0) -> nx.DiGraph:
