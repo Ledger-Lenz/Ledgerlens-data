@@ -429,3 +429,106 @@ Tests cover:
 - Per-annotator noise rate alert fires at > 20 %
 - Quarantine log contains `noise_score` and `annotator_id` for every quarantined item
 - Quarantined items are never silently deleted
+
+## Epistemic vs Aleatoric Uncertainty (Issue #190)
+
+### Background
+
+Prior to this change, the annotation queue ranked samples using a simple entropy
+heuristic applied to ensemble predicted probabilities. This conflates two
+fundamentally different sources of uncertainty:
+
+| Type | Cause | Action |
+|---|---|---|
+| **Epistemic** | Model doesn't know — insufficient training data in this region | Annotate: more data will change the model's belief |
+| **Aleatoric** | Data is inherently ambiguous — irreducible noise in the sample | Do NOT annotate: no amount of labelling will help |
+
+Prioritising only epistemic uncertainty focuses annotator effort on samples where
+labelling genuinely improves the model. Samples with high aleatoric uncertainty
+are inherently noisy and should be deprioritised or discarded.
+
+### Implementation
+
+#### Monte Carlo Dropout (Gal & Ghahramani, 2016)
+
+Epistemic uncertainty is estimated by running N=50 stochastic forward passes
+through the model with dropout enabled at test time (MC Dropout). The variance
+of predictions across passes measures the model's uncertainty about its own
+parameters:
+
+```
+epistemic_uncertainty = Var_{t=1..N}[f(x; θ_t)]  ∈ [0, 1]
+```
+
+where `θ_t` denotes parameters sampled by activating dropout on pass `t`.
+
+When the MAML adapter (PyTorch) is available, MC Dropout is applied directly via
+`model.train()` mode on dropout layers. For the sklearn ensemble, epistemic
+uncertainty is approximated by the inter-model variance (ensemble disagreement).
+
+**Important**: MC Dropout is disabled in production scoring (`caller_id != "internal"`)
+to prevent inference-time variability from leaking model internals via a timing
+or output side-channel.
+
+#### Aleatoric Uncertainty
+
+Aleatoric uncertainty is estimated as the mean binary entropy of model predictions:
+
+```
+aleatoric_uncertainty = E_models[H(p)]  where  H(p) = -p log p - (1-p) log(1-p)
+```
+
+Samples near the decision boundary (p ≈ 0.5) have high entropy regardless of how
+much training data is added — these are genuinely ambiguous wallet behaviours.
+
+#### Filtering
+
+Samples where `aleatoric_uncertainty > ACTIVE_LEARNING_ALEATORIC_THRESHOLD`
+(default 0.25, configurable via env var) are filtered out before enqueuing. The
+remaining samples are sorted by descending epistemic uncertainty.
+
+### API
+
+```python
+from detection.model_inference import RiskScorer
+
+scorer = RiskScorer()
+feature_row = feature_matrix.loc["GABCD..."]
+
+epistemic = scorer.compute_epistemic_uncertainty(feature_row)  # [0, 1]
+aleatoric = scorer.compute_aleatoric_uncertainty(feature_row)  # [0, 1]
+```
+
+```python
+from detection.active_learning.annotation_queue import AnnotationQueue
+
+queue = AnnotationQueue()
+queue.push(
+    wallets=["GABCD...", "GXYZ..."],
+    strategy_name="epistemic_mc_dropout",
+    epistemic_uncertainties={"GABCD...": 0.8, "GXYZ...": 0.3},
+    aleatoric_uncertainties={"GABCD...": 0.1, "GXYZ...": 0.9},  # GXYZ filtered out
+)
+batch = queue.pop_batch(5)  # returns wallets ranked by epistemic uncertainty
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACTIVE_LEARNING_ALEATORIC_THRESHOLD` | `0.25` | Filter samples above this aleatoric uncertainty |
+| `ACTIVE_LEARNING_MC_DROPOUT_PASSES` | `50` | Number of stochastic forward passes |
+
+### Queue Output Fields
+
+`pop_batch` returns items with the following additional fields when uncertainty
+estimation was used:
+
+```json
+{
+  "wallet": "GABCD...",
+  "epistemic_uncertainty": 0.82,
+  "aleatoric_uncertainty": 0.11,
+  ...
+}
+```
