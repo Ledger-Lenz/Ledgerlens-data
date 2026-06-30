@@ -70,6 +70,9 @@ fastavro>=1.9.0
 # Cryptography (model artifact signing/verification)
 cryptography>=42.0.0
 
+# Active learning — approximate nearest-neighbour index (core-set selection, Issue #253)
+hnswlib>=0.8.0
+
 # Static type checking
 mypy>=1.10.0
 

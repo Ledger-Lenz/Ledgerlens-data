@@ -209,6 +209,7 @@ class ForensicReportGenerator:
         base_scores: dict[str, float] | None = None,
         co_trade_graph: nx.Graph | None = None,
         propagation_alpha: float = 0.15,
+        provenance: "dict[str, list[str]] | None" = None,
     ) -> ForensicReport:
         if risk_score_dict is None and feature_row is not None:
             risk_score_dict = self._scorer.score(feature_row)
@@ -226,7 +227,7 @@ class ForensicReportGenerator:
 
         benford_analysis = _build_benford_analysis(wallet_trades)
         trade_evidence = _select_anomalous_trades(wallet, wallet_trades, asset_pair)
-        enriched_shap = _enrich_shap(shap_values or [])
+        enriched_shap = _enrich_shap(shap_values or [], provenance=provenance)
 
         score_lower = max(0, score - 10)
         score_upper = min(100, score + 10)
@@ -347,18 +348,32 @@ def _select_anomalous_trades(
     return evidence
 
 
-def _enrich_shap(shap_values: list[dict]) -> list[dict]:
-    """Attach plain-English description to each SHAP entry."""
+def _enrich_shap(
+    shap_values: list[dict],
+    provenance: "dict[str, list[str]] | None" = None,
+) -> list[dict]:
+    """Attach plain-English description to each SHAP entry.
+
+    When *provenance* is provided (a feature_name → [trade_id, ...] mapping),
+    the top-5 entries also receive an ``evidence_links`` list of Horizon
+    explorer URLs, one per contributing trade ID.
+    """
     try:
         from detection.feature_engineering import FEATURE_DESCRIPTIONS
     except ImportError:
         FEATURE_DESCRIPTIONS = {}
 
     result = []
-    for entry in shap_values:
+    for i, entry in enumerate(shap_values):
         enriched = dict(entry)
         fname = entry.get("feature", "")
         enriched["description"] = FEATURE_DESCRIPTIONS.get(fname, fname)
+        if provenance is not None and i < 5:
+            trade_ids = provenance.get(fname, [])
+            horizon_base = config.HORIZON_URL.rstrip("/")
+            enriched["evidence_links"] = [
+                f"{horizon_base}/trades/{tid}" for tid in trade_ids
+            ]
         result.append(enriched)
     return result
 

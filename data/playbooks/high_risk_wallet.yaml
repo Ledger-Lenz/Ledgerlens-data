@@ -1,0 +1,66 @@
+# Incident response playbook for high-risk wallet alerts.
+#
+# Steps are executed in order by IncidentResponder.  Each step has a required
+# `action` key and optional `params`.  New steps may be appended; the order
+# must not be changed without updating the runbook in docs/incident_response.md.
+#
+# Severity trigger conditions (any one is sufficient):
+#   - risk_score > 90
+#   - benford_mad > 0.05
+#   - alert_type == "emergency_drift"
+
+name: high_risk_wallet
+version: "1.0"
+description: >
+  Automated first-response playbook for wallets that trigger a high-severity
+  LedgerLens alert.  Designed to preserve evidence, generate a preliminary
+  report, and route the incident to the on-call team within 60 seconds.
+
+severity_triggers:
+  risk_score_threshold: 90
+  benford_mad_threshold: 0.05
+  alert_types:
+    - high_risk_wallet
+    - emergency_drift
+
+steps:
+  - id: snapshot_risk_history
+    action: snapshot_risk_score_history
+    description: >
+      Capture a point-in-time snapshot of the wallet's risk score history
+      from the risk score store.  Stored as evidence in the incident record.
+    params:
+      lookback_days: 30
+
+  - id: generate_preliminary_report
+    action: generate_preliminary_forensic_report
+    description: >
+      Run the forensic report generator against the wallet using cached
+      features.  Must complete within 60 seconds of the alert firing.
+    params:
+      timeout_seconds: 60
+
+  - id: create_incident_record
+    action: create_db_incident_record
+    description: >
+      Persist an incident record to the database.  Idempotency key is
+      (wallet_hash, alert_fingerprint) — a duplicate alert does not create
+      a second record.
+    params:
+      status: open
+
+  - id: notify_webhook
+    action: post_webhook_notification
+    description: >
+      POST a JSON notification to the configured webhook endpoint (Slack,
+      PagerDuty, or generic).  Raw wallet addresses are replaced with their
+      SHA-256 hashed identifiers before transmission.
+    params:
+      include_report_summary: true
+      redact_wallet: true
+
+deduplication:
+  window_seconds: 3600
+  key_fields:
+    - wallet_hash
+    - alert_fingerprint

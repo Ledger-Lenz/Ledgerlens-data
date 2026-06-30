@@ -166,172 +166,61 @@ Each entry in `data/annotation_queue.json` carries an `annotation_hmac` field: H
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Model Inversion Attack Defence
+## Field-Level Encryption for Forensic Reports
 
-A model inversion attack allows an adversary to reconstruct features used in
-scoring by querying the model repeatedly and analyzing the gradients (or in
-discrete settings, the score deltas). In LedgerLens, an attacker could query
-the score for a wallet, remove one trade, re-query, and observe the delta to
-identify which individual trade was most anomalous. Repeated queries across
-variants reconstruct the full anomaly profile.
+Forensic reports (`detection/forensic_report.py`) contain raw Stellar wallet
+addresses that identify subjects under investigation.  To prevent premature
+exposure, wallet addresses should be encrypted at rest using AES-256-GCM
+field-level encryption provided by `utils/field_encryption.py`.
 
-### Output Perturbation (Laplace Mechanism)
+### Encryption Scheme
 
-`detection/model_inference.py::score()` applies **Laplace output perturbation**
-per external API call to defend against this attack. The mechanism:
+- **Algorithm**: AES-256-GCM (authenticated encryption with 128-bit tag).
+- **IV**: A fresh 12-byte random IV is generated per field per encryption call.
+  This guarantees that encrypting the same wallet address twice produces
+  different ciphertexts (IV-reuse attack prevention).
+- **Stored format**: `iv (12 bytes) || ciphertext || GCM tag (16 bytes)` as a
+  binary blob.
+- **Authentication**: Decryption raises `cryptography.exceptions.InvalidTag`
+  on any authentication failure.  Silent corruption is impossible.
 
-1. **Per-query random seed**: derived from `(caller_id, timestamp_bucket)` so
-   identical repeated queries produce different scores, preventing averaging.
-2. **Laplace noise**: drawn with scale `σ = sensitivity / ε`, where sensitivity
-   is the max score change from one trade (bounded at 100) and `ε` is the privacy
-   budget (default 1.0).
-3. **Clipping + rounding**: perturbed scores clipped to [0, 100] and rounded to
-   `SCORE_ROUNDING_GRANULARITY` (default 1 point).
+### Key Management
 
-**Internal pipeline calls** (e.g. `run_pipeline.py` → model training) use
-`caller_id="internal"` and are **not perturbed**, preserving model quality for
-batch operations.
-
-### Query Rate-Limiting
-
-`detection/risk_score_store.py::RiskScoreStore` tracks queries per
-`(caller_id, wallet_id)` pair. Once a caller exceeds `MODEL_INVERSION_QUERY_LIMIT`
-queries (default 100) on a wallet, subsequent API requests for that wallet return
-**429 Too Many Requests**. This prevents sustained gradient-based attacks.
-
-| Config Variable | Default | Description |
-|---|---|---|
-| `MODEL_INVERSION_QUERY_LIMIT` | `100` | Max queries per (caller, wallet) before 429 |
-| `MODEL_INVERSION_DP_EPSILON` | `1.0` | Privacy budget ε for Laplace mechanism |
-| `SCORE_ROUNDING_GRANULARITY` | `1` | Quantize scores to this granularity |
-
-### Seeding Prevents Averaging
-
-The seed derivation `hash(caller_id + timestamp_bucket)` ensures:
-- **Different results for identical queries**: Attacker's repeated score queries
-  get different noisy values, so averaging them doesn't converge to the truth.
-- **Reproducibility within a time window**: For testing / audit, the same
-  `(caller_id, timestamp)` always produces the same noise.
-
-### Example: Attacker Scenario
-
-```
-Attacker's intended attack:
-  Query 1: GET /score/G...wallet.../USDC:G.../XLM:native → score = 75
-  Remove last trade, re-query
-  Query 2: GET /score/G...wallet.../USDC:G.../XLM:native → score = 72
-  Delta = 3 points → identifies last trade as moderately anomalous
-
-With model inversion defence:
-  Query 1: score = 75 + Laplace(0, 100/ε) → 68 (noisy)
-  Query 2: score = 72 + Laplace(0, 100/ε) → 79 (different noise seed)
-  Delta = 11 points (includes noise) → cannot invert
-  After 100 queries: 429 Too Many Requests → rate limited
-```
-
----
-
-## Federated Learning Auditability (Issue #227)
-
-### Overview
-
-LedgerLens uses a federated learning architecture in which multiple participants
-train on local data and submit gradient updates to a central coordinator.  To
-satisfy regulatory requirements and enable post-incident investigation of
-Byzantine participants, every training round is recorded in a tamper-evident
-audit trail.
-
-### Information Recorded per Round
-
-Each row in the `federated_audit_trail` database table captures:
-
-| Field | Type | Description |
-|---|---|---|
-| `round_id` | SHA-256 hex | Deterministic hash of `(timestamp, sorted fingerprints, model_version)` — prevents sequential-ID manipulation |
-| `round_timestamp` | ISO-8601 UTC | When the round was recorded |
-| `participant_fingerprints` | JSON array | SHA-256 certificate fingerprints of every contributing participant |
-| `gradient_norms` | JSON object | `{"participant_id": l2_norm}` — scalar norms only, **never raw tensors** |
-| `aggregation_algorithm` | string | E.g. `"fedavg"`, `"staleness_weighted_fedavg"` |
-| `aggregate_model_hash` | SHA-256 hex | Hash of the post-aggregation global model weights |
-| `round_outcome` | string | `"success"` or `"abort"` |
-| `model_version` | integer | Monotonically increasing version counter after aggregation |
-| `participant_count` | integer | Number of contributors in this round |
-| `prev_hash` | SHA-256 hex | Hash of the previous record's canonical JSON — forms a Merkle chain |
-| `recorded_at` | datetime | DB insertion timestamp |
-
-### Security Invariants
-
-| Invariant | Enforcement |
-|---|---|
-| **No raw gradients** | `FederatedAuditTrail.record_round()` raises `TypeError` if any `gradient_norms` value is not a scalar. Raw tensors are rejected before reaching the DB. |
-| **Append-only records** | The application layer exposes no UPDATE or DELETE path for `federated_audit_trail`. Enforce DB-level row-security policies in production (e.g. PostgreSQL `GRANT INSERT` only). |
-| **Deterministic round ID** | `round_id = SHA-256(timestamp + sorted(fingerprints) + model_version)` — an attacker cannot insert a fake round without the hash changing. |
-| **Merkle chain** | `prev_hash` chains each record to its predecessor. Retroactive insertion or deletion breaks the chain and is detectable. |
-
-### Enabling the Audit Trail
-
-Attach a `FederatedAuditTrail` instance to `AsyncFederatedCoordinator`:
-
-```python
-from detection.federated.coordinator import AsyncFederatedCoordinator, FederatedAuditTrail
-
-audit = FederatedAuditTrail()          # uses RISK_SCORE_DB_URL by default
-coord = AsyncFederatedCoordinator(weight_dim=256)
-coord._audit = audit
-
-# Optionally register real certificate fingerprints (hex SHA-256 of cert DER)
-audit.set_participant_fingerprints({
-    "participant_alice": "aabbccddeeff...",
-    "participant_bob":   "11223344...",
-})
-```
-
-If `coord._audit` is `None` (the default), no audit records are written.
-
-### Query Tool
-
-`scripts/query_federated_audit.py` provides a CLI interface to the audit trail.
+Set `FORENSIC_REPORT_ENCRYPTION_KEY` to a 64-character lowercase hex string
+representing 32 random bytes:
 
 ```bash
-# Look up a specific round by its deterministic hash
-python -m scripts.query_federated_audit --round-id <round_id_hex>
-
-# List all rounds a participant contributed to
-python -m scripts.query_federated_audit --participant <fingerprint_hex>
-
-# Find the round that produced a specific model version
-python -m scripts.query_federated_audit --model-hash <sha256_hex>
-
-# List the 50 most recent rounds (default)
-python -m scripts.query_federated_audit --list
-
-# List with pagination
-python -m scripts.query_federated_audit --list --limit 20 --offset 40
-
-# Machine-readable NDJSON output
-python -m scripts.query_federated_audit --list --json
-
-# Full detail for each record
-python -m scripts.query_federated_audit --round-id <round_id_hex> --detail
-
-# Use a custom database URL
-python -m scripts.query_federated_audit \
-    --db-url postgresql://user:pass@host/dbname \
-    --list
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-### Regulatory Compliance Notes
+- The key must be **exactly 32 bytes**; a shorter key raises a startup error.
+- If the variable is absent, a warning is emitted and plaintext is stored
+  (development only — never acceptable in production).
+- Store the key in a secrets manager (Vault, AWS Secrets Manager, etc.),
+  never in `.env` committed to version control.
 
-Gradient norms (L2 scalar values) are recorded to enable anomaly detection
-(unusually large or small norms may indicate a Byzantine participant) without
-exposing any model parameters or training data.  The combination of:
+### Key Rotation
 
-- Deterministic, content-addressed round IDs
-- Certificate fingerprints linking each round to specific participants
-- Merkle hash chain over all records
-- Aggregate model hash per round
+To re-encrypt existing forensic reports when the key changes:
 
-…provides a complete, verifiable training lineage that satisfies common
-regulatory requirements (e.g. EU AI Act audit trail obligations, MAS TRM
-guidelines on model governance) and allows investigators to pinpoint exactly
-which participant's update corrupted a model version.
+1. Decrypt all stored blobs with the **old** key.
+2. Re-encrypt each field value with the **new** key.
+3. Atomically swap the updated blobs in the database.
+4. Revoke the old key.
+
+Run this as a migration script with the old key available as a temporary
+environment variable (e.g. `OLD_FORENSIC_KEY`), then set
+`FORENSIC_REPORT_ENCRYPTION_KEY` to the new key.
+
+### Export Authorisation
+
+Before generating a PDF that includes decrypted wallet addresses, call:
+
+```python
+from utils.field_encryption import check_export_permission
+
+check_export_permission(current_user.permissions)  # raises PermissionError if not authorised
+```
+
+Only users with the `forensic_export` permission may trigger exports with
+decrypted addresses.
