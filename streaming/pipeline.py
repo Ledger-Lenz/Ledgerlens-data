@@ -9,27 +9,16 @@ Reconnection on Horizon SSE failures is handled at two levels:
   2. _stream_pair() restarts the generator if stream_trades() raises after
      exhausting its own retries.
 
-Streaming metadata join
------------------------
-``MetadataJoinState`` holds the latest ``AccountMetadataUpdate`` per wallet
-inside a configurable join window (``METADATA_JOIN_WINDOW_SECONDS``, default
-3600 s).  When a trade arrives, the involved wallets' metadata is fetched from
-join state and passed to the feature buffer so wallet-graph features reflect the
-current on-chain account state.
+Circuit breakers
+----------------
+Pass ``circuit_breakers`` to wrap the model-inference call with independent
+per-component ``CircuitBreaker`` instances.  Supported keys:
+  - ``"inference"``  — wraps ``scorer.score_wallet()``
+  - ``"db_write"``   — wraps ``dispatcher.dispatch()``
+  - ``"benford"``    — wraps any explicit Benford computation (future extension)
 
-When a metadata update arrives *after* the join window has closed for a wallet,
-the update is queued in ``_pending_updates``.  On the next scoring cycle for that
-wallet the pending update is promoted to active join state.
-
-Join state is bounded: wallets whose last trade was more than
-``METADATA_ACTIVE_WALLET_TTL_SECONDS`` ago (default 86 400 s / 24 h) are evicted
-from join state during a periodic housekeeping pass that runs every 5 minutes.
-This caps memory at O(active_wallets) regardless of how many distinct wallets the
-pipeline has ever seen.
-
-Join lag — the time between a metadata update arriving and the affected wallet's
-features being re-computed — is tracked as a Prometheus histogram
-(``metadata_join_lag_seconds``).
+When a circuit is OPEN the pipeline falls back to the last cached score for
+the wallet-pair so alert delivery can continue uninterrupted.
 
 Shutdown
 --------
@@ -335,11 +324,9 @@ class StreamingPipeline:
         )
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
-        self._metadata_join_state: MetadataJoinState | None = metadata_join_state
-        self._metadata_stream = metadata_stream
-        # Track wallets we have already subscribed to effects for.
-        self._subscribed_wallets: set[str] = set()
-        self._subscribed_wallets_lock = threading.Lock()
+        self._circuit_breakers: dict[str, CircuitBreaker] = circuit_breakers or {}
+        # Wallet → last successfully computed score (used as fallback when OPEN)
+        self._score_cache: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -596,7 +583,7 @@ class StreamingPipeline:
                         self._enrich_from_metadata(wallet)
                         score = self._scorer.score_wallet(wallet, self._buffer)
                         if score is not None:
-                            self._dispatcher.dispatch(wallet, score, pair_id)
+                            self._dispatch_with_cb(wallet, score, pair_id)
             except Exception as exc:
                 if self._stop_event.is_set():
                     return

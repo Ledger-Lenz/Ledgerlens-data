@@ -13,5 +13,10 @@ models/archive/
 models/optuna_studies.db
 models/best_params_*.json
 reports/
+# Keep sample/committed reports but ignore generated load test output
+reports/load_test_results.json
+
+# mutmut mutation testing cache
+.mutmut-cache
 
 .DS_Store

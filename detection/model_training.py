@@ -843,6 +843,17 @@ def parse_args() -> argparse.Namespace:
         default="data/raw_trades.parquet",
         help="Path to raw trades Parquet file for Benford window optimization"
     )
+    parser.add_argument(
+        "--adv-training",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable FGSM-based adversarial training (Issue #191). "
+            "Overridden by ADV_TRAINING_ENABLED env var when set to 'true'. "
+            "Epochs / epsilon / ratio are controlled by ADV_TRAINING_EPOCHS, "
+            "ADV_TRAINING_EPSILON, and ADV_TRAINING_RATIO."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1006,6 +1017,58 @@ def main() -> None:
 
     save_models(results, model_dir)
     save_training_artifacts(training_output, args.data_path, model_dir)
+
+    # FGSM adversarial training (Issue #191)
+    adv_training_enabled = config.ADV_TRAINING_ENABLED or args.adv_training
+    if adv_training_enabled:
+        try:
+            from detection.adversarial.robustness import run_adversarial_training
+            from detection.model_inference import RiskScorer
+
+            logger.info(
+                "ADV_TRAINING_ENABLED=true — starting FGSM adversarial training loop "
+                "(epochs=%d epsilon=%.3f ratio=%.2f)",
+                config.ADV_TRAINING_EPOCHS,
+                config.ADV_TRAINING_EPSILON,
+                config.ADV_TRAINING_RATIO,
+            )
+            adv_report = run_adversarial_training(
+                df,
+                epochs=config.ADV_TRAINING_EPOCHS,
+                epsilon=config.ADV_TRAINING_EPSILON,
+                adv_ratio=config.ADV_TRAINING_RATIO,
+                test_size=args.test_size,
+                random_state=args.random_state,
+                model_dir=model_dir,
+            )
+
+            # Enforce clean accuracy degradation constraint (<= 3 pp)
+            if not adv_report.get("clean_degradation_within_tolerance", True):
+                logger.warning(
+                    "ADV TRAINING: clean accuracy degradation (%.4f) exceeds 3 pp tolerance. "
+                    "Consider reducing ADV_TRAINING_EPSILON or ADV_TRAINING_RATIO.",
+                    adv_report.get("clean_accuracy_degradation", float("nan")),
+                )
+            else:
+                logger.info(
+                    "ADV TRAINING: clean_auc %.4f→%.4f  adversarial_auc %.4f→%.4f  "
+                    "(within 3 pp clean degradation tolerance)",
+                    adv_report["clean_auc_initial"],
+                    adv_report["clean_auc_final"],
+                    adv_report["adversarial_auc_initial"],
+                    adv_report["adversarial_auc_final"],
+                )
+
+            # Persist adversarial training report
+            os.makedirs("reports", exist_ok=True)
+            ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+            adv_report_path = f"reports/adversarial_training_{ts}.json"
+            with open(adv_report_path, "w") as f:
+                json.dump(adv_report, f, indent=2)
+            logger.info("Adversarial training report written to %s", adv_report_path)
+
+        except Exception as _adv_exc:
+            logger.error("Adversarial training step failed: %s", _adv_exc, exc_info=True)
 
     # Compute DP-noised aggregate statistics and log privacy budget consumed.
     try:

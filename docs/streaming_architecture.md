@@ -583,6 +583,74 @@ All threads are `daemon=True` so they are automatically killed if the main proce
 
 ---
 
+## Sliding Window Benford Aggregator (Issue #254)
+
+The DB-based Benford computation in `benford_engine.py` scans all trades in a
+time window from the database on every call.  For the 30-day window on active
+pairs this takes several seconds and scans millions of rows.
+
+`SlidingWindowBenfordAggregator` (`detection/sliding_window_benford.py`)
+maintains per-digit counts in memory, updated incrementally as trades arrive
+and expire.
+
+### Design
+
+```
+add_trade(amount, timestamp)
+  └── _lazy_expire(timestamp)          ← drain expired entries from heap
+  └── digit = leading_digit(amount)
+  └── digit_counts[digit-1] += 1
+  └── heappush(heap, (timestamp, digit))
+
+chi_square()  ← O(9) arithmetic over digit_counts; no DB access
+mad()         ← O(9) arithmetic
+z_scores()    ← O(9) arithmetic
+```
+
+**Lazy expiry**: a min-heap keyed by timestamp drains expired entries on each
+`add_trade` call.  No background thread or timer is required.
+
+**Concurrency**: all mutations are guarded by `asyncio.Lock`, making the
+aggregator safe for concurrent use from multiple scoring coroutines within the
+same event loop.
+
+### Tolerance guarantee
+
+Running chi-square matches the batch-computed value (from `benford_engine.py`)
+within **1e-4 absolute tolerance** on synthetic data.  Verified in
+`tests/test_issues_253_254_255_256.py`.
+
+### Backward clock / NTP correction
+
+If the system clock jumps backward (e.g. an NTP step correction), some trades
+will appear to have timestamps in the future relative to the new system time.
+`_lazy_expire` uses the *current trade's timestamp* as the reference for
+expiry — not the system clock — so a backward step does not immediately
+un-expire in-window trades.  Trades with future-relative timestamps will stay
+in the window longer than their nominal window size, but will eventually expire
+correctly as real trades arrive.  For deployments sensitive to this edge case,
+use a monotonic clock for `add_trade` timestamps.
+
+### Performance
+
+10 000 `add_trade` calls complete in < 100ms on a single asyncio event loop
+(verified in the performance test).
+
+### Integration
+
+For real-time (streaming) scoring, instantiate a `SlidingWindowBenfordAggregator`
+per wallet / per window size and call `add_trade` as each new trade arrives.
+Call `to_metrics()` to get a `BenfordMetrics` object compatible with the rest
+of the feature pipeline.  The DB-based `compute_benford_metrics_for_windows`
+in `benford_engine.py` remains in use for batch scoring runs.
+
+### Environment variables
+
+No new variables are introduced.  The aggregator window width is determined
+by `BENFORD_WINDOWS_HOURS` (default `1,4,24,168,720`).
+
+---
+
 ## Kafka Streaming Backend (Issue #36)
 
 The default `sse` backend runs one thread per pair inside a single process — it
@@ -695,230 +763,71 @@ replicas, Prometheus (`:9090`), and Grafana (`:3000`, dashboard
 
 ---
 
-## Streaming Account Metadata Join (Phase 4)
+## Adaptive Micro-Batch Sizing (Issue #243)
 
-### Overview
+### Problem
 
-Trade events carry wallet IDs but not account metadata (account age, trust
-lines, signer configuration). Wallet-graph features that depend on account age
-or trust-line configuration were previously computed from a static snapshot
-fetched at pipeline startup. When account state changes between snapshot
-refreshes — for example, when a trust line is added to enable trading a new
-asset pair — those features silently lag behind reality until the next snapshot.
+The streaming scorer processes trade events in micro-batches. A fixed batch size is suboptimal: small batches waste per-batch inference overhead during quiet periods; large batches introduce queueing latency during spikes.
 
-Phase 4 closes this gap with a **streaming metadata join**: the pipeline
-subscribes to the Stellar Horizon
-`/accounts/{wallet}/effects` SSE endpoint for every wallet it sees trading.
-Incoming effect events are validated and fed into a `MetadataJoinState` store.
-Each trade event then enriches the involved wallets' features from the latest
-in-window metadata entry before scoring.
+### PID Controller
 
-### Architecture
+`AdaptiveBatchController` (in `streaming/streaming_scorer.py`) adjusts batch size in real time using a **Proportional-Integral-Derivative (PID)** controller.
 
 ```
-Stellar Horizon
-  /accounts/{wallet}/effects (SSE)
-          │
-          │ raw effect records
-          ▼
-  ┌─────────────────────────────────┐
-  │  AccountMetadataStream           │  streaming/account_metadata_stream.py
-  │  (one daemon thread per wallet)  │
-  │                                  │
-  │  _stream_effects()               │
-  │   → filter to interesting types  │
-  │   → validate_metadata_event()    │  Pydantic validation / discard
-  │   → on_update callback           │  (or Kafka produce)
-  └──────────────┬──────────────────┘
-                 │ AccountMetadataUpdate
-                 ▼
-  ┌─────────────────────────────────┐
-  │  MetadataJoinState               │  streaming/pipeline.py
-  │  (thread-safe, bounded)          │
-  │                                  │
-  │  apply_update()                  │  stores update in _active or _pending
-  │  get_metadata(wallet)            │  returns metadata if within join window
-  │  evict_inactive_wallets()        │  background housekeeping (every 5 min)
-  └──────────────┬──────────────────┘
-                 │
-  ┌──────────────▼──────────────────┐
-  │  StreamingPipeline               │
-  │  _stream_pair() / AMM loop       │
-  │                                  │
-  │  for each trade event:           │
-  │    buffer.update(trade)          │
-  │    _enrich_from_metadata(wallet) │ ← get_metadata() + buffer.apply_metadata()
-  │    scorer.score_wallet(wallet)   │
-  │    dispatcher.dispatch(…)        │
-  └─────────────────────────────────┘
+error = observed_p95_latency - target_p95_latency
+Δbatch = -(Kp × error + Ki × ∫error + Kd × Δerror)
+batch_size = clamp(batch_size + Δbatch, min_batch, max_batch)
 ```
 
-### Join State
+- **P term** — responds immediately to the current latency error; dominant during fast changes.
+- **I term** — integrates accumulated error to correct steady-state offset (e.g. consistently high latency at the current batch size).
+- **D term** — damps oscillation by reacting to the rate of change in error.
+- **Anti-windup** — the integral is clamped to `±50` so that sustained overload does not build an unbounded correction term that overshoots when conditions improve.
 
-`MetadataJoinState` is an in-memory, thread-safe dictionary of the latest
-`AccountMetadataUpdate` per wallet:
+### Default Gains
 
-```python
-# Apply an incoming Horizon effect to join state:
-join_state.apply_update(update)
+| Gain | Default | Notes |
+|---|---|---|
+| `Kp` | 0.5 | Scale down for pipelines with high natural latency variance. |
+| `Ki` | 0.1 | Increase if steady-state offset persists after many seconds. |
+| `Kd` | 0.05 | Increase if the batch size oscillates. |
 
-# Retrieve metadata for a wallet when a trade arrives:
-metadata = join_state.get_metadata(wallet)
-if metadata:
-    buffer.apply_metadata(wallet, metadata)
+The defaults target a **p95 latency of 2 seconds** on typical LedgerLens workloads.
+
+### Tuning for Different Deployment Sizes
+
+- **High-throughput (>10 k trades/s)**: reduce `Kp` to 0.2–0.3 and increase `max_batch` to 1000.
+- **Low-throughput (<100 trades/s)**: the controller naturally settles near `max_batch` since latency is always below target.
+- **Bursty workloads (exchange listings)**: increase `Kd` to dampen oscillation during volume spikes.
+
+Batch-size adjustments are logged at `DEBUG` level (`streaming.streaming_scorer`). Enable debug logging to produce a PID trace:
+
+```bash
+LOG_LEVEL=DEBUG python -m scripts.stream
 ```
 
-#### Join Window
+### Disabling Adaptive Sizing
 
-A metadata entry enriches trade events for `METADATA_JOIN_WINDOW_SECONDS`
-(default `3600`, configurable) after the update arrives. When the window
-expires the entry is evicted from active state; the next metadata update for
-the wallet is admitted as a new entry.
+Pass `--fixed-batch-size N` to `scripts/stream.py` to pin the batch size for debugging:
 
-**Why a join window?**  Account state can change at any time; keeping metadata
-indefinitely would mean scoring wallets with arbitrarily stale entries.  A 1-
-hour window strikes a balance between freshness and the cost of re-subscribing
-wallets after a Horizon reconnect.  For wallets that trade continuously, new
-metadata updates typically arrive more frequently than the window, so there is
-no coverage gap in practice.
-
-#### Late-Arrival Handling
-
-A metadata update that arrives *while no active entry exists* for a wallet (the
-wallet is new, or its previous entry expired) is stored in `_pending_updates`
-rather than being discarded. On the next `get_metadata()` call for that wallet
-— which is triggered by the next trade event involving the wallet — the pending
-update is **promoted** to active state and its lag is recorded in the
-`metadata_join_lag_seconds` Prometheus histogram. This ensures no metadata
-update is ever silently dropped.
-
-```
-Timeline:                                  is_active?  pending?
-───────────────────────────────────────────────────────────────
-t=0   trade arrives for wallet W           no           no
-      get_metadata(W) → None, records W in last_trade_at
-
-t=10  Horizon effect for W arrives         no           no
-      apply_update(update)                 → queued as pending
-                                           no           yes
-
-t=15  trade arrives for W (next cycle)
-      get_metadata(W):
-        • pending entry found → promoted   yes          no
-        • METADATA_JOIN_LAG.observe(5s)
-        → returns update
-
-t=3615 join window expires
-        get_metadata(W) → None (evicted)   no           no
+```bash
+python -m scripts.stream --fixed-batch-size 64
 ```
 
-#### Memory Bounding
+### Prometheus Gauges
 
-Join state is bounded at O(active wallets). A background daemon thread
-(`_run_housekeeping`) runs every 300 seconds and calls
-`evict_inactive_wallets()`. Any wallet whose last trade event was more than
-`METADATA_ACTIVE_WALLET_TTL_SECONDS` ago (default `86400` / 24 hours) is
-removed from both `_active` and `_pending_updates`. High-frequency wallets
-(those with a trade in the last 24 hours) are never evicted prematurely — their
-`_last_trade_at` timestamp is refreshed on every `get_metadata()` call.
+| Metric | Type | Description |
+|---|---|---|
+| `ledgerlens_adaptive_batch_size` | Gauge | Current batch size chosen by the PID controller |
+| `ledgerlens_batch_target_latency_seconds` | Gauge | Configured p95 latency target |
 
-This mirrors the same eviction strategy as Kafka Streams' [windowed state
-stores](https://kafka.apache.org/documentation/streams/developer-guide/dsl-api.html#windowing)
-but is implemented entirely in Python using a monotonic clock and a periodic
-sweep, avoiding a JVM dependency. The trade-off versus time-to-live on
-individual entries is that a brief spike in unique wallets (e.g., a burst of
-new accounts during a token launch) can temporarily increase memory usage
-before the next housekeeping pass clears them. Operators can reduce
-`METADATA_ACTIVE_WALLET_TTL_SECONDS` to reclaim memory more aggressively at
-the cost of re-fetching metadata for returning wallets.
-
-### Security
-
-All effect records from Horizon are validated through
-`validate_metadata_event()` before being admitted to join state:
-
-* `account_id` must match the Stellar account ID format (`G` followed by 55
-  base-32 characters).
-* `effect_type` must be a non-empty string.
-* Any `ValidationError` raised by Pydantic causes the record to be **discarded
-  and logged at WARNING level**. Malformed records never reach `MetadataJoinState`
-  or the scorer.
-
-This follows the same defense-in-depth pattern as the Kafka dead-letter queue
-for trade messages: untrusted data is validated at the ingestion boundary and
-silently dropped on failure so a single malformed Horizon response cannot
-corrupt join state or trigger a pipeline crash.
-
-### Prometheus Metrics
-
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `metadata_join_lag_seconds` | Histogram | — | Seconds between a metadata update arriving and the affected wallet being re-scored with the new metadata. Observed when a pending update is promoted to active state. |
-
-Typical lag distribution:
-- **< 5 s**: metadata arrived and was immediately promoted on the next trade event.
-- **5–60 s**: trade activity is moderate (1 trade per minute).
-- **> 60 s**: wallet is trading infrequently; the pending update sits until the
-  next trade arrives.
-
-### Environment Variables
+### Configuration
 
 | Variable | Default | Description |
 |---|---|---|
-| `METADATA_TOPIC` | `ledgerlens.account_metadata` | Kafka topic for account metadata update events (used when `STREAMING_BACKEND=kafka`) |
-| `METADATA_JOIN_WINDOW_SECONDS` | `3600` | How long (seconds) a metadata entry enriches trade events before expiring |
-| `METADATA_ACTIVE_WALLET_TTL_SECONDS` | `86400` | Wallets inactive for this many seconds are evicted from join state |
-
-### Files
-
-| File | Purpose |
-|---|---|
-| `streaming/account_metadata_stream.py` | Horizon effects subscriber; validates events; produces to Kafka in `kafka` mode |
-| `streaming/pipeline.py` — `MetadataJoinState` | Stateful join store with join window, late-arrival pending queue, and housekeeping eviction |
-| `streaming/pipeline.py` — `StreamingPipeline` | Wires `_enrich_from_metadata`, `_subscribe_wallet`, `_trigger_rescore_from_metadata`, `_run_housekeeping` |
-| `tests/test_metadata_join.py` | Unit tests: validation, join state, late-arrival, window expiry, eviction, histogram, pipeline enrichment |
-
-### Threading Model with Metadata Join
-
-```
-Main thread (scripts/stream.py)
-│  installs SIGINT → _stop_event.set()
-│
-├── Thread: pair-0 (daemon)  → _stream_pair(USDC/XLM)
-│     for trade in stream_trades():
-│         buffer.update(trade)
-│         _enrich_from_metadata(base)   ← looks up MetadataJoinState
-│         _subscribe_wallet(base)        ← adds to AccountMetadataStream
-│         scorer.score_wallet(base)
-│         dispatcher.dispatch(base, …)
-│         _enrich_from_metadata(counter)
-│         …
-│
-├── Thread: metadata-housekeeping (daemon)
-│     every 300 s: MetadataJoinState.evict_inactive_wallets()
-│
-├── Thread: metadata-<WALLET_A[:8]> (daemon, per wallet)
-│     AccountMetadataStream._subscribe(WALLET_A)
-│       → Horizon SSE /accounts/WALLET_A/effects
-│       → validate_metadata_event(record)
-│       → on_update(AccountMetadataUpdate) → MetadataJoinState.apply_update()
-│
-└── Thread: metadata-<WALLET_B[:8]> (daemon, per wallet)
-      AccountMetadataStream._subscribe(WALLET_B)
-      …
-```
-
-### Join Window Trade-offs
-
-| Window duration | Freshness | Memory pressure | Re-subscription cost |
-|---|---|---|---|
-| **Short (< 300 s)** | High — stale entries evicted quickly | Low | High — effects stream re-opened frequently for wallets with low trade rates |
-| **Medium (3600 s, default)** | Good — covers most intra-hour account changes | Moderate — one entry per active wallet | Low — one SSE connection per wallet, reconnects only on failure |
-| **Long (> 86400 s)** | Low — stale entries persist for days | High — proportional to all wallets ever seen | Minimal | 
-
-The default 1-hour window is chosen to match typical DEX trading sessions
-while remaining well within Stellar's 3–5 second ledger close cycle. Operators
-running high-frequency monitoring against thin markets (where individual trades
-are minutes apart) should increase `METADATA_JOIN_WINDOW_SECONDS` to match
-their expected inter-trade interval so wallets are not prematurely evicted
-between trades.
+| `STREAM_TARGET_P95_LATENCY_SECONDS` | `2.0` | PID target latency |
+| `STREAM_MIN_BATCH_SIZE` | `1` | Minimum allowed batch size |
+| `STREAM_MAX_BATCH_SIZE` | `500` | Maximum allowed batch size |
+| `STREAM_PID_KP` | `0.5` | Proportional gain |
+| `STREAM_PID_KI` | `0.1` | Integral gain |
+| `STREAM_PID_KD` | `0.05` | Derivative gain |
