@@ -100,3 +100,95 @@ groups:
             Benford MAD for {{ $labels.asset_pair }} has been above the 0.015 non-conformity
             threshold for 15 minutes (current MAD: {{ $value | printf "%.4f" }}).
             This may indicate sustained wash-trading activity or a data quality issue.
+
+  # SLO dashboard alerting rules (issue #197)
+  - name: ledgerlens_slo_monitoring
+    interval: 1m
+    rules:
+      # Fires when p99 scoring latency exceeds 5 seconds for 10 minutes.
+      # SLO target: p99 < 5s (fraud investigation use case, not real-time blocking).
+      - alert: ScoringLatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(ledgerlens_score_duration_seconds_bucket[5m])) by (le, asset_pair)
+          ) > 5.0
+        for: 10m
+        labels:
+          severity: critical
+          slo: "latency"
+        annotations:
+          summary: "Scoring latency p99 exceeds 5s for {{ $labels.asset_pair }}"
+          description: >
+            p99 scoring latency for {{ $labels.asset_pair }} has exceeded 5 seconds for 10 minutes
+            (current p99: {{ $value | printf "%.3f" }}s). This indicates a systemic scoring issue.
+            Check: data ingestion rate, feature engineering pipeline, model inference latency.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/monitoring.md#runbook-scoring-latency"
+
+      # Fires when recall on confirmed wash trades drops below 85%.
+      # Recall = (detected wash trades) / (detected + missed wash trades).
+      # SLO target: >= 85% (fraud investigation baseline; higher recall prevents missing cases).
+      - alert: WashTradeRecallBelowSLO
+        expr: |
+          (
+            sum(increase(ledgerlens_confirmed_wash_trades_total[24h]))
+            /
+            (
+              sum(increase(ledgerlens_confirmed_wash_trades_total[24h]))
+              + sum(increase(ledgerlens_false_negative_wash_trades_total[24h]))
+              + 0.0001
+            )
+          ) < 0.85
+        for: 1h
+        labels:
+          severity: warning
+          slo: "recall"
+        annotations:
+          summary: "Wash trade detection recall below SLO ({{ $value | humanizePercentage }})"
+          description: >
+            Recall on manually-confirmed wash trades has dropped below 85% over the last 24h
+            (current: {{ $value | humanizePercentage }}). This indicates the ML models may need
+            retraining on recent wash trading patterns.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/monitoring.md#runbook-recall"
+
+      # Fires when false positive rate on clean wallets exceeds 5%.
+      # False positive rate = (flagged clean wallets) / (total confirmed clean wallets).
+      # SLO target: < 5% (keeps false-positive burden manageable for analysts).
+      - alert: WashTradeFalsePositiveRateHigh
+        expr: |
+          (
+            sum(increase(ledgerlens_false_positive_wallets_total[24h]))
+            /
+            (
+              sum(increase(ledgerlens_confirmed_clean_wallets_total[24h]))
+              + 0.0001
+            )
+          ) > 0.05
+        for: 1h
+        labels:
+          severity: warning
+          slo: "false_positive_rate"
+        annotations:
+          summary: "False positive rate on clean wallets exceeds SLO ({{ $value | humanizePercentage }})"
+          description: >
+            False positive rate has exceeded 5% over the last 24h (current: {{ $value | humanizePercentage }}).
+            This indicates the ML models are flagging legitimate traders too aggressively.
+            Consider: lowering RISK_SCORE_FLAG_THRESHOLD, retraining with balanced examples.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/monitoring.md#runbook-false-positive"
+
+      # Fires when Benford computation throughput is near zero.
+      # Indicates either no trades are flowing or the feature pipeline is blocked.
+      - alert: BenfordThroughputCritical
+        expr: |
+          sum(rate(ledgerlens_benford_computation_total[5m])) < 0.1
+        for: 15m
+        labels:
+          severity: critical
+          slo: "throughput"
+        annotations:
+          summary: "Benford computation throughput critically low (< 0.1 ops/s)"
+          description: >
+            Benford computation throughput has been below 0.1 operations per second for 15 minutes.
+            This indicates either: (1) no trades are arriving from Stellar Horizon, or
+            (2) the feature engineering pipeline is blocked/crashed.
+            Check: Horizon API connectivity, streaming pipeline status, Prometheus scrape logs.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/monitoring.md#runbook-throughput"
