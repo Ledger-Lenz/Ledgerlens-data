@@ -1,5 +1,45 @@
 # Feature Store Architecture
 
+## OHLCV-derived candle features
+
+Computed from individual trade events by aggregating into OHLCV candles at
+multiple time resolutions.
+
+### Resampling logic
+
+For each requested resolution (validated against an allowlist: `1m`, `5m`,
+`15m`, `1h`, `4h`), trades are bucketed using pandas `resample` anchored to
+the trade timestamps.
+
+For each candle window, these features are computed:
+
+- **`price_range_ratio_{res}`**: 
+  
+  
+  \(\frac{high-low}{open}\)
+
+- **`vwap_deviation_{res}`**:
+  
+  \(\frac{close - VWAP}{VWAP}\)
+
+- **`candle_body_ratio_{res}`**:
+  
+  \(\frac{close-open}{high-low}\)
+
+- **`volume_spike_ratio_{res}`**:
+  
+  \(\frac{candle\_volume}{rolling\_avg\_{20}(candle\_volume)}\)
+
+  Where `rolling_avg_20` is computed over the previous 20 candles **excluding
+  the current candle** (anchored to the current candle via a `.shift(1)`).
+
+### NaN handling for sparse candles
+
+If a candle window contains fewer than 2 trades, all candle-based features
+(`price_range_ratio`, `vwap_deviation`, `candle_body_ratio`, and
+`volume_spike_ratio`) are set to `NaN`.
+
+
 The feature store caches precomputed wallet feature vectors to eliminate redundant computation and reduce scoring latency.
 
 ## Cache Structure

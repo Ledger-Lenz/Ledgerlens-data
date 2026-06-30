@@ -13,7 +13,9 @@ import pandas as pd
 
 from detection.feature_engineering import build_feature_vector
 from features.velocity_features import compute_token_velocity
+from features.ohlcv_features import compute_ohlcv_features
 from features.wallet_lifecycle_features import compute_lifecycle_features
+
 
 
 def build_extended_feature_vector(
@@ -47,4 +49,9 @@ def build_extended_feature_vector(
         compute_lifecycle_features(wallet, wallet_trades, account_created_at, now=now)
     )
     features.update(compute_token_velocity(wallet_trades, asset_supply, now=now))
+
+    # OHLCV-derived candle features (pair-level microstructure signals)
+    features.update(compute_ohlcv_features(wallet_trades))
+
     return features
+

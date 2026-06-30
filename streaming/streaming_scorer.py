@@ -18,6 +18,9 @@ with up to 10,000 nodes.
 
 from __future__ import annotations
 
+import os
+import threading
+
 import networkx as nx
 
 from config import config
@@ -27,6 +30,126 @@ from streaming.feature_buffer import FeatureBuffer
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Adaptive micro-batch controller (Issue #243)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TARGET_P95 = float(os.getenv("STREAM_TARGET_P95_LATENCY_SECONDS", "2.0"))
+_DEFAULT_MIN_BATCH = int(os.getenv("STREAM_MIN_BATCH_SIZE", "1"))
+_DEFAULT_MAX_BATCH = int(os.getenv("STREAM_MAX_BATCH_SIZE", "500"))
+_DEFAULT_KP = float(os.getenv("STREAM_PID_KP", "0.5"))
+_DEFAULT_KI = float(os.getenv("STREAM_PID_KI", "0.1"))
+_DEFAULT_KD = float(os.getenv("STREAM_PID_KD", "0.05"))
+
+try:
+    from prometheus_client import Gauge, REGISTRY as _PROM_REGISTRY
+
+    _batch_size_gauge: "Gauge | None" = (
+        _PROM_REGISTRY._names_to_collectors.get("ledgerlens_adaptive_batch_size")  # type: ignore[attr-defined]
+        or Gauge("ledgerlens_adaptive_batch_size", "Current adaptive micro-batch size")
+    )
+    _target_latency_gauge: "Gauge | None" = (
+        _PROM_REGISTRY._names_to_collectors.get("ledgerlens_batch_target_latency_seconds")  # type: ignore[attr-defined]
+        or Gauge(
+            "ledgerlens_batch_target_latency_seconds",
+            "Target p95 latency for adaptive batch controller (seconds)",
+        )
+    )
+except Exception:  # pragma: no cover
+    _batch_size_gauge = None
+    _target_latency_gauge = None
+
+
+class AdaptiveBatchController:
+    """PID controller that adjusts streaming micro-batch size to meet a p95 latency target.
+
+    The controller decreases batch size when observed p95 latency exceeds the
+    target (error > 0) and increases it when latency is comfortably below the
+    target, bounded by ``[min_batch, max_batch]``.
+
+    Anti-windup is applied by clamping the integral term to ``_INTEGRAL_CLAMP``,
+    preventing unbounded accumulation during sustained overload.
+
+    Parameters
+    ----------
+    target_p95_latency:
+        Desired p95 end-to-end latency in seconds (``STREAM_TARGET_P95_LATENCY_SECONDS``).
+    min_batch, max_batch:
+        Inclusive bounds on batch size (``STREAM_MIN_BATCH_SIZE`` / ``STREAM_MAX_BATCH_SIZE``).
+    kp, ki, kd:
+        PID gains (``STREAM_PID_KP`` / ``STREAM_PID_KI`` / ``STREAM_PID_KD``).
+        Defaults (0.5, 0.1, 0.05) are tuned for a 2-second target; scale Kp
+        down for slower pipelines with high natural variance.
+    """
+
+    _INTEGRAL_CLAMP = 50.0
+
+    def __init__(
+        self,
+        target_p95_latency: float = _DEFAULT_TARGET_P95,
+        min_batch: int = _DEFAULT_MIN_BATCH,
+        max_batch: int = _DEFAULT_MAX_BATCH,
+        kp: float = _DEFAULT_KP,
+        ki: float = _DEFAULT_KI,
+        kd: float = _DEFAULT_KD,
+    ) -> None:
+        self.target = target_p95_latency
+        self.min_batch = min_batch
+        self.max_batch = max_batch
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+        self._batch_size: float = float(min(32, max_batch))
+        self._integral: float = 0.0
+        self._prev_error: float = 0.0
+        self._lock = threading.Lock()
+
+        if _target_latency_gauge is not None:
+            _target_latency_gauge.set(target_p95_latency)
+
+    @property
+    def batch_size(self) -> int:
+        return int(self._batch_size)
+
+    def update(self, observed_p95_latency: float) -> int:
+        """Observe *observed_p95_latency* and return the new batch size.
+
+        A positive error (latency above target) shrinks the batch; a negative
+        error (latency below target) grows it.  Batch size adjustments are
+        logged at DEBUG level for PID oscillation diagnosis.
+        """
+        with self._lock:
+            error = observed_p95_latency - self.target
+
+            # Anti-windup: clamp integral before accumulating
+            self._integral = max(
+                -self._INTEGRAL_CLAMP,
+                min(self._INTEGRAL_CLAMP, self._integral + error),
+            )
+            derivative = error - self._prev_error
+            self._prev_error = error
+
+            # Positive error → too slow → reduce batch size (negative adjustment)
+            adjustment = -(self.kp * error + self.ki * self._integral + self.kd * derivative)
+            self._batch_size = max(
+                float(self.min_batch),
+                min(float(self.max_batch), self._batch_size + adjustment),
+            )
+
+        logger.debug(
+            "AdaptiveBatchController: p95=%.3fs error=%.3f adj=%.2f -> batch=%d",
+            observed_p95_latency,
+            error,
+            adjustment,
+            self.batch_size,
+        )
+
+        if _batch_size_gauge is not None:
+            _batch_size_gauge.set(self.batch_size)
+
+        return self.batch_size
 
 
 class StreamingScorer:

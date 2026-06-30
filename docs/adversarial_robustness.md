@@ -240,6 +240,58 @@ pytest tests/test_backdoor_detector.py -v
    - Data validation and quality checks
 5. **Plan for clean-label attacks**: Use ensemble of defences or manual review of high-uncertainty samples
 
+---
+
+## Certified Robustness via Interval Bound Propagation (IBP) — Issue #245
+
+Adversarial training provides empirical robustness against specific attack methods but does not give formal guarantees. **Interval Bound Propagation (IBP)** provides a provable lower bound: for any input perturbation within a specified L∞ ball of radius ε around the feature vector, IBP certifies that the model produces the correct classification.
+
+### What IBP Certifies
+
+Given a feature vector **x** and a perturbation budget ε, IBP certifies that the model's output score is:
+- ≥ `fraud_threshold` (default 50) for every input in **[x − ε, x + ε]** when the wallet is a known fraud, or
+- < `fraud_threshold` for every input in the L∞ ball when the wallet is benign.
+
+If this holds at the chosen ε, the model is **certifiably robust** at that radius — no adversary can flip the classification with a perturbation that small.
+
+### Implementation
+
+`certify_ibp(layers, feature_vector, epsilon, label)` in `detection/certified_robustness.py`:
+
+1. **Interval initialisation** — [x − ε, x + ε]
+2. **Layer-by-layer propagation** using closed-form IBP rules:
+   - **Linear(W, b)**: split W into positive/negative parts; the tightest interval bounds are `W⁺·lo + W⁻·hi + b` and `W⁺·hi + W⁻·lo + b`.
+   - **ReLU**: `[max(0, lo), max(0, hi)]`
+   - **BatchNorm** (inference mode): treated as a per-feature affine transform; negative scale flips the interval.
+3. **Certification check** — if the output interval confirms the correct class, return ε; otherwise binary-search for the largest certified radius.
+
+Complexity is O(L × d) per sample (L layers, d features) — well under 10 ms for LedgerLens model sizes.
+
+### Limitations of IBP
+
+IBP is **conservative**: the returned certified radius is a provable lower bound, not the true robustness. The true robustness may be larger because IBP over-approximates the reachable output set (it includes non-reachable corner cases from the interval arithmetic). Methods such as CROWN or α-CROWN produce tighter bounds at higher computational cost.
+
+**IBP vs. randomised smoothing**: Randomised smoothing certifies robustness in the L2 norm and scales well to high-dimensional inputs, but requires many forward passes (hundreds) per sample and provides probabilistic rather than deterministic guarantees. IBP is deterministic and extremely fast (< 1 ms per sample) but only certifies L∞ robustness and becomes loose for deep networks. For LedgerLens's shallow 2–3 layer MLP ensemble, IBP provides useful tight bounds; for deeper architectures, CROWN would be preferred.
+
+### Evaluation Integration
+
+`scripts/run_adversarial_eval.py` reports IBP certification results at ε = 0.01 and ε = 0.05 in the JSON output:
+
+```json
+"ibp_certification": {
+  "certified_robust_fraction_eps_0.01": 0.82,
+  "certified_robust_fraction_eps_0.05": 0.41
+}
+```
+
+A fraction of 0.82 at ε = 0.01 means 82% of correctly classified wash wallets are certified robust against any perturbation of magnitude ≤ 0.01 in feature space (after standardisation).
+
+### `certified_robust` DB Flag
+
+Risk score records have a `certified_robust` boolean column (NULL when not evaluated, True/False after IBP certification). This field is for internal quality tracking only — it is not exposed via the external API.
+
+---
+
 ## References
 
 - Wang et al. (2019) "Activation Clustering: An Approach to Detecting Backdoor Attacks"
@@ -248,3 +300,5 @@ pytest tests/test_backdoor_detector.py -v
   https://arxiv.org/abs/1811.00636
 - Turner et al. (2018) "Clean-Label Backdoor Attacks on Video Recognition Models"
   https://arxiv.org/abs/1912.02765
+- Gowal et al. (2018) "On the Effectiveness of Interval Bound Propagation for Training Verifiably Robust Models"
+  https://arxiv.org/abs/1810.12715

@@ -21,12 +21,15 @@ Run with:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import numpy as np
@@ -34,6 +37,324 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _hash_weights(weights: np.ndarray) -> str:
+    """Return the SHA-256 hex digest of the serialised global model weights.
+
+    The weights are serialised as a canonical JSON array of floats (6 decimal
+    places) so the hash is deterministic across platforms and Python versions.
+    Raw gradient tensors are *not* stored anywhere in this function — only the
+    aggregate model weights (which are persisted openly anyway).
+    """
+    canonical = json.dumps([round(float(v), 6) for v in weights.ravel()], separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _deterministic_round_id(
+    timestamp: str,
+    participant_fingerprints: list[str],
+    model_version: int,
+) -> str:
+    """SHA-256 of (timestamp, sorted-fingerprints, model_version).
+
+    Using a content-addressed hash prevents sequential-ID manipulation:
+    an attacker cannot insert a fake round without changing the hash.
+    """
+    material = json.dumps(
+        {
+            "timestamp": timestamp,
+            "fingerprints": sorted(participant_fingerprints),
+            "model_version": model_version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# FederatedAuditTrail
+# ---------------------------------------------------------------------------
+
+
+class FederatedAuditTrail:
+    """Append-only audit trail for federated learning rounds (issue #227).
+
+    Records for each round:
+    - A deterministic round ID (SHA-256 of timestamp + participant fingerprints
+      + model version) — prevents sequential-ID manipulation.
+    - Participant certificate fingerprints (hex SHA-256 of the participant ID
+      by default; callers can supply real certificate fingerprints via
+      ``set_participant_fingerprints``).
+    - Gradient **norms** only (scalar L2 norms) — raw tensors are never stored.
+    - The aggregation algorithm name.
+    - A SHA-256 hash of the aggregate model weights.
+    - The round outcome ("success" or "abort").
+
+    Records are persisted to the ``federated_audit_trail`` DB table via
+    SQLAlchemy (same engine as the main risk-score DB).  A Merkle-like hash
+    chain (``prev_hash``) links each record to its predecessor, making
+    retroactive insertion or deletion detectable.
+
+    Security invariants
+    -------------------
+    * Raw gradient tensors are **never** written to storage.
+    * The DB layer exposes no UPDATE or DELETE path for this table.
+    * ``round_id`` is content-addressed — not a sequential integer.
+    """
+
+    def __init__(
+        self,
+        session_factory: Any | None = None,
+        db_url: str | None = None,
+    ) -> None:
+        """Initialise the audit trail.
+
+        Parameters
+        ----------
+        session_factory:
+            A SQLAlchemy ``sessionmaker`` instance.  If ``None``, a default
+            factory is created from ``db_url`` (or ``RISK_SCORE_DB_URL``).
+        db_url:
+            SQLAlchemy connection URL; ignored when ``session_factory`` is
+            provided.
+        """
+        if session_factory is None:
+            from detection.persistence import get_engine, get_session_factory, Base, FederatedAuditRecord  # noqa: F401
+            engine = get_engine(db_url)
+            Base.metadata.create_all(engine, checkfirst=True)
+            session_factory = get_session_factory(engine)
+        self._session_factory = session_factory
+
+        # Optional mapping from participant_id -> certificate fingerprint.
+        # When absent, participant_id is hashed to produce a stable fingerprint.
+        self._fingerprint_map: dict[str, str] = {}
+
+        logger.info("FederatedAuditTrail initialised")
+
+    # ------------------------------------------------------------------
+    # Participant fingerprints
+    # ------------------------------------------------------------------
+
+    def set_participant_fingerprints(self, mapping: dict[str, str]) -> None:
+        """Register real certificate fingerprints for participant IDs.
+
+        Parameters
+        ----------
+        mapping:
+            ``{participant_id: fingerprint_hex}``  where *fingerprint_hex* is
+            the SHA-256 fingerprint of the participant's TLS/X.509 certificate.
+        """
+        self._fingerprint_map.update(mapping)
+
+    def get_fingerprint(self, participant_id: str) -> str:
+        """Return the fingerprint for *participant_id*.
+
+        Falls back to SHA-256(participant_id) when no certificate fingerprint
+        has been registered — this ensures every participant always has a
+        stable, unique fingerprint in the audit record.
+        """
+        if participant_id in self._fingerprint_map:
+            return self._fingerprint_map[participant_id]
+        # Derive a stable pseudonymous fingerprint from the participant ID.
+        return hashlib.sha256(participant_id.encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Core write path
+    # ------------------------------------------------------------------
+
+    def record_round(
+        self,
+        participant_fingerprints: list[str],
+        gradient_norms: dict[str, float],
+        aggregation_algorithm: str,
+        aggregate_model_hash: str,
+        round_outcome: str,
+        model_version: int,
+        timestamp: str | None = None,
+    ) -> str:
+        """Persist an audit record for one federated round and return its round_id.
+
+        Parameters
+        ----------
+        participant_fingerprints:
+            Certificate fingerprints (hex) of every participant who contributed
+            in this round.
+        gradient_norms:
+            ``{participant_id: l2_norm}`` — scalar gradient norms **only**.
+            Raw gradient tensors must never be passed here.
+        aggregation_algorithm:
+            Human-readable algorithm name, e.g. ``"fedavg"`` or
+            ``"staleness_weighted_fedavg"``.
+        aggregate_model_hash:
+            SHA-256 hex digest of the post-aggregation global model weights
+            (computed by :func:`_hash_weights`).
+        round_outcome:
+            ``"success"`` or ``"abort"``.
+        model_version:
+            The model version number after this aggregation.
+        timestamp:
+            ISO-8601 UTC string.  Defaults to ``datetime.now(UTC).isoformat()``.
+
+        Returns
+        -------
+        str
+            The deterministic ``round_id`` (SHA-256 hex digest).
+        """
+        # Security: refuse to record any value whose key suggests a raw tensor.
+        # This is a defence-in-depth check; callers must never pass tensors.
+        for key, value in gradient_norms.items():
+            if not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"gradient_norms[{key!r}] must be a scalar float, got {type(value).__name__}. "
+                    "Raw gradient tensors must never be written to the audit trail."
+                )
+
+        ts = timestamp or datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        round_id = _deterministic_round_id(ts, participant_fingerprints, model_version)
+
+        from detection.persistence import FederatedAuditRecord, get_session_factory
+
+        # Read the previous record's canonical hash to build the chain.
+        prev_hash = self._get_latest_record_hash()
+
+        record = FederatedAuditRecord(
+            round_id=round_id,
+            round_timestamp=ts,
+            participant_fingerprints=json.dumps(sorted(participant_fingerprints)),
+            gradient_norms=json.dumps(gradient_norms),
+            aggregation_algorithm=aggregation_algorithm,
+            aggregate_model_hash=aggregate_model_hash,
+            round_outcome=round_outcome,
+            model_version=model_version,
+            participant_count=len(participant_fingerprints),
+            prev_hash=prev_hash,
+        )
+
+        with self._session_factory() as session:
+            session.add(record)
+            session.commit()
+
+        logger.info(
+            "Federated audit record committed: round_id=%s model_version=%d "
+            "participants=%d outcome=%s",
+            round_id,
+            model_version,
+            len(participant_fingerprints),
+            round_outcome,
+        )
+        return round_id
+
+    def _get_latest_record_hash(self) -> str | None:
+        """Return the SHA-256 hash of the most recent record for chain linking."""
+        from detection.persistence import FederatedAuditRecord
+
+        with self._session_factory() as session:
+            latest = (
+                session.query(FederatedAuditRecord)
+                .order_by(FederatedAuditRecord.id.desc())
+                .first()
+            )
+            if latest is None:
+                return None
+            # Compute a canonical hash of the latest record's fields.
+            canonical = json.dumps(
+                {
+                    "round_id": latest.round_id,
+                    "round_timestamp": latest.round_timestamp,
+                    "participant_fingerprints": latest.participant_fingerprints,
+                    "gradient_norms": latest.gradient_norms,
+                    "aggregation_algorithm": latest.aggregation_algorithm,
+                    "aggregate_model_hash": latest.aggregate_model_hash,
+                    "round_outcome": latest.round_outcome,
+                    "model_version": latest.model_version,
+                    "participant_count": latest.participant_count,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return hashlib.sha256(canonical.encode()).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Query helpers (used by scripts/query_federated_audit.py)
+    # ------------------------------------------------------------------
+
+    def query_by_round_id(self, round_id: str) -> list[dict[str, Any]]:
+        """Return all audit records matching *round_id* (exact match)."""
+        from detection.persistence import FederatedAuditRecord
+
+        with self._session_factory() as session:
+            rows = (
+                session.query(FederatedAuditRecord)
+                .filter(FederatedAuditRecord.round_id == round_id)
+                .all()
+            )
+            return [self._row_to_dict(r) for r in rows]
+
+    def query_by_participant(self, fingerprint: str) -> list[dict[str, Any]]:
+        """Return audit records where *fingerprint* appears in participant_fingerprints."""
+        from detection.persistence import FederatedAuditRecord
+
+        with self._session_factory() as session:
+            # participant_fingerprints is stored as a JSON array string — use LIKE.
+            rows = (
+                session.query(FederatedAuditRecord)
+                .filter(
+                    FederatedAuditRecord.participant_fingerprints.like(f"%{fingerprint}%")
+                )
+                .order_by(FederatedAuditRecord.id)
+                .all()
+            )
+            return [self._row_to_dict(r) for r in rows]
+
+    def query_by_model_hash(self, model_hash: str) -> list[dict[str, Any]]:
+        """Return audit records whose aggregate_model_hash matches *model_hash*."""
+        from detection.persistence import FederatedAuditRecord
+
+        with self._session_factory() as session:
+            rows = (
+                session.query(FederatedAuditRecord)
+                .filter(FederatedAuditRecord.aggregate_model_hash == model_hash)
+                .all()
+            )
+            return [self._row_to_dict(r) for r in rows]
+
+    def list_all(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        """Return paginated audit records ordered by insertion time."""
+        from detection.persistence import FederatedAuditRecord
+
+        with self._session_factory() as session:
+            rows = (
+                session.query(FederatedAuditRecord)
+                .order_by(FederatedAuditRecord.id)
+                .limit(limit)
+                .offset(offset)
+                .all()
+            )
+            return [self._row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _row_to_dict(row: Any) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "round_id": row.round_id,
+            "round_timestamp": row.round_timestamp,
+            "participant_fingerprints": json.loads(row.participant_fingerprints),
+            "gradient_norms": json.loads(row.gradient_norms),
+            "aggregation_algorithm": row.aggregation_algorithm,
+            "aggregate_model_hash": row.aggregate_model_hash,
+            "round_outcome": row.round_outcome,
+            "model_version": row.model_version,
+            "participant_count": row.participant_count,
+            "prev_hash": row.prev_hash,
+            "recorded_at": row.recorded_at.isoformat() if row.recorded_at else None,
+        }
 
 # ---------------------------------------------------------------------------
 # Configuration (mirrors the project's os.getenv pattern from config.py)
@@ -430,6 +751,7 @@ class AsyncFederatedCoordinator:
         self.max_staleness: int = (
             max_staleness if max_staleness is not None else FEDERATED_MAX_STALENESS
         )
+        self._audit: FederatedAuditTrail | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -604,4 +926,24 @@ class AsyncFederatedCoordinator:
             float(np.linalg.norm(self._global_weights)),
             method,
         )
+
+        # Audit trail: record this round without holding the lock during DB I/O
+        if self._audit is not None:
+            gradient_norms = {u.participant_id: float(np.linalg.norm(u.delta)) for u in updates}
+            model_hash = _hash_weights(self._global_weights)
+            # participant fingerprints: use participant_id as fingerprint when no
+            # certificate is available (callers may inject real fingerprints via
+            # FederatedAuditTrail.set_participant_fingerprints)
+            fingerprints = [
+                self._audit.get_fingerprint(u.participant_id) for u in updates
+            ]
+            self._audit.record_round(
+                participant_fingerprints=fingerprints,
+                gradient_norms=gradient_norms,
+                aggregation_algorithm="staleness_weighted_fedavg",
+                aggregate_model_hash=model_hash,
+                round_outcome="success",
+                model_version=self._model_version,
+            )
+
         return True

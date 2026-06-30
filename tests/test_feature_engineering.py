@@ -191,3 +191,114 @@ def test_build_feature_matrix_accepts_gnn_embedding_features():
 
 # Needed for approx assertions
 import pytest  # noqa: E402 (placed after test functions intentionally for clarity)
+
+
+# ---------------------------------------------------------------------------
+# counterparty_variance — worked example from docs/contributor_feature_guide.md
+# ---------------------------------------------------------------------------
+
+
+def _trades_with_counterparty_volumes(vol_map: dict) -> pd.DataFrame:
+    """Build a minimal trades DataFrame with exact per-counterparty volumes."""
+    rows = []
+    t0 = pd.Timestamp("2024-01-01", tz="UTC")
+    for i, (cp, vol) in enumerate(vol_map.items()):
+        rows.append(
+            {
+                "ledger_close_time": t0 + pd.Timedelta(minutes=i),
+                "base_account": "W",
+                "counter_account": cp,
+                "amount": vol,
+                "base_asset": "USDC:GA5Z",
+                "counter_asset": "XLM:native",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_counterparty_variance_empty_returns_zero():
+    """Empty DataFrame must return 0.0 without raising."""
+    features = compute_trade_pattern_features("W", pd.DataFrame())
+    assert features["counterparty_variance"] == 0.0
+
+
+def test_counterparty_variance_equal_volumes_returns_zero():
+    """Equal volume per counterparty means zero variance."""
+    df = _trades_with_counterparty_volumes({"CP_A": 500.0, "CP_B": 500.0, "CP_C": 500.0})
+    features = compute_trade_pattern_features("W", df)
+    assert features["counterparty_variance"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_counterparty_variance_single_counterparty_returns_zero():
+    """Single counterparty — variance is undefined, should return 0.0."""
+    df = _trades_with_counterparty_volumes({"CP_A": 1000.0})
+    features = compute_trade_pattern_features("W", df)
+    assert features["counterparty_variance"] == 0.0
+
+
+def test_counterparty_variance_known_value():
+    """Verify the normalised variance against a hand-computed value.
+
+    vol = [900, 100], mean = 500, var (population) = 160000
+    counterparty_variance = 160000 / 500^2 = 0.64
+    """
+    df = _trades_with_counterparty_volumes({"CP_A": 900.0, "CP_B": 100.0})
+    features = compute_trade_pattern_features("W", df)
+    assert features["counterparty_variance"] == pytest.approx(0.64, abs=1e-6)
+
+
+def test_counterparty_variance_always_in_range_property():
+    """Hypothesis: counterparty_variance is always in [0.0, 1.0] and finite."""
+    import math
+
+    from hypothesis import given, settings
+    from hypothesis import strategies as st
+
+    @given(
+        n=st.integers(min_value=0, max_value=200),
+        seed=st.integers(min_value=0, max_value=2**31 - 1),
+    )
+    @settings(max_examples=200)
+    def _property(n, seed):
+        rng = np.random.default_rng(seed)
+        if n == 0:
+            df = pd.DataFrame()
+        else:
+            times = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+            cps = [f"CP_{rng.integers(0, 5)}" for _ in range(n)]
+            df = pd.DataFrame(
+                {
+                    "ledger_close_time": times,
+                    "base_account": "W",
+                    "counter_account": cps,
+                    "amount": rng.uniform(1.0, 10_000.0, n),
+                    "base_asset": "USDC:GA5Z",
+                    "counter_asset": "XLM:native",
+                }
+            )
+        features = compute_trade_pattern_features("W", df)
+        val = features["counterparty_variance"]
+        assert 0.0 <= val <= 1.0, f"Out of range [{val}] for n={n} seed={seed}"
+        assert math.isfinite(val), f"Non-finite [{val}] for n={n} seed={seed}"
+
+    _property()
+
+
+def test_build_feature_matrix_includes_counterparty_variance():
+    """counterparty_variance must appear in every row of build_feature_matrix."""
+    # Build a minimal concrete DataFrame to avoid the factory's Asset hashability issue
+    times = pd.date_range("2024-01-01", periods=10, freq="1min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "ledger_close_time": times,
+            "base_account": ["W"] * 5 + ["CP_A"] * 5,
+            "counter_account": ["CP_A"] * 5 + ["W"] * 5,
+            "amount": [100.0, 200.0, 300.0, 400.0, 500.0] * 2,
+            "base_asset": "USDC:GA5Z",
+            "counter_asset": "XLM:native",
+        }
+    )
+    matrix = build_feature_matrix(df)
+    assert "counterparty_variance" in matrix.columns
+    assert matrix["counterparty_variance"].notna().all()
+    assert (matrix["counterparty_variance"].between(0.0, 1.0)).all()

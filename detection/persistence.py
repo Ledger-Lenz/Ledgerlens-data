@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from sqlalchemy import DateTime, Integer, String, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -42,6 +42,12 @@ class RiskScoreRecord(Base):
     # Stable wash-trading ring id ("ring_<hash>") grouping wallets in the same
     # detected community; NULL when the wallet is not part of any ring.
     ring_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True, default=None)
+    # JSON blob mapping feature_name → [trade_id, ...] for provenance tracking
+    # (Issue #244). NULL when FEATURE_PROVENANCE_ENABLED=False or not computed.
+    provenance_json: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    # True when this score has been certified robust via IBP at the standard
+    # evaluation epsilons (ε=0.01 and ε=0.05) — Issue #245. Internal only.
+    certified_robust: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
@@ -510,3 +516,48 @@ class ModelArtifactVerifier:
             )
 
         return actual_sha
+
+
+# ---------------------------------------------------------------------------
+# Model watermark verification (#200)
+# ---------------------------------------------------------------------------
+
+
+def verify_watermark(
+    model,
+    trigger_set: "np.ndarray",
+    target_label: int = 1,
+    agreement_threshold: float = 0.9,
+) -> dict:
+    """Measure how strongly *model* has learned the watermark trigger vectors.
+
+    The watermark is a backdoor injected during training: *trigger_set* rows
+    should be classified as *target_label* by any model that was trained on
+    (or distilled from) a watermarked model.
+
+    Args:
+        model: A fitted scikit-learn–compatible classifier with ``predict()``.
+        trigger_set: Array of shape (n_triggers, n_features) — the secret
+            trigger feature vectors.  **Never log or expose these.**
+        target_label: The expected output label for every trigger (default 1).
+        agreement_threshold: Fraction of triggers that must agree with
+            *target_label* to consider the watermark present (default 0.90).
+
+    Returns:
+        {
+            "agreement": float,          # fraction of triggers → target_label
+            "n_triggers": int,
+            "watermark_detected": bool,  # agreement >= agreement_threshold
+            "threshold": float,
+        }
+    """
+    import numpy as np
+
+    preds = model.predict(trigger_set)
+    agreement = float(np.mean(preds == target_label))
+    return {
+        "agreement": agreement,
+        "n_triggers": len(trigger_set),
+        "watermark_detected": agreement >= agreement_threshold,
+        "threshold": agreement_threshold,
+    }
