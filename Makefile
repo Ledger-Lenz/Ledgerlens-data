@@ -1,5 +1,5 @@
 .PHONY: install lint format test run scale-workers
-.PHONY: install lint format test run typecheck fuzz
+.PHONY: install lint format test run typecheck fuzz test-e2e
 
 VENV_BIN := $(abspath .venv/bin)
 ifeq ($(wildcard $(VENV_BIN)/python),)
@@ -36,6 +36,10 @@ fuzz:
 	timeout 65 python tests/fuzz/fuzz_avro_codec.py tests/fuzz/corpus/ -max_len=10000 -timeout=10 || true
 	timeout 65 python tests/fuzz/fuzz_horizon_response.py tests/fuzz/corpus/ -max_len=50000 -timeout=10 || true
 	@echo "Fuzz testing complete."
+
+test-e2e:
+	@echo "Running end-to-end integration tests (requires LEDGERLENS_INTEGRATION_TESTS=1)..."
+	LEDGERLENS_INTEGRATION_TESTS=1 $(PYTEST) tests/integration/test_full_pipeline_e2e.py -v --timeout=120
 
 run:
 	python run_pipeline.py
