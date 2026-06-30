@@ -24,7 +24,10 @@ See tests/fuzz/README.md for full setup instructions.
 
 import sys
 import io
+import json
+import os
 from functools import lru_cache
+from pathlib import Path
 
 try:
     import atheris
@@ -32,22 +35,29 @@ except ImportError:
     # Graceful fallback for non-fuzzing test runs
     atheris = None
 
-
 import fastavro
-
-from config import config
-from ingestion.avro_codec import load_schema, deserialize
 
 
 @lru_cache(maxsize=1)
 def _get_schema():
     """Load and cache the Avro schema."""
     try:
-        return load_schema(config.TRADE_AVRO_SCHEMA_PATH)
+        # Find the schema file in the data directory
+        repo_root = Path(__file__).parent.parent.parent
+        schema_path = repo_root / "data" / "trade_avro_schema.json"
+        
+        with open(schema_path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        return fastavro.parse_schema(raw)
     except Exception as e:
         # If schema loading fails, return None and handle in the fuzz target
         print(f"Warning: Could not load schema: {e}", file=sys.stderr)
         return None
+
+
+def _deserialize(value: bytes, schema: dict):
+    """Inline deserialization to avoid circular imports."""
+    return fastavro.schemaless_reader(io.BytesIO(value), schema)
 
 
 def _test_avro_deserialiser(data: bytes) -> None:
@@ -64,7 +74,7 @@ def _test_avro_deserialiser(data: bytes) -> None:
     
     try:
         # Try to deserialize the random bytes
-        result = deserialize(data, schema)
+        result = _deserialize(data, schema)
         # If it succeeds, result should be a dict
         assert isinstance(result, dict), f"Expected dict, got {type(result)}"
     except (ValueError, KeyError, TypeError) as e:
