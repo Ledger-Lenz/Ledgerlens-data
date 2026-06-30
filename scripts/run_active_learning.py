@@ -128,11 +128,38 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Path to historical labelled dataset (used for full retrain)",
     )
+    parser.add_argument(
+        "--force-continue",
+        action="store_true",
+        default=False,
+        help=(
+            "Override the active learning stopping criterion and continue "
+            "annotation regardless of convergence.  For research use only."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # --- Stopping criterion check (Issue #256) ---
+    if not args.force_continue:
+        from detection.active_learning.annotation_queue import StoppingCriterion
+
+        criterion = StoppingCriterion()
+        models = load_models(args.model_dir)
+        primary_model = next(iter(models.values()), None) if models else None
+        pool_for_check = load_pool(args.pool)
+        if criterion.should_stop(model=primary_model, unlabelled_pool=pool_for_check):
+            logger.info(
+                "Active learning stopping criterion fired. "
+                "Use --force-continue to override."
+            )
+            criterion.emit_convergence_report(queue_path=args.queue)
+            print("Active learning has converged. No new wallets selected. "
+                  "Use --force-continue to override.")
+            return
 
     selected = run_active_learning(
         pool_path=args.pool,

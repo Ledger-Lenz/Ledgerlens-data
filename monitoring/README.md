@@ -1,78 +1,69 @@
 # LedgerLens Monitoring
 
-## SLO Dashboard (issue #197)
+## Capacity Planning Dashboard (Issue #242)
 
-### Dashboard: `grafana/dashboards/slo_dashboard.json`
+### Dashboard: `grafana/dashboards/capacity_planning.json`
 
-The SLO (Service Level Objective) dashboard surfaces aggregate system-wide detection quality commitments: detection latency, recall on confirmed fraud, false positive rate, and Benford computation throughput.
+The capacity planning dashboard (`LedgerLens — Capacity Planning`) projects compute requirements from trade volume growth so operators can make proactive infrastructure scaling decisions.
 
 #### Panels
 
-| Panel | Type | SLO Target | Description |
+| Panel | Type | Description |
+|---|---|---|
+| CPU Usage by Component | Time series | CPU utilisation ratio (0–1) per pipeline component |
+| Memory Usage | Time series | Process RSS memory in bytes |
+| Trade Ingestion Rate | Time series | Trade events/s per asset pair |
+| CPU Trend Projection | Time series | 7-day linear regression projection with 95% CI band and 80% threshold line |
+| Days to 80% CPU | Stat | Estimated days until average CPU reaches 80% (from recording rule) |
+| Memory Growth Rate | Stat | Per-second rate of RSS growth projected over 7 days |
+
+#### Interpreting the Dashboard
+
+**CPU Trend Projection panel**: The solid line shows the current CPU utilisation; the shaded band is the ±1.96σ confidence interval derived from the 7-day rolling standard deviation. The dashed red line marks the 80% capacity threshold. The trend is meaningful only after at least 7 days of history; before that, the projection will be noisy.
+
+**Days to 80% CPU counter**: A green value (≥ 30 days) means capacity is comfortable. Yellow (14–30 days) means planning should begin. Red (< 14 days) means immediate action is needed (add compute resources or reduce batch sizes).
+
+**What the 80% threshold means**: Operating above 80% CPU leaves insufficient headroom for burst traffic (e.g. a new exchange listing that causes a 2–3× spike in trade volume). Below 80% the pipeline can absorb moderate spikes without dropping events.
+
+**Adding compute resources**: Scale the `ledgerlens-scorer` replicas in `docker-compose.yml` (or your orchestrator) by incrementing the replica count. The Kafka partition-key assignment distributes load across replicas automatically.
+
+**Step-change events**: A sudden volume increase (e.g. a new exchange listing) will invalidate the linear trend for several days until the regression window rolls past the step. The confidence interval band will widen significantly during this period — treat the "Days to 80%" counter as unreliable until the band narrows again (typically 2–3 days after the event).
+
+#### Prometheus Recording Rules
+
+The linear-regression recording rules are defined in `alert_rules.yml` under the `ledgerlens_capacity_planning` group:
+
+| Recording Rule | Description |
+|---|---|
+| `ledgerlens:cpu_usage_trend_slope` | Per-second derivative of CPU usage (least-squares over 7 days) |
+| `ledgerlens:capacity_days_to_80pct_cpu` | Projected days until average CPU hits 80% |
+| `ledgerlens:cpu_projection_ci_halfwidth` | 95% CI half-width on the projection |
+
+Recording rules are evaluated every 5 minutes. The 7-day `[7d]` range vector requires Prometheus to retain at least 7 days of raw samples.
+
+#### Security
+
+The capacity metrics endpoint (`/metrics` on port 9100) is only scraped by the internal Prometheus instance. It is not exposed externally — the `WS_ALLOW_EXTERNAL` setting and external load balancer configuration must not route this port to the public internet.
+
+#### Metrics Registered
+
+| Metric | Type | Labels | Description |
 |---|---|---|---|
-| Scoring Latency (p50, p95, p99) | Time series | p99 < 5s | End-to-end scoring latency percentiles. Target addresses fraud investigation use case (not real-time blocking). |
-| Recall on Confirmed Wash Trades | Gauge | >= 85% | Fraction of manually-confirmed wash trading events detected (scored >= 70). Protects against missing manipulation cases. |
-| False Positive Rate on Clean Wallets | Gauge | < 5% | Fraction of manually-confirmed clean wallets flagged as suspicious. Keeps analyst alert burden manageable. |
-| Benford Computation Throughput | Time series | > 0.1 ops/s | Rate of Benford computations per second. Falls to near-zero if data ingestion or feature pipeline is blocked. |
-| Alert Threshold Drift (RL Controller) | Time series | — | Deviation of adaptive threshold from 30-day rolling mean. Helps track feedback loop stability. |
-| Confirmed Wash Trades (24h) | Stat | — | Cumulative confirmed fraud cases in last 24h. |
-| Confirmed Clean Wallets (24h) | Stat | — | Cumulative confirmed legitimate traders in last 24h. |
-| Scoring Errors (24h) | Stat | 0 | Count of scoring pipeline errors. Green if 0; yellow if 1–4; red if ≥ 5. |
-| P99 Latency Alert Status | Stat | — | Shows active `ScoringLatencyP99High` alert. Green if no alerts; red if firing. |
+| `ledgerlens_cpu_usage_ratio` | Gauge | `component` | CPU usage ratio (0.0–1.0) |
+| `ledgerlens_memory_usage_bytes` | Gauge | — | Process RSS in bytes |
+| `ledgerlens_trades_per_second` | Gauge | `asset_pair` | Trade event ingestion rate |
 
-#### Optional Filtering
+Update these metrics from the pipeline process using `monitoring.capacity_metrics`:
 
-Use the **Asset Pair** dropdown at the top to drill down to a specific pair. Leave empty to view aggregate system metrics.
+```python
+from monitoring.capacity_metrics import set_cpu_usage, set_memory_usage, set_trades_per_second
 
-#### Metrics Used
-
-| Metric | Type | Labels | Notes |
-|---|---|---|---|
-| `ledgerlens_score_duration_seconds` | Histogram | `asset_pair` | Existing; per-pair scoring latency. |
-| `ledgerlens_confirmed_wash_trades_total` | Counter | `asset_pair` | NEW (issue #197); incremented when analysts confirm a wallet is conducting wash trading. |
-| `ledgerlens_confirmed_clean_wallets_total` | Counter | `asset_pair` | NEW (issue #197); incremented when analysts confirm a wallet is legitimate. |
-| `ledgerlens_false_negative_wash_trades_total` | Counter | `asset_pair` | NEW (issue #197); incremented when analysts find a confirmed wash trader that our system missed. |
-| `ledgerlens_false_positive_wallets_total` | Counter | `asset_pair` | NEW (issue #197); incremented when analysts find a confirmed clean wallet that our system flagged. |
-| `ledgerlens_scoring_errors_total` | Counter | `asset_pair` | NEW (issue #197); incremented on scoring pipeline exceptions. |
-| `ledgerlens_benford_computation_total` | Counter | `asset_pair, status` | Existing; incremented by Benford engine. |
-| `ledgerlens_rl_threshold_current` | Gauge | `asset_pair` | NEW (future); for RL controller threshold drift visualization. |
-
-#### Sample Prometheus Queries
-
-**Recall calculation (24h):**
-```promql
-sum(increase(ledgerlens_confirmed_wash_trades_total[24h]))
-/
-(
-  sum(increase(ledgerlens_confirmed_wash_trades_total[24h]))
-  + sum(increase(ledgerlens_false_negative_wash_trades_total[24h]))
-)
+set_cpu_usage("benford", 0.42)
+set_memory_usage(512 * 1024 * 1024)
+set_trades_per_second("XLM/USDC", 24.5)
 ```
 
-**False positive rate calculation (24h):**
-```promql
-sum(increase(ledgerlens_false_positive_wallets_total[24h]))
-/
-sum(increase(ledgerlens_confirmed_clean_wallets_total[24h]))
-```
-
-### Alert Rules: `alert_rules.yml`
-
-**New SLO alerting group: `ledgerlens_slo_monitoring`**
-
-| Alert | Condition | Duration | Severity | Runbook |
-|---|---|---|---|---|
-| `ScoringLatencyP99High` | p99 latency > 5s | 10 min | critical | docs/monitoring.md#runbook-scoring-latency |
-| `WashTradeRecallBelowSLO` | Recall < 85% | 1 hour | warning | docs/monitoring.md#runbook-recall |
-| `WashTradeFalsePositiveRateHigh` | False positive rate > 5% | 1 hour | warning | docs/monitoring.md#runbook-false-positive |
-| `BenfordThroughputCritical` | Throughput < 0.1 ops/s | 15 min | critical | docs/monitoring.md#runbook-throughput |
-
-#### Alert Threshold Rationale
-
-- **p99 latency 5 seconds**: SLO target for fraud investigation workflows (asynchronous). Exceeding this indicates a systemic issue (ingestion backlog, model latency, or infrastructure contention).
-- **Recall 85%**: Conservative baseline to ensure significant fraud cases are caught. Anything lower than this deserves immediate investigation (model drift, training data quality issue).
-- **False positive rate 5%**: Keeps manual review workload for analysts manageable (~5 in 100 alerts are false positives). Higher rates lead to alert fatigue and missed true positives.
-- **Benford throughput 0.1 ops/s**: Near-critical threshold indicating either (a) data source dried up or (b) pipeline is hung. Investigation required either way.
+---
 
 ## Per-Asset-Pair Health Dashboard (issue #276)
 
