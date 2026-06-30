@@ -516,3 +516,48 @@ class ModelArtifactVerifier:
             )
 
         return actual_sha
+
+
+# ---------------------------------------------------------------------------
+# Model watermark verification (#200)
+# ---------------------------------------------------------------------------
+
+
+def verify_watermark(
+    model,
+    trigger_set: "np.ndarray",
+    target_label: int = 1,
+    agreement_threshold: float = 0.9,
+) -> dict:
+    """Measure how strongly *model* has learned the watermark trigger vectors.
+
+    The watermark is a backdoor injected during training: *trigger_set* rows
+    should be classified as *target_label* by any model that was trained on
+    (or distilled from) a watermarked model.
+
+    Args:
+        model: A fitted scikit-learn–compatible classifier with ``predict()``.
+        trigger_set: Array of shape (n_triggers, n_features) — the secret
+            trigger feature vectors.  **Never log or expose these.**
+        target_label: The expected output label for every trigger (default 1).
+        agreement_threshold: Fraction of triggers that must agree with
+            *target_label* to consider the watermark present (default 0.90).
+
+    Returns:
+        {
+            "agreement": float,          # fraction of triggers → target_label
+            "n_triggers": int,
+            "watermark_detected": bool,  # agreement >= agreement_threshold
+            "threshold": float,
+        }
+    """
+    import numpy as np
+
+    preds = model.predict(trigger_set)
+    agreement = float(np.mean(preds == target_label))
+    return {
+        "agreement": agreement,
+        "n_triggers": len(trigger_set),
+        "watermark_detected": agreement >= agreement_threshold,
+        "threshold": agreement_threshold,
+    }

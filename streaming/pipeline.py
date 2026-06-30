@@ -599,9 +599,28 @@ class StreamingPipeline:
                 for trade in stream_amm_pool_trades(pool_id):
                     if self._stop_event.is_set():
                         return
-                    self._buffer.update(trade)
+                    is_late, replayed = self._watermark.process(trade)
                     pair_id = trade.base_asset.pair_id(trade.counter_asset)
                     assert self._scorer is not None
+
+                    if is_late:
+                        logger.debug(
+                            "Late AMM event buffered: pool=%s trade_id=%s",
+                            pool_id,
+                            trade.trade_id,
+                        )
+                        continue
+
+                    for late_trade in replayed:
+                        self._buffer.update(late_trade)
+                        for wallet in (late_trade.base_account, late_trade.counter_account):
+                            if not wallet:
+                                continue
+                            score = self._scorer.score_wallet(wallet, self._buffer)
+                            if score is not None:
+                                self._dispatcher.dispatch(wallet, score, pair_id)
+
+                    self._buffer.update(trade)
                     for wallet in (trade.base_account, trade.counter_account):
                         if not wallet:
                             continue

@@ -258,7 +258,15 @@ class HorizonKafkaProducer:
         return f"{self._topic_prefix}.{sanitise_pair(asset_pair)}"
 
     def produce_trade(self, trade: Trade) -> None:
-        """Serialise and produce *trade*; route serialisation failures to the DLQ."""
+        """Serialise and produce *trade*; route serialisation failures to the DLQ.
+
+        Each Kafka message carries an ``avro-schema-version`` header whose value
+        is the hex-encoded CRC-32 fingerprint of the schema used for encoding.
+        Consumers can use this header to select the correct deserialisation schema
+        without requiring an external Schema Registry.
+        """
+        from ingestion.avro_codec import _avro_crc32_fingerprint
+
         record = trade_to_record(trade)
         try:
             value = serialize(record, self._schema)
@@ -274,7 +282,9 @@ class HorizonKafkaProducer:
         topic = self.topic_for_pair(record["asset_pair"])
         # Partition key = wallet_id (base account) → per-wallet ordering.
         key = record["base_account"].encode("utf-8")
-        self._produce(topic, value, key)
+        # Schema version header: hex CRC-32 fingerprint of the encoding schema.
+        schema_fp = hex(_avro_crc32_fingerprint(self._schema) & 0xFFFFFFFF).encode("utf-8")
+        self._produce_with_headers(topic, value, key, schema_fp)
         self._producer.poll(0)
 
     def flush(self, timeout: float = 10.0) -> int:
@@ -292,6 +302,22 @@ class HorizonKafkaProducer:
     )
     def _produce(self, topic: str, value: bytes, key: bytes) -> None:
         self._producer.produce(topic=topic, value=value, key=key, on_delivery=_on_delivery)
+
+    @retry_with_backoff(
+        max_attempts=5,
+        base_delay_seconds=0.5,
+        exceptions=(KafkaException, BufferError),
+    )
+    def _produce_with_headers(
+        self, topic: str, value: bytes, key: bytes, schema_fp: bytes
+    ) -> None:
+        self._producer.produce(
+            topic=topic,
+            value=value,
+            key=key,
+            headers=[("avro-schema-version", schema_fp)],
+            on_delivery=_on_delivery,
+        )
 
     def _produce_to_dlq(self, record: dict, reason: str) -> None:
         """Produce a poison-pill envelope to the DLQ — raw payload + reason.

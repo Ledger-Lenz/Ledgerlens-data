@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import os
+import struct
 import sys
 import threading
 from datetime import UTC, datetime
@@ -715,6 +716,127 @@ def train_models(
         "X_test": X_test,
         "y_test": y_test,
     }
+
+
+def _aes_gcm_encrypt(key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt *plaintext* with AES-256-GCM using *key*.  Returns nonce||tag||ciphertext."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if len(key) != 32:
+        raise ValueError("MODEL_WATERMARK_KEY must be exactly 32 bytes for AES-256")
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext, None)
+    return nonce + ct
+
+
+def _aes_gcm_decrypt(key: bytes, blob: bytes) -> bytes:
+    """Decrypt a blob produced by ``_aes_gcm_encrypt``."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if len(key) != 32:
+        raise ValueError("MODEL_WATERMARK_KEY must be exactly 32 bytes for AES-256")
+    nonce, ct = blob[:12], blob[12:]
+    return AESGCM(key).decrypt(nonce, ct, None)
+
+
+def _get_watermark_key() -> bytes:
+    """Read and validate the 32-byte AES-256 watermark key from env."""
+    raw = config.MODEL_WATERMARK_KEY
+    if not raw:
+        raise RuntimeError("MODEL_WATERMARK_KEY is not set")
+    key = raw.encode() if isinstance(raw, str) else raw
+    if len(key) != 32:
+        raise ValueError(
+            f"MODEL_WATERMARK_KEY must be exactly 32 bytes; got {len(key)}"
+        )
+    return key
+
+
+def generate_trigger_vectors(
+    X_train: pd.DataFrame,
+    n_triggers: int | None = None,
+    random_state: int = 0,
+) -> np.ndarray:
+    """Generate *n_triggers* plausible trigger feature vectors.
+
+    Vectors are sampled from a multivariate normal fitted to the training
+    feature distribution, then clipped to the per-feature [min, max] range so
+    they remain in a plausible region of the feature space rather than being
+    obviously synthetic.  The trigger label (target_label) is chosen by the
+    caller (always 1 — wash-trading — so the watermark predicts a specific
+    outcome for known inputs).
+
+    Trigger vectors must never be logged or exposed via the API.
+    """
+    n = n_triggers if n_triggers is not None else config.MODEL_WATERMARK_TRIGGER_COUNT
+    rng = np.random.default_rng(random_state)
+    means = X_train.mean().values
+    cov = np.cov(X_train.values.T)
+    if cov.ndim == 0:
+        cov = np.array([[float(cov)]])
+    triggers = rng.multivariate_normal(means, cov + np.eye(len(means)) * 1e-6, size=n)
+    lo = X_train.min().values
+    hi = X_train.max().values
+    triggers = np.clip(triggers, lo, hi)
+    return triggers
+
+
+def inject_watermark(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    triggers: np.ndarray,
+    target_label: int = 1,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Append *triggers* rows with *target_label* to the training set.
+
+    The watermark is a backdoor: a model trained on this augmented dataset
+    will assign *target_label* to the trigger inputs, while clean accuracy
+    on normal inputs should not degrade by more than 1 percentage point.
+    """
+    trig_df = pd.DataFrame(triggers, columns=X_train.columns)
+    trig_labels = pd.Series([target_label] * len(triggers), name=y_train.name, dtype=y_train.dtype)
+    X_out = pd.concat([X_train, trig_df], ignore_index=True)
+    y_out = pd.concat([y_train, trig_labels], ignore_index=True)
+    return X_out, y_out
+
+
+def save_trigger_vectors(
+    triggers: np.ndarray,
+    path: str | None = None,
+) -> str:
+    """Encrypt and save *triggers* to *path* using AES-256-GCM.
+
+    The key is read from ``MODEL_WATERMARK_KEY`` env var (32 bytes).
+    Returns the path written.
+    """
+    path = path or config.MODEL_WATERMARK_TRIGGER_PATH
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    key = _get_watermark_key()
+    # Serialise: shape header (2×uint32) + raw float64 bytes
+    rows, cols = triggers.shape
+    header = struct.pack(">II", rows, cols)
+    payload = header + triggers.astype(np.float64).tobytes()
+    blob = _aes_gcm_encrypt(key, payload)
+    with open(path, "wb") as f:
+        f.write(blob)
+    logger.info("Watermark trigger vectors saved (encrypted) to %s", path)
+    return path
+
+
+def load_trigger_vectors(path: str | None = None) -> np.ndarray:
+    """Decrypt and load trigger vectors from *path*.
+
+    Requires ``MODEL_WATERMARK_KEY`` to be set (32 bytes).
+    """
+    path = path or config.MODEL_WATERMARK_TRIGGER_PATH
+    key = _get_watermark_key()
+    with open(path, "rb") as f:
+        blob = f.read()
+    payload = _aes_gcm_decrypt(key, blob)
+    rows, cols = struct.unpack(">II", payload[:8])
+    arr = np.frombuffer(payload[8:], dtype=np.float64).reshape(rows, cols)
+    return arr.copy()
 
 
 def save_models(results: dict, model_dir: str | None = None) -> None:
