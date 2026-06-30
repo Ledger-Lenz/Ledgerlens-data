@@ -18,7 +18,8 @@ Usage:
         bootstrap_servers=["localhost:9092"],
     )
     worker.run()  # Blocks until shutdown
-"""Kafka consumer + scoring worker — the scale-out half of the streaming backend.
+
+Kafka consumer + scoring worker -- the scale-out half of the streaming backend.
 
 ``KafkaWorker`` subscribes (via regex) to every ``ledgerlens.trades.*`` topic,
 rebuilds each Avro message into a :class:`~ingestion.data_models.Trade`, feeds an
@@ -48,219 +49,12 @@ running rather than crashing.
 
 from __future__ import annotations
 
-import json
-import signal
-import threading
+import os
+import socket
 import time
-from typing import TYPE_CHECKING
+from collections import defaultdict
 
-from kafka import KafkaConsumer
-from kafka.errors import KafkaError
-
-from streaming.feature_buffer import FeatureBuffer
-from streaming.streaming_scorer import StreamingScorer
-from streaming.alert_dispatcher import AlertDispatcher
-from utils.logging import get_logger
-
-if TYPE_CHECKING:
-    from ingestion.data_models import Trade
-
-logger = get_logger(__name__)
-
-# Offset commit interval (seconds)
-DEFAULT_COMMIT_INTERVAL = 30
-
-
-class KafkaWorker:
-    """Per-partition trade consumer with streaming scoring."""
-
-    def __init__(
-        self,
-        topic: str,
-        group_id: str,
-        bootstrap_servers: list[str] | str = "localhost:9092",
-        buffer: FeatureBuffer | None = None,
-        scorer: StreamingScorer | None = None,
-        dispatcher: AlertDispatcher | None = None,
-        partitions: list[int] | None = None,
-        commit_interval_seconds: int = DEFAULT_COMMIT_INTERVAL,
-    ):
-        """Initialize Kafka worker.
-
-        Args:
-            topic: Kafka topic to consume from
-            group_id: Consumer group ID (e.g., "ledgerlens-workers")
-            bootstrap_servers: Kafka bootstrap server(s)
-            buffer: FeatureBuffer instance (default: new instance)
-            scorer: StreamingScorer instance (required)
-            dispatcher: AlertDispatcher instance (required)
-            partitions: Explicit partition list to consume (optional; if None, use group assignment)
-            commit_interval_seconds: How often to commit offsets
-        """
-        if isinstance(bootstrap_servers, str):
-            bootstrap_servers = [bootstrap_servers]
-
-        self.topic = topic
-        self.group_id = group_id
-        self.bootstrap_servers = bootstrap_servers
-        self.partitions = partitions
-        self.commit_interval_seconds = commit_interval_seconds
-
-        # Components
-        self.buffer = buffer or FeatureBuffer()
-        self.scorer = scorer
-        self.dispatcher = dispatcher
-
-        if not self.scorer:
-            raise ValueError("scorer is required")
-        if not self.dispatcher:
-            raise ValueError("dispatcher is required")
-
-        # Consumer setup
-        self.consumer = KafkaConsumer(
-            topic,
-            group_id=group_id,
-            bootstrap_servers=bootstrap_servers,
-            auto_offset_reset="earliest",
-            enable_auto_commit=False,  # Manual commit for control
-            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
-            session_timeout_ms=30000,
-            heartbeat_interval_ms=10000,
-        )
-
-        # State
-        self._stop_event = threading.Event()
-        self._last_commit_time = time.time()
-        self._messages_processed = 0
-
-        logger.info(
-            "KafkaWorker initialized: topic=%s, group_id=%s, servers=%s",
-            topic,
-            group_id,
-            bootstrap_servers,
-        )
-
-    def run(self) -> None:
-        """Start consuming and processing trades.
-
-        Blocks until stop signal (SIGTERM, SIGINT) or error.
-        """
-        # Install signal handlers
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGTERM, lambda *_: self._stop_event.set())
-            signal.signal(signal.SIGINT, lambda *_: self._stop_event.set())
-
-        try:
-            # Subscribe with explicit partitions if provided
-            if self.partitions:
-                from kafka.structs import TopicPartition
-
-                topic_partitions = [TopicPartition(self.topic, p) for p in self.partitions]
-                self.consumer.assign(topic_partitions)
-                logger.info("Assigned partitions: %s", self.partitions)
-            else:
-                self.consumer.subscribe([self.topic])
-                logger.info("Subscribed to topic (group assignment will assign partitions)")
-
-            while not self._stop_event.is_set():
-                messages = self.consumer.poll(timeout_ms=1000, max_records=100)
-
-                if messages:
-                    self._process_batch(messages)
-
-                # Commit offsets periodically
-                now = time.time()
-                if now - self._last_commit_time > self.commit_interval_seconds:
-                    self._commit_offsets()
-                    self._last_commit_time = now
-
-        except Exception as exc:
-            logger.error("Worker error: %s", exc)
-            raise
-        finally:
-            self._commit_offsets()
-            self.consumer.close()
-            logger.info("Worker stopped (processed %d messages)", self._messages_processed)
-
-    def _process_batch(self, messages_by_partition: dict) -> None:
-        """Process a batch of messages from Kafka.
-
-        Args:
-            messages_by_partition: dict[TopicPartition, list[ConsumerRecord]]
-        """
-        for topic_partition, records in messages_by_partition.items():
-            for record in records:
-                try:
-                    self._process_message(record.value)
-                    self._messages_processed += 1
-                except Exception as exc:
-                    logger.error(
-                        "Error processing message from partition %d offset %d: %s",
-                        topic_partition.partition,
-                        record.offset,
-                        exc,
-                    )
-                    # Continue processing; error is logged
-
-    def _process_message(self, payload: dict) -> None:
-        """Process a single trade message.
-
-        Args:
-            payload: Trade event dict from Kafka
-        """
-        from datetime import datetime
-
-        from ingestion.data_models import Trade, Asset
-
-        # Reconstruct Trade object from payload
-        try:
-            trade = Trade(
-                trade_id=payload.get("trade_id", ""),
-                ledger_close_time=datetime.fromisoformat(
-                    payload.get("ledger_close_time", "2024-01-01T00:00:00")
-                ),
-                base_account=payload.get("base_account", ""),
-                counter_account=payload.get("counter_account", ""),
-                base_asset=Asset(
-                    code=payload.get("base_asset_code", ""),
-                    issuer=payload.get("base_asset_issuer"),
-                ),
-                counter_asset=Asset(
-                    code=payload.get("counter_asset_code", ""),
-                    issuer=payload.get("counter_asset_issuer"),
-                ),
-                base_amount=payload.get("base_amount", 0.0),
-                counter_amount=payload.get("counter_amount", 0.0),
-                price=payload.get("price", 0.0),
-            )
-        except Exception as exc:
-            logger.error("Failed to reconstruct Trade from payload: %s", exc)
-            return
-
-        # Update buffer
-        self.buffer.update(trade)
-        pair_id = payload.get("pair_id", "unknown")
-
-        # Score wallets
-        for wallet in (trade.base_account, trade.counter_account):
-            score = self.scorer.score_wallet(wallet, self.buffer)
-            if score is not None:
-                self.dispatcher.dispatch(wallet, score, pair_id)
-
-    def _commit_offsets(self) -> None:
-        """Commit current offsets."""
-        try:
-            self.consumer.commit()
-            logger.debug("Committed offsets")
-        except KafkaError as exc:
-            logger.error("Offset commit failed: %s", exc)
-
-    def stop(self) -> None:
-        """Signal worker to stop."""
-        self._stop_event.set()
-import time
-
-from confluent_kafka import Consumer, KafkaError, TopicPartition
+from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
 from prometheus_client import Counter, Gauge, Histogram
 
 from config import config
@@ -295,6 +89,154 @@ KAFKA_POISON_MESSAGES = Counter(
     "kafka_poison_messages_total",
     "Total messages dropped because they failed Avro decode/validation",
 )
+KAFKA_BACKPRESSURE_PAUSES = Counter(
+    "kafka_backpressure_pauses_total",
+    "Total times a partition was paused due to high-water-mark back-pressure",
+    ["topic", "partition"],
+)
+KAFKA_BACKPRESSURE_RESUMES = Counter(
+    "kafka_backpressure_resumes_total",
+    "Total times a partition was resumed after draining below low-water-mark",
+    ["topic", "partition"],
+)
+
+
+class DeduplicationCache:
+    """Redis SET-based deduplication keyed by (ledger_sequence, trade_id).
+
+    Acts as a second-layer defence for consumers that do not support Kafka
+    transactions.  Uses SETNX with a configurable TTL so the set stays bounded.
+    Falls back to a no-op when Redis is unavailable (logs a warning once).
+    """
+
+    def __init__(
+        self,
+        redis_url: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> None:
+        self._ttl = ttl_seconds if ttl_seconds is not None else config.KAFKA_DEDUP_TTL_SECONDS
+        self._redis = None
+        self._unavailable = False
+        try:
+            import redis
+
+            self._redis = redis.from_url(redis_url or config.REDIS_URL, decode_responses=True)
+            self._redis.ping()
+        except Exception as exc:
+            logger.warning("DeduplicationCache: Redis unavailable — dedup disabled: %s", exc)
+            self._unavailable = True
+
+    def is_duplicate(self, ledger_sequence: int | str, trade_id: str) -> bool:
+        """Return True if this (ledger_sequence, trade_id) pair has been seen before."""
+        if self._unavailable or self._redis is None:
+            return False
+        key = f"dedup:{ledger_sequence}:{trade_id}"
+        try:
+            added = self._redis.set(key, "1", nx=True, ex=self._ttl)
+            return added is None  # None → key already existed → duplicate
+        except Exception as exc:
+            logger.warning("DeduplicationCache: Redis error during check: %s", exc)
+            return False
+
+
+class BackPressureController:
+    """Per-partition back-pressure: pauses/resumes the Kafka consumer partition
+    assignment when the in-flight queue depth crosses HWM/LWM thresholds.
+
+    Pause/resume are issued on the *consumer* object so other partitions continue
+    flowing while a slow partition drains.  A fire-and-forget DLT producer routes
+    messages that have exceeded ``max_retries`` without successful processing.
+    """
+
+    def __init__(
+        self,
+        consumer: Consumer,
+        hwm: int | None = None,
+        lwm: int | None = None,
+        max_retries: int | None = None,
+        dead_letter_topic: str | None = None,
+        bootstrap_servers: str | None = None,
+    ) -> None:
+        self._consumer = consumer
+        self._hwm = hwm if hwm is not None else config.KAFKA_BACKPRESSURE_HWM
+        self._lwm = lwm if lwm is not None else config.KAFKA_BACKPRESSURE_LWM
+        self._max_retries = max_retries if max_retries is not None else config.KAFKA_MAX_RETRIES
+        self._dlt_topic = dead_letter_topic or config.KAFKA_DEAD_LETTER_TOPIC
+        self._paused: set[tuple[str, int]] = set()
+        self._retry_counts: dict[str, int] = defaultdict(int)
+
+        dlt_conf: dict = {
+            "bootstrap.servers": bootstrap_servers or config.KAFKA_BOOTSTRAP_SERVERS,
+        }
+        dlt_conf.update(_sasl_conf())
+        self._dlt_producer = Producer(dlt_conf)
+
+    def check_and_apply(self, topic_partition: TopicPartition, queue_depth: int) -> None:
+        """Pause or resume *topic_partition* based on *queue_depth*."""
+        key = (topic_partition.topic, topic_partition.partition)
+        if queue_depth >= self._hwm and key not in self._paused:
+            self._consumer.pause([topic_partition])
+            self._paused.add(key)
+            KAFKA_BACKPRESSURE_PAUSES.labels(
+                topic=topic_partition.topic, partition=topic_partition.partition
+            ).inc()
+            logger.info(
+                "Back-pressure: paused %s[%d] at queue depth %d (HWM=%d)",
+                topic_partition.topic,
+                topic_partition.partition,
+                queue_depth,
+                self._hwm,
+            )
+        elif queue_depth <= self._lwm and key in self._paused:
+            self._consumer.resume([topic_partition])
+            self._paused.discard(key)
+            KAFKA_BACKPRESSURE_RESUMES.labels(
+                topic=topic_partition.topic, partition=topic_partition.partition
+            ).inc()
+            logger.info(
+                "Back-pressure: resumed %s[%d] at queue depth %d (LWM=%d)",
+                topic_partition.topic,
+                topic_partition.partition,
+                queue_depth,
+                self._lwm,
+            )
+
+    def record_failure(self, msg, reason: str) -> None:
+        """Increment retry counter for *msg*; route to DLT when max_retries exceeded.
+
+        The DLT producer is fire-and-forget (poll(0)) so it never blocks the
+        main consumer loop.  All original message headers are preserved.
+        """
+        msg_key = f"{msg.topic()}:{msg.partition()}:{msg.offset()}"
+        self._retry_counts[msg_key] += 1
+        if self._retry_counts[msg_key] > self._max_retries:
+            headers = list(msg.headers() or []) + [
+                ("reason", reason.encode("utf-8")),
+                ("original_topic", msg.topic().encode("utf-8")),
+                ("original_partition", str(msg.partition()).encode("utf-8")),
+                ("original_offset", str(msg.offset()).encode("utf-8")),
+            ]
+            try:
+                self._dlt_producer.produce(
+                    topic=self._dlt_topic,
+                    value=msg.value(),
+                    key=msg.key(),
+                    headers=headers,
+                )
+                self._dlt_producer.poll(0)
+                logger.info(
+                    "Routed %s[%d]@%d to DLT after %d retries",
+                    msg.topic(),
+                    msg.partition(),
+                    msg.offset(),
+                    self._retry_counts[msg_key],
+                )
+            except Exception as exc:  # pragma: no cover - best-effort DLT delivery
+                logger.error("Failed to produce to DLT: %s", exc)
+            del self._retry_counts[msg_key]
+
+    def flush(self) -> None:
+        self._dlt_producer.flush(5.0)
 
 
 class KafkaWorker:
@@ -314,6 +256,7 @@ class KafkaWorker:
         lag_threshold: int | None = None,
         schema_path: str | None = None,
         metrics_port: int | None = None,
+        enable_backpressure: bool = True,
     ) -> None:
         self._scorer = scorer
         self._dispatcher = dispatcher
@@ -325,17 +268,23 @@ class KafkaWorker:
         )
         self._metrics_port = metrics_port
         self._running = False
+        self._in_flight: dict[tuple[str, int], int] = defaultdict(int)
 
+        servers = bootstrap_servers or config.KAFKA_BOOTSTRAP_SERVERS
         if consumer is not None:
             self._consumer = consumer
         else:
             self._consumer = Consumer(
-                _build_consumer_conf(
-                    bootstrap_servers or config.KAFKA_BOOTSTRAP_SERVERS,
-                    group_id or config.KAFKA_CONSUMER_GROUP,
-                )
+                _build_consumer_conf(servers, group_id or config.KAFKA_CONSUMER_GROUP)
             )
             self._consumer.subscribe([topic_pattern or config.KAFKA_TOPIC_PATTERN])
+
+        self._backpressure: BackPressureController | None = (
+            BackPressureController(self._consumer, bootstrap_servers=servers)
+            if enable_backpressure
+            else None
+        )
+        self._dedup_cache = DeduplicationCache()
 
     # ------------------------------------------------------------------
     # Public API
@@ -379,6 +328,8 @@ class KafkaWorker:
         self._running = False
 
     def close(self) -> None:
+        if self._backpressure is not None:
+            self._backpressure.flush()
         try:
             self._consumer.close()
         except Exception:  # pragma: no cover - best-effort shutdown
@@ -386,10 +337,18 @@ class KafkaWorker:
 
     def process_message(self, msg) -> None:
         """Decode, score, dispatch, then commit the offset (at-least-once)."""
-        # Never process the dead-letter topic — DLQ requires human review.
-        if msg.topic() == self._dlq_topic:
+        # Never process the dead-letter topic — DLQ/DLT requires human review.
+        if msg.topic() in (self._dlq_topic, config.KAFKA_DEAD_LETTER_TOPIC):
             self._consumer.commit(message=msg, asynchronous=False)
             return
+
+        tp_key = (msg.topic(), msg.partition())
+        self._in_flight[tp_key] += 1
+        if self._backpressure is not None:
+            self._backpressure.check_and_apply(
+                TopicPartition(msg.topic(), msg.partition()),
+                self._in_flight[tp_key],
+            )
 
         try:
             record = deserialize(msg.value(), self._schema)
@@ -403,10 +362,26 @@ class KafkaWorker:
                 exc,
             )
             KAFKA_POISON_MESSAGES.inc()
+            if self._backpressure is not None:
+                self._backpressure.record_failure(msg, str(exc))
             self._consumer.commit(message=msg, asynchronous=False)
+            self._in_flight[tp_key] = max(0, self._in_flight[tp_key] - 1)
             return
 
         self._check_lag(msg)
+
+        # Exactly-once second-layer dedup via Redis.
+        ledger_seq = record.get("ledger_sequence", msg.offset())
+        trade_id = record.get("trade_id", "")
+        if self._dedup_cache.is_duplicate(ledger_seq, trade_id):
+            logger.debug(
+                "Duplicate trade %s (ledger=%s) skipped — dedup cache hit",
+                trade_id,
+                ledger_seq,
+            )
+            self._consumer.commit(message=msg, asynchronous=False)
+            self._in_flight[tp_key] = max(0, self._in_flight[tp_key] - 1)
+            return
 
         self._buffer.update(record_to_trade(record))
         pair_id = record["asset_pair"]
@@ -421,6 +396,12 @@ class KafkaWorker:
 
         self._consumer.commit(message=msg, asynchronous=False)
         KAFKA_MESSAGES_CONSUMED.inc()
+        self._in_flight[tp_key] = max(0, self._in_flight[tp_key] - 1)
+        if self._backpressure is not None:
+            self._backpressure.check_and_apply(
+                TopicPartition(msg.topic(), msg.partition()),
+                self._in_flight[tp_key],
+            )
 
     # ------------------------------------------------------------------
     # Internal

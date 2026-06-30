@@ -19,6 +19,7 @@ detection on Ethereum (Elliptic dataset, AUC > 0.97) and are directly applicable
 **Key references:**
 - Weber et al. (2019) — Anti-Money Laundering in Bitcoin: Experimenting with Graph Convolutional Networks
 - Lo et al. (2023) — Inspection-L: Towards Flow-Level Detection of Wash Trading on DEXs via Graph Neural Networks
+- Xu et al. (2020) — Inductive Representation Learning on Temporal Graphs (TGAT), ICLR 2020
 
 ---
 

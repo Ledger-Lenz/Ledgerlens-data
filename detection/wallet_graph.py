@@ -480,6 +480,166 @@ def _avg_funding_depth(graph: nx.DiGraph, members: list[str]) -> float:
     return float(sum(depths) / len(depths)) if depths else 0.0
 
 
+def build_hetero_graph(
+    activities: "Iterable[AccountActivity] | None" = None,
+    trades: "pd.DataFrame | None" = None,
+    asset_features: "Mapping[str, Sequence[float]] | None" = None,
+    amm_pool_features: "Mapping[str, Sequence[float]] | None" = None,
+    *,
+    co_trade_window_hours: float = 24.0,
+    hash_wallet_ids: bool = True,
+):
+    """Build a heterogeneous graph with wallet, asset, and AMM pool node types.
+
+    Node types
+    ----------
+    - ``wallet``   — 37-feature vector (zeros when wallet_features not supplied)
+    - ``asset``    — (total_volume_30d, unique_traders_30d, benford_mad_30d)
+    - ``amm_pool`` — (tvl, fee_rate, volume_24h)
+
+    Edge types
+    ----------
+    - ``(wallet, traded, asset)``               — wallet traded the asset
+    - ``(wallet, provided_liquidity, amm_pool)`` — wallet provided pool liquidity
+    - ``(wallet, co_traded_with, wallet)``       — wallets co-active on the same pair
+
+    Wallet addresses are SHA-256-hashed before use as node IDs when
+    ``hash_wallet_ids=True`` (default) to prevent re-identification from model
+    artefacts.
+
+    Returns a ``torch_geometric.data.HeteroData`` object.
+    """
+    try:
+        import torch
+        from torch_geometric.data import HeteroData
+    except ImportError as exc:
+        raise ImportError("PyG output requires torch and torch-geometric") from exc
+
+    import hashlib
+
+    def _hash_wallet(w: str) -> str:
+        if not hash_wallet_ids:
+            return w
+        return hashlib.sha256(w.encode("utf-8")).hexdigest()
+
+    wallet_set: set[str] = set()
+    asset_set: set[str] = set()
+    pool_set: set[str] = set()
+
+    traded_edges: list[tuple[str, str]] = []
+    liquidity_edges: list[tuple[str, str]] = []
+    co_traded_edges: list[tuple[str, str]] = []
+
+    if activities is not None:
+        for act in activities:
+            wallet_set.add(_hash_wallet(act.account_id))
+
+    if trades is not None and not trades.empty:
+        required = {"base_account", "counter_account", "ledger_close_time"}
+        if required.issubset(trades.columns):
+            frame = trades.copy()
+            frame["ledger_close_time"] = pd.to_datetime(frame["ledger_close_time"], utc=True)
+
+            for _, row in frame.iterrows():
+                bw = _hash_wallet(str(row["base_account"]))
+                cw = _hash_wallet(str(row["counter_account"]))
+                wallet_set.update((bw, cw))
+
+                for asset_col in ("base_asset", "counter_asset"):
+                    if asset_col in row and pd.notna(row.get(asset_col)):
+                        asset_id = str(row[asset_col])
+                        asset_set.add(asset_id)
+                        traded_edges.append((bw, asset_id))
+                        traded_edges.append((cw, asset_id))
+
+                if "pool_id" in row and pd.notna(row.get("pool_id")):
+                    pool_id = str(row["pool_id"])
+                    pool_set.add(pool_id)
+                    liquidity_edges.append((bw, pool_id))
+                    liquidity_edges.append((cw, pool_id))
+
+            if "pair_id" not in frame.columns and {"base_asset", "counter_asset"}.issubset(
+                frame.columns
+            ):
+                frame["pair_id"] = (
+                    frame["base_asset"].astype(str) + "/" + frame["counter_asset"].astype(str)
+                )
+
+            if "pair_id" in frame.columns:
+                window = pd.Timedelta(hours=co_trade_window_hours)
+                for _, pair_df in frame.groupby("pair_id", sort=False):
+                    records = pair_df.sort_values("ledger_close_time").to_dict("records")
+                    for li, left in enumerate(records):
+                        left_time = left["ledger_close_time"]
+                        active = {
+                            _hash_wallet(str(left["base_account"])),
+                            _hash_wallet(str(left["counter_account"])),
+                        }
+                        for right in records[li + 1 :]:
+                            if right["ledger_close_time"] - left_time > window:
+                                break
+                            active.update((
+                                _hash_wallet(str(right["base_account"])),
+                                _hash_wallet(str(right["counter_account"])),
+                            ))
+                        for a, b in combinations(sorted(active), 2):
+                            co_traded_edges.append((a, b))
+                            co_traded_edges.append((b, a))
+
+    wallet_idx = {w: i for i, w in enumerate(sorted(wallet_set))}
+    asset_idx = {a: i for i, a in enumerate(sorted(asset_set))}
+    pool_idx = {p: i for i, p in enumerate(sorted(pool_set))}
+
+    _WALLET_FEAT_DIM = 37
+    _ASSET_FEAT_DIM = 3   # total_volume_30d, unique_traders_30d, benford_mad_30d
+    _POOL_FEAT_DIM = 3    # tvl, fee_rate, volume_24h
+
+    data = HeteroData()
+
+    import torch
+
+    data["wallet"].x = torch.zeros((len(wallet_idx), _WALLET_FEAT_DIM), dtype=torch.float32)
+
+    asset_x = torch.zeros((len(asset_idx), _ASSET_FEAT_DIM), dtype=torch.float32)
+    if asset_features:
+        for asset, feats in asset_features.items():
+            if asset in asset_idx:
+                asset_x[asset_idx[asset]] = torch.tensor(
+                    list(feats)[:_ASSET_FEAT_DIM], dtype=torch.float32
+                )
+    data["asset"].x = asset_x
+
+    pool_x = torch.zeros((len(pool_idx), _POOL_FEAT_DIM), dtype=torch.float32)
+    if amm_pool_features:
+        for pool, feats in amm_pool_features.items():
+            if pool in pool_idx:
+                pool_x[pool_idx[pool]] = torch.tensor(
+                    list(feats)[:_POOL_FEAT_DIM], dtype=torch.float32
+                )
+    data["amm_pool"].x = pool_x
+
+    def _edge_index(pairs: list[tuple[str, str]], src_map: dict, dst_map: dict):
+        valid = [(src_map[s], dst_map[d]) for s, d in pairs if s in src_map and d in dst_map]
+        if not valid:
+            return torch.empty((2, 0), dtype=torch.long)
+        return torch.tensor(valid, dtype=torch.long).t().contiguous()
+
+    data["wallet", "traded", "asset"].edge_index = _edge_index(
+        traded_edges, wallet_idx, asset_idx
+    )
+    data["wallet", "provided_liquidity", "amm_pool"].edge_index = _edge_index(
+        liquidity_edges, wallet_idx, pool_idx
+    )
+    data["wallet", "co_traded_with", "wallet"].edge_index = _edge_index(
+        co_traded_edges, wallet_idx, wallet_idx
+    )
+
+    data._wallet_idx = wallet_idx
+    data._asset_idx = asset_idx
+    data._pool_idx = pool_idx
+    return data
+
+
 def build_co_trade_graph(trades: pd.DataFrame, window_hours: float = 24.0) -> nx.DiGraph:
     """Build a directed graph of wallets co-active on an asset pair within window_hours.
 
