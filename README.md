@@ -198,7 +198,8 @@ perturbed test set. See `scripts/run_adversarial_eval.py`.
 ledgerlens-data/
 │
 ├── README.md                         ← This file
-├── requirements.txt                  ← Python dependencies
+├── requirements.in                   ← Human-edited Python dependency policy
+├── requirements/                     ← Hashed locks for Linux/macOS and Python 3.11/3.12
 ├── pyproject.toml                    ← Lint/format/test config (ruff, black, mypy, pytest)
 ├── Makefile                          ← make install / lint / format / test / run
 ├── Dockerfile                        ← Container image (entrypoint: run_pipeline.py)
@@ -257,7 +258,7 @@ ledgerlens-data/
 ```bash
 # Install dependencies
 make install
-# (equivalent to: pip install -r requirements.txt)
+# (equivalent to: validate, pip install --require-hashes, then pip check)
 
 # Generate a synthetic labelled dataset and train the ensemble
 python -m scripts.generate_synthetic_dataset --output data/synthetic_dataset.parquet
@@ -466,7 +467,7 @@ for the full query strategy comparison, annotation workflow, and incremental upd
 ## Development
 
 ```bash
-make install   # pip install -r requirements.txt
+make install   # validated, hash-enforced install
 make lint      # ruff check .
 make format    # black .
 make test      # pytest

@@ -23,7 +23,7 @@ if ! command -v pytest &> /dev/null; then
     echo "❌ Error: pytest is not installed"
     echo ""
     echo "Please install dependencies:"
-    echo "  pip install -r requirements.txt"
+    echo "  make install"
     echo ""
     exit 1
 fi
@@ -33,7 +33,7 @@ python3 -c "import websockets" 2>/dev/null || {
     echo "❌ Error: websockets module not found"
     echo ""
     echo "Please install dependencies:"
-    echo "  pip install -r requirements.txt"
+    echo "  make install"
     echo ""
     exit 1
 }
@@ -42,7 +42,7 @@ python3 -c "import jose" 2>/dev/null || {
     echo "❌ Error: python-jose module not found"
     echo ""
     echo "Please install dependencies:"
-    echo "  pip install -r requirements.txt"
+    echo "  make install"
     echo ""
     exit 1
 }

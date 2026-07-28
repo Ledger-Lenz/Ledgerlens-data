@@ -33,7 +33,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python scripts/validate_lockfiles.py
+          pip install --require-hashes -r requirements/requirements-linux-py311.txt
+          pip check
 
       - name: Run active learning loop
         env:

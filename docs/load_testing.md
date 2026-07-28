@@ -38,7 +38,7 @@ early-latency percentiles.
 ### Prerequisites
 
 ```bash
-# Install dependencies (mutmut and psutil are already in requirements.txt)
+# Install dependencies (mutmut and psutil are included in the selected lockfile)
 make install
 
 # Optional: ensure psutil is available for memory sampling

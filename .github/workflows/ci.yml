@@ -10,7 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        include:
+          - python-version: "3.11"
+            lockfile: requirements/requirements-linux-py311.txt
+          - python-version: "3.12"
+            lockfile: requirements/requirements-linux-py312.txt
 
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +24,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: ${{ matrix.lockfile }}
+
+      - name: Validate dependency lockfile
+        run: python scripts/validate_lockfiles.py
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install ruff black nbconvert nbformat jupyter-client ipykernel
+          pip install --require-hashes -r "${{ matrix.lockfile }}"
+          pip check
 
       - name: Lint
         run: |
@@ -114,8 +122,13 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Validate dependency lockfile
+        run: python scripts/validate_lockfiles.py
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --require-hashes -r requirements/requirements-linux-py311.txt
+          pip check
 
       - name: Run mutation tests on core scoring path
         # --paths-to-mutate limits scope to the three core modules so the job

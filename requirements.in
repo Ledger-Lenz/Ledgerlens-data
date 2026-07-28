@@ -1,0 +1,95 @@
+# Runtime dependencies
+
+# Stellar
+stellar-sdk>=11.0.0
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.26.0
+pydantic>=2.5.0
+networkx>=3.0
+python-louvain>=0.16
+statsmodels>=0.14.0
+
+# Machine learning
+scikit-learn>=1.4.0
+matplotlib>=3.8.0
+xgboost>=2.0.0
+lightgbm>=4.3.0
+imbalanced-learn>=0.12.0
+shap>=0.45.0
+# SHAP's unconstrained numba dependency can backtrack to releases that predate
+# Python 3.11/3.12; keep the resolved graph inside the supported interpreter range.
+numba>=0.59.1
+torch>=2.2.0
+torch-geometric>=2.5.0
+opacus>=1.5.0
+
+# RL threshold controller
+stable-baselines3>=2.3.0
+gymnasium>=0.29.0
+
+# Multi-objective ensemble weight calibration
+pymoo>=0.6.1
+
+# Persistence / config
+python-dotenv>=1.0.0
+sqlalchemy>=2.0.0
+pyarrow>=15.0.0
+pyyaml>=6.0.0
+redis>=5.0.0
+msgpack>=1.0.0
+
+# HTTP and services
+requests>=2.31.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+httpx>=0.27.0
+prometheus-client>=0.20.0
+websockets>=12.0
+kafka-python>=2.0.2
+python-jose>=3.3.0
+confluent-kafka>=2.3.0
+fastavro>=1.9.0
+
+# Cryptography
+cryptography>=42.0.0
+
+# Active learning
+hnswlib>=0.8.0
+cleanlab>=2.6.0
+
+# Testing and static analysis
+mypy>=1.10.0
+pytest>=8.0.0
+fakeredis>=2.20.0
+pytest-asyncio>=0.23.0
+pytest-timeout>=2.3.0
+hypothesis>=6.100.0
+factory-boy>=3.3.0
+mutmut==2.4.4
+ruff>=0.6.9
+black>=24.10.0
+
+# Notebook validation
+nbconvert>=7.16.4
+nbformat>=5.10.4
+jupyter-client>=8.6.3
+ipykernel>=6.29.5
+
+# Reporting
+jinja2>=3.1.0
+tqdm>=4.66.0
+weasyprint>=62.0
+python-json-logger==2.0.7
+tabulate>=0.9.0
+
+# Hyperparameter optimization
+optuna>=4.0.0
+
+# Causal inference and counterfactuals
+causal-learn>=0.1.4
+dice-ml>=0.11
+
+# Cross-chain resolver
+cachetools>=5.3.0
