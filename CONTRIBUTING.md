@@ -25,6 +25,7 @@ cp .env.example .env  # then edit as needed
 make lint     # ruff + black --check
 make format   # ruff --fix + black
 make test     # pytest (unit tests only — no network)
+make lock-check  # validate exact dependency pins and lock freshness
 ```
 
 Optionally install the pre-commit hooks so checks run automatically:
@@ -62,6 +63,38 @@ and Testnet fee estimates.
 The `testnet-integration.yml` CI workflow runs these tests on a weekly
 schedule (Sundays 03:00 UTC) and on manual `workflow_dispatch` — it does
 **not** run on pull requests so it never blocks a PR merge.
+
+### Dependency lockfiles
+
+`requirements.in` is the human-edited dependency policy. The `requirements/`
+directory contains four complete resolved locks: Linux and macOS, each on
+Python 3.11 and 3.12. Every resolved package is exactly pinned and carries one
+or more SHA-256 artifact hashes. Installers use pip's `--require-hashes` mode,
+so a missing transitive dependency or unapproved artifact fails closed.
+`make install` selects the lock matching the current interpreter and platform;
+unsupported Python versions and platforms fail with an actionable error.
+
+The standard-library-only lock check runs before dependency installation and
+rejects stale source fingerprints, missing direct dependencies, incompatible
+direct pins, duplicate normalized package names, unhashed entries, and entries
+that are not exact `==` pins.
+
+After changing `requirements.in`, regenerate and validate the complete
+dependency graph:
+
+```bash
+make lock
+make lock-check
+```
+
+`make lock` uses `uv==0.8.3` to resolve each supported environment separately,
+preserves extras and environment markers, generates hashes, and then stamps
+every lock with its source fingerprint, resolver, and exact target metadata.
+Install that version of `uv` first when bootstrapping a new environment. CI
+uses the Linux lock matching each Python matrix entry; the Docker image uses
+the Linux Python 3.12 lock. Supporting a new Python minor version or platform
+requires updating `requires-python` where applicable, adding a lock target,
+regenerating all locks, and extending CI in the same change.
 
 ## Pull requests
 

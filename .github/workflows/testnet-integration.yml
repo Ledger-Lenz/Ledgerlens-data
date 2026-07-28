@@ -22,8 +22,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install ruff black pytest-timeout
+          python scripts/validate_lockfiles.py
+          pip install --require-hashes -r requirements/requirements-linux-py312.txt
+          pip check
 
       - name: Download ledgerlens-score WASM
         env:

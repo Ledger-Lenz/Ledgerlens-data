@@ -1,7 +1,7 @@
-.PHONY: install lint format test run scale-workers mutation-test
-.PHONY: install lint format test run typecheck mutation-test
+.PHONY: install lock lock-check lint format test run scale-workers typecheck mutation-test
 
 VENV_BIN := $(abspath .venv/bin)
+UV ?= uv
 ifeq ($(wildcard $(VENV_BIN)/python),)
   PYTHON := python3
   PIP := pip3
@@ -16,9 +16,56 @@ else
   PYTEST := $(VENV_BIN)/pytest
 endif
 
-install:
-	$(PIP) install -r requirements.txt
-	$(PIP) install ruff black
+PY_TAG := $(shell $(PYTHON) -c 'import sys; print(f"py{sys.version_info.major}{sys.version_info.minor}")')
+PLATFORM := $(shell $(PYTHON) -c 'import sys; print("macos" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else "unsupported")')
+LOCKFILE := requirements/requirements-$(PLATFORM)-$(PY_TAG).txt
+
+install: lock-check
+	@test -f "$(LOCKFILE)" || (echo "No lockfile for $(PLATFORM) $(PY_TAG); supported: macOS/Linux on Python 3.11 or 3.12" && exit 1)
+	$(PIP) install --require-hashes -r $(LOCKFILE)
+	$(PIP) check
+
+lock:
+	$(UV) pip compile \
+		--python-version 3.11 \
+		--python-platform linux \
+		--no-strip-extras \
+		--generate-hashes \
+		--upgrade \
+		--custom-compile-command "make lock" \
+		--output-file requirements/requirements-linux-py311.txt \
+		requirements.in
+	$(UV) pip compile \
+		--python-version 3.12 \
+		--python-platform linux \
+		--no-strip-extras \
+		--generate-hashes \
+		--upgrade \
+		--custom-compile-command "make lock" \
+		--output-file requirements/requirements-linux-py312.txt \
+		requirements.in
+	$(UV) pip compile \
+		--python-version 3.11 \
+		--python-platform macos \
+		--no-strip-extras \
+		--generate-hashes \
+		--upgrade \
+		--custom-compile-command "make lock" \
+		--output-file requirements/requirements-macos-py311.txt \
+		requirements.in
+	$(UV) pip compile \
+		--python-version 3.12 \
+		--python-platform macos \
+		--no-strip-extras \
+		--generate-hashes \
+		--upgrade \
+		--custom-compile-command "make lock" \
+		--output-file requirements/requirements-macos-py312.txt \
+		requirements.in
+	$(PYTHON) scripts/validate_lockfiles.py --stamp
+
+lock-check:
+	$(PYTHON) scripts/validate_lockfiles.py
 
 lint:
 	$(RUFF) check .

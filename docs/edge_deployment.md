@@ -165,7 +165,7 @@ See `models/README.md` for the full benchmark table with measured values.
 ### Prerequisites
 
 ```bash
-pip install -r requirements.txt  # includes torch, xgboost, lightgbm, scikit-learn, joblib
+make install  # includes torch, xgboost, lightgbm, scikit-learn, joblib
 ```
 
 No CUDA installation is required. All operations run on CPU.

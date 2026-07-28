@@ -52,7 +52,7 @@ Tests the Pydantic models in `ingestion/data_models.py` which parse Horizon API 
 1. Install atheris and dependencies:
 
 ```bash
-pip install -r requirements.txt
+make install
 python tests/fuzz/generate_corpus.py  # Generate seed corpus
 ```
 

@@ -17,3 +17,12 @@ repos:
       - id: trailing-whitespace
       - id: check-yaml
       - id: check-toml
+
+  - repo: local
+    hooks:
+      - id: validate-dependency-lock
+        name: validate dependency lock
+        entry: python scripts/validate_lockfiles.py
+        language: system
+        pass_filenames: false
+        files: ^(requirements\.in|requirements/requirements-(linux|macos)-py(311|312)\.txt|pyproject\.toml|scripts/validate_lockfiles\.py)$
