@@ -1,5 +1,27 @@
 # LedgerLens Monitoring
 
+## Project Health Summary (Issue #605)
+
+Dashboard-ready **project foundation health** as a stable JSON contract.
+
+| Piece | Path |
+|---|---|
+| Builder / contract | `monitoring/project_health.py` |
+| CLI | `python -m scripts.project_health_summary` |
+| API | `GET /v1/ops/project-health` (API key required) |
+| Grafana | `grafana/dashboards/project_health.json` |
+| Docs | [`docs/project_health.md`](../docs/project_health.md) |
+| Tests | `tests/test_project_health.py` |
+
+```bash
+python -m scripts.project_health_summary --output reports/project_health.json
+make project-health
+```
+
+Overall status is a worst-of rollup across model artifacts, training metrics, data contracts, adversarial posture, ops surface, and pipeline entrypoints. Diagnostics are ordered critical → degraded so maintainers can act without grepping the tree.
+
+---
+
 ## Capacity Planning Dashboard (Issue #242)
 
 ### Dashboard: `grafana/dashboards/capacity_planning.json`

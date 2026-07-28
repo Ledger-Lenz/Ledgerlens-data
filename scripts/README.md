@@ -1,5 +1,20 @@
 # scripts/
 
+## `project_health_summary.py` — Project health (Issue #605)
+
+Builds a **dashboard-ready project health summary** (schema `1.0`) from model artifacts, training metrics, data contracts, adversarial reports, ops config, and pipeline entrypoints.
+
+```bash
+python -m scripts.project_health_summary
+python -m scripts.project_health_summary --output reports/project_health.json
+python -m scripts.project_health_summary --fail-on critical --quiet
+make project-health
+```
+
+See [docs/project_health.md](../docs/project_health.md).
+
+---
+
 ## `stream.py` — Real-time streaming pipeline
 
 Streams trades from the Stellar Horizon SSE API, maintains a rolling feature

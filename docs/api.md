@@ -58,6 +58,40 @@ Liveness and readiness check. No authentication required.
 
 ---
 
+### `GET /v1/ops/project-health`
+
+Dashboard-ready **project foundation health** summary (Issue #605, schema `1.0`). Requires API key.
+
+Aggregates model artifacts, training metrics, data contracts, adversarial posture, ops surface, and pipeline entrypoints into a single validated document for dashboards and operators.
+
+**Response (abridged):**
+
+```json
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-07-28T12:00:00Z",
+  "overall_status": "healthy",
+  "components": [
+    {
+      "id": "model_artifacts",
+      "name": "Model artifacts",
+      "status": "healthy",
+      "score": 100.0,
+      "metrics": {},
+      "diagnostics": [],
+      "checked_at": "2026-07-28T12:00:00Z"
+    }
+  ],
+  "signals": { "model": {}, "data_quality": {}, "security": {}, "ops": {} },
+  "diagnostics": ["All project-health components are healthy."],
+  "thresholds": { "max_auc_degradation": 0.05 }
+}
+```
+
+See [project_health.md](project_health.md) for the full contract and CLI.
+
+---
+
 ### `GET /v1/wallets/{address}/scores`
 
 Paginated risk score history for a wallet. Results are in **descending timestamp order**. Pagination is cursor-based (keyed on `score_id`) for consistent results under concurrent writes.

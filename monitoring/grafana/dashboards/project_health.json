@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 39,
+  "title": "LedgerLens — Project Health",
+  "uid": "ledgerlens-project-health",
+  "tags": ["ledgerlens", "ops", "project-health", "issue-605"],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Overall project status",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 0 },
+      "description": "Worst-of rollup from the project health summary contract (Issue #605). Feed via reports/project_health.json or GET /v1/ops/project-health.",
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "healthy", "color": "green" } } },
+            { "type": "value", "options": { "1": { "text": "unknown", "color": "purple" } } },
+            { "type": "value", "options": { "2": { "text": "degraded", "color": "yellow" } } },
+            { "type": "value", "options": { "3": { "text": "critical", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2 },
+              { "color": "red", "value": 3 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ledgerlens_project_health_status_rank",
+          "legendFormat": "status"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Healthy / degraded / critical components",
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 0 },
+      "description": "Counts from project health signals.*_count fields.",
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ledgerlens_project_health_components{status=\"healthy\"}",
+          "legendFormat": "healthy"
+        },
+        {
+          "refId": "B",
+          "expr": "ledgerlens_project_health_components{status=\"degraded\"}",
+          "legendFormat": "degraded"
+        },
+        {
+          "refId": "C",
+          "expr": "ledgerlens_project_health_components{status=\"critical\"}",
+          "legendFormat": "critical"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Component scores (0–100)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "description": "Per-component health scores from the Issue #605 contract.",
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "unit": "none",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ledgerlens_project_health_component_score",
+          "legendFormat": "{{component}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Diagnostics feed",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "description": "Actionable maintainer diagnostics from the summary document. Prefer the JSON artifact or API for full text.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ledgerlens_project_health_diagnostic_count",
+          "legendFormat": "diagnostics",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    }
+  ]
+}

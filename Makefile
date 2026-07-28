@@ -1,5 +1,5 @@
-.PHONY: install lint format test run scale-workers mutation-test
-.PHONY: install lint format test run typecheck mutation-test
+.PHONY: install lint format test run scale-workers mutation-test project-health
+.PHONY: install lint format test run typecheck mutation-test project-health
 
 VENV_BIN := $(abspath .venv/bin)
 ifeq ($(wildcard $(VENV_BIN)/python),)
@@ -43,6 +43,13 @@ test-e2e:
 
 run:
 	python run_pipeline.py
+
+# ---------------------------------------------------------------------------
+# Project health summary (Issue #605) — dashboard-ready ops document
+# ---------------------------------------------------------------------------
+project-health:
+	$(PYTHON) -m scripts.project_health_summary --output reports/project_health.json
+	@echo "Wrote reports/project_health.json"
 
 scale-workers:
 	@if [ -z "$(N)" ]; then \

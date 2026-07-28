@@ -102,6 +102,28 @@ class HealthResponse(BaseModel):
     model: str
 
 
+class ProjectHealthComponentResponse(BaseModel):
+    id: str
+    name: str
+    status: str
+    score: float
+    metrics: dict
+    diagnostics: list[str]
+    checked_at: str = ""
+
+
+class ProjectHealthResponse(BaseModel):
+    """Dashboard-ready project health summary (Issue #605, schema 1.0)."""
+
+    schema_version: str
+    generated_at: str
+    overall_status: str
+    components: list[ProjectHealthComponentResponse]
+    signals: dict
+    diagnostics: list[str]
+    thresholds: dict[str, float]
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -146,6 +168,25 @@ async def health(request: Request):
 
     overall = "ok" if db_status == "ok" else "degraded"
     return HealthResponse(status=overall, db=db_status, model=model_status)
+
+
+@app.get(
+    "/v1/ops/project-health",
+    response_model=ProjectHealthResponse,
+    tags=["ops"],
+)
+@limiter.limit(f"{config.API_RATE_LIMIT_RPM}/minute")
+async def project_health(request: Request, _key: str = Depends(_check_api_key)):
+    """Dashboard-ready project health summary (Issue #605).
+
+    Aggregates model artifacts, training metrics, data contracts, adversarial
+    posture, ops surface, and pipeline entrypoints into a stable JSON contract
+    suitable for dashboards and operator tooling.
+    """
+    from monitoring.project_health import build_project_health_summary
+
+    summary = build_project_health_summary()
+    return ProjectHealthResponse(**summary.to_dict())
 
 
 @app.get(
