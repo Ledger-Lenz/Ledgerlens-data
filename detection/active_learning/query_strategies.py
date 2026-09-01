@@ -182,9 +182,14 @@ class BADGE(BaseQueryStrategy):
         return cast(list[str], pool.iloc[selected_idx]["wallet"].tolist())
 
 
-def _kmeans_pp_indices(X: np.ndarray, k: int) -> list[int]:
-    """k-means++ seeding — returns k indices."""
-    rng = np.random.default_rng(42)
+def _kmeans_pp_indices(X: np.ndarray, k: int, seed: int | None = None) -> list[int]:
+    """k-means++ seeding — returns k indices.
+
+    When *seed* is provided the seeding is deterministic, enabling exact
+    reproduction of a batch selection.  Defaults to a fixed seed of 42 for
+    backward compatibility.
+    """
+    rng = np.random.default_rng(42 if seed is None else seed)
     idx = [int(rng.integers(len(X)))]
     for _ in range(k - 1):
         dists = _min_dist_to_set(X, X[idx])

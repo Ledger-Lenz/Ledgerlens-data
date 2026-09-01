@@ -9,6 +9,12 @@ Usage:
     # Select wallets using default strategy and push to queue:
     python -m scripts.run_active_learning --pool data/unscored_wallets.parquet
 
+    # Select exactly reproducibly for a given seed:
+    python -m scripts.run_active_learning \\
+        --pool data/unscored_wallets.parquet \\
+        --strategy badge \\
+        --seed 42
+
     # Specify strategy and batch size:
     python -m scripts.run_active_learning \\
         --pool data/unscored_wallets.parquet \\
@@ -27,6 +33,7 @@ Runs on a weekly schedule via .github/workflows/active_learning.yml.
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 
 import pandas as pd
@@ -77,8 +84,13 @@ def run_active_learning(
     queue_path: str,
     model_dir: str,
     asset_pair: str = "",
+    seed: int | None = None,
 ) -> list[str]:
     """Select *batch_size* wallets from *pool_path* and push to *queue_path*.
+
+    *seed*, when provided, is forwarded to the query strategy so that the
+    random components of batch selection (e.g. BADGE k-means++ seeding) can
+    be reproduced exactly.
 
     Returns the list of selected wallet IDs.
     """
@@ -98,6 +110,15 @@ def run_active_learning(
         kwargs["models"] = models
     elif primary_model is not None:
         kwargs["model"] = primary_model
+
+    if seed is not None:
+        select_sig = inspect.signature(strategy.select)
+        if "seed" in select_sig.parameters:
+            kwargs["seed"] = seed
+        else:
+            logger.warning(
+                "Strategy '%s' does not accept a seed; ignoring --seed", strategy_name
+            )
 
     selected = strategy.select(pool, n_query=batch_size, **kwargs)
     logger.info(
@@ -121,6 +142,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue", default=config.AL_QUEUE_PATH)
     parser.add_argument("--model-dir", default=config.MODEL_DIR)
     parser.add_argument("--asset-pair", default="")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Random seed for reproducible batch selection (e.g. BADGE "
+            "k-means++ seeding / committee tie-breaking). When omitted, "
+            "selections use the strategy's default behaviour."
+        ),
+    )
     # Incremental update flags
     parser.add_argument(
         "--update",
@@ -173,6 +204,7 @@ def main() -> None:
         queue_path=args.queue,
         model_dir=args.model_dir,
         asset_pair=args.asset_pair,
+        seed=args.seed,
     )
     print(f"Selected {len(selected)} wallets → {args.queue}")
 
