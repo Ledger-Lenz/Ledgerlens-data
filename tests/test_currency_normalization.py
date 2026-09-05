@@ -719,3 +719,46 @@ class TestIntegration:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestUnsupportedCurrencyCode:
+    """Tests for unsupported/malformed currency codes (#678)."""
+
+    def test_garbage_currency_code_returns_no_rate(self, mock_provider):
+        """A completely unrecognized asset code returns NO_RATE, not an exception."""
+        from decimal import Decimal
+
+        garbage_asset = Asset(code="GARBAGE123", issuer="GINVALID000000000000000000000000000000000000000000")
+        amount = DecimalAmount("100")
+        xlm = Asset(code="XLM", issuer=None)
+
+        normalized = normalize_amount(amount, garbage_asset, xlm, mock_provider)
+
+        assert normalized.status == NormalizationStatus.NO_RATE
+        assert not normalized.is_successful()
+        assert normalized.confidence == Decimal("0.0")
+        assert normalized.original_value == Decimal("100")
+
+    def test_empty_string_currency_code_returns_no_rate(self, mock_provider):
+        """An empty-string asset code returns NO_RATE without raising."""
+        empty_asset = Asset(code="", issuer=None)
+        amount = DecimalAmount("100")
+        xlm = Asset(code="XLM", issuer=None)
+
+        normalized = normalize_amount(amount, empty_asset, xlm, mock_provider)
+
+        assert normalized.status == NormalizationStatus.NO_RATE
+        assert normalized.confidence == Decimal("0.0")
+
+    def test_fully_malformed_asset_passes_through_unchanged(self, mock_provider):
+        """A malformed asset with no rate returns the original amount unchanged."""
+        malformed = Asset(code="@@@INVALID@@@", issuer="GBADBADBADBADBADBADBADBADBADBADBADBADBADBAD")
+        amount = DecimalAmount("250")
+        xlm = Asset(code="XLM", issuer=None)
+
+        normalized = normalize_amount(amount, malformed, xlm, mock_provider)
+
+        assert normalized.status == NormalizationStatus.NO_RATE
+        assert normalized.value == Decimal("250")
+        assert normalized.original_asset == malformed
+        assert normalized.base_asset == malformed  # Keeps original when no rate
