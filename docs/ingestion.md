@@ -44,6 +44,86 @@ logs a warning once and grants every request immediately rather than
 blocking ingestion on a rate-limiter outage. This sacrifices the global cap
 under Redis downtime in favor of not stalling data collection.
 
+## Resumable chunked backfill
+
+Multi-hour (or multi-day) historical backfills go through
+`ingestion.historical_loader.backfill_trades`, which processes an asset
+pair's trade history in fixed-size chunks and persists progress after each
+one, so an interrupted run resumes from the last completed chunk instead of
+starting over.
+
+```python
+from ingestion.historical_loader import backfill_trades, parquet_chunk_sink
+
+backfill_trades(
+    base_asset,
+    counter_asset,
+    checkpoint_path="checkpoints/usdc_xlm_backfill.json",
+    sink=parquet_chunk_sink("data/backfill/usdc_xlm"),
+    chunk_size=10_000,
+)
+```
+
+* A chunk is `chunk_size` raw Horizon records. Its valid trades are handed to
+  the sink, and only after the sink returns is the chunk recorded in the
+  checkpoint together with the paging token of its last record. The
+  checkpoint is a JSON file written atomically via `utils/checkpoint.py`
+  (temp file + fsync + `os.replace`), so a hard kill never corrupts it.
+* On restart, `backfill_trades` reads the last completed chunk and resumes
+  paging from its cursor. At most the in-flight chunk is re-fetched.
+* A sink must be idempotent per chunk index: a crash after the sink writes
+  but before the checkpoint is saved re-delivers that chunk.
+  `parquet_chunk_sink` writes `chunk-NNNNNN.parquet` and simply overwrites it
+  on re-delivery, so there are no gaps or duplicate rows.
+* A sink failure is recorded against the chunk (error and attempt count) and
+  re-raised; the next run retries the same chunk.
+* Re-running a finished backfill later resumes from the last cursor and only
+  picks up trades that arrived since.
+* The checkpoint is bound to the pair and `start_time`. Resuming with
+  different values raises `CheckpointMismatchError`. Pass `fresh=True` to
+  discard it and start over.
+
+### Monitoring progress
+
+Operators can inspect a running (or interrupted) backfill without
+disturbing it:
+
+```bash
+python -m cli.main backfill-status --checkpoint-file checkpoints/usdc_xlm_backfill.json
+python -m cli.main backfill-status --checkpoint-file checkpoints/usdc_xlm_backfill.json --json
+```
+
+The command reports chunks completed, trades loaded, raw records scanned,
+the latest ledger close time reached, the resume cursor, start/update
+timestamps, and any failed chunks with their error and attempt count. It
+exits `1` if the checkpoint is missing or is not a backfill checkpoint.
+
+### Choosing a chunk size
+
+A chunk is the unit of lost work on interruption and the unit of
+checkpoint I/O. At Horizon's default page size of 200 records and roughly
+500 ms per page (about 400 records/s), the trade-offs are:
+
+| `chunk_size` | Pages per chunk | Work lost on interruption | Checkpoint writes per 1M records |
+|---|---|---|---|
+| 2,000 | 10 | ~5 s | 500 |
+| 10,000 (default) | 50 | ~25 s | 100 |
+| 50,000 | 250 | ~2 min | 20 |
+
+Recommendations:
+
+* Keep `chunk_size` a multiple of `limit_per_page` so chunks line up with
+  Horizon pages and no page is fetched twice on resume.
+* The default of 10,000 suits most backfills. Checkpoint overhead is
+  negligible, and a restart repeats well under a minute of fetching.
+* Use 2,000 to 5,000 when the Horizon connection is unreliable or heavily
+  rate-limited (many 429s or failovers), where interruptions are frequent and
+  re-fetching is expensive.
+* Use up to 50,000 for very large multi-day backfills on a stable connection
+  to keep the number of chunk files and checkpoint writes down. Going higher
+  mainly increases sink memory (one chunk of trades is held in memory) and
+  the work repeated after a crash.
+
 ## Error handling
 
 Ingestion and validation failures raise typed exceptions rather than bare

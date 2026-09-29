@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Resumable, chunked historical backfill (`ingestion.historical_loader.backfill_trades`,
+  issue #915): trade history is processed in fixed-size chunks with a durable
+  per-chunk checkpoint (resume cursor, counts, failures), so an interrupted
+  backfill resumes from the last completed chunk with no gaps or duplicates.
+  Adds `parquet_chunk_sink` and a `backfill-status` operator command
+  (`python -m cli.main backfill-status --checkpoint-file ...`). Chunk-size
+  guidance is in `docs/ingestion.md`.
 - Single, authenticated, cryptographically-gated model promotion/rollback path
   (`detection/model_governance.py`, issue #671): `RiskScorer` now hard-blocks
   on any model that fails Ed25519 signature or transparency-log verification
