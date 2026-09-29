@@ -257,3 +257,19 @@ alerts_dlq.ndjson
 
 # Grafana provisioning secrets
 monitoring/grafana/provisioning/datasources/*.yaml
+
+# -----------------------------------------------------------------------
+# Issues #960-#963 — CLI dry-run, audit logging, confirmation, migration testing
+# -----------------------------------------------------------------------
+
+# CLI audit log (runtime output, not source)
+logs/cli_audit.ndjson
+logs/
+
+# Migration snapshot test artefacts (generated; not committed)
+data/migration_snapshots/
+tests/snapshots/
+migration_test_snapshot_*.db
+
+# Backup/restore runtime outputs (timestamped; never committed)
+backups/

@@ -60,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from cli.audit_hook import emit_cli_audit_event
+
+    cli_args = {
+        "db_url": (args.db_url or "")[:40] + "..." if args.db_url else "from-env",
+        "target": args.target,
+        "dry_run": args.dry_run,
+        "status": args.status,
+    }
+
     engine = get_engine(args.db_url)
     runner = MigrationRunner(engine, target=args.target, dry_run=args.dry_run)
 
@@ -77,12 +86,21 @@ def main(argv: list[str] | None = None) -> int:
             print("Database is up to date.")
         return 0 if status.is_up_to_date else 1
 
-    status = runner.upgrade(args.target)
+    try:
+        status = runner.upgrade(args.target)
+    except Exception as exc:
+        emit_cli_audit_event("migrate", cli_args, "error", error=str(exc))
+        raise
+
     if status.pending and not args.dry_run:
         # upgrade() returned but there are still pending migrations — something
         # went wrong; surface this as a non-zero exit.
         logger.error("Some migrations could not be applied: %s", status.pending)
+        emit_cli_audit_event("migrate", cli_args, "error", error=f"Pending: {status.pending}")
         return 1
+
+    outcome = "dry-run" if args.dry_run else "success"
+    emit_cli_audit_event("migrate", cli_args, outcome)
 
     if args.dry_run:
         print("Dry-run complete. No migrations were applied.")

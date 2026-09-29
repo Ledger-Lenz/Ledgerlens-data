@@ -169,6 +169,10 @@ def _compute_features_for_wallets(
 
 
 def main() -> None:
+    from cli.audit_hook import emit_cli_audit_event
+    from cli.confirmation import ConfirmationAborted, add_yes_argument, confirm_destructive
+    from cli.dry_run import DryRunContext, add_dry_run_argument
+
     parser = argparse.ArgumentParser(
         description="Backfill AMM trade history and cross-venue features"
     )
@@ -211,6 +215,8 @@ def main() -> None:
         help="Discard an existing --checkpoint-file and start over. No effect without "
         "--checkpoint-file.",
     )
+    add_dry_run_argument(parser)
+    add_yes_argument(parser)
     args = parser.parse_args()
 
     since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
@@ -220,6 +226,40 @@ def main() -> None:
     if not pool_ids:
         logger.error("No pool IDs specified. Set --pool-ids or WATCHED_AMM_POOLS in .env")
         raise SystemExit(1)
+
+    cli_args = {
+        "pool_ids": pool_ids,
+        "since": args.since,
+        "until": args.until,
+        "output": args.output,
+        "dry_run": args.dry_run,
+        "yes": args.yes,
+    }
+
+    blast_summary = {
+        "operation": "backfill AMM trades and compute cross-venue features",
+        "pool_count": len(pool_ids),
+        "date_range": f"{args.since} → {args.until}",
+        "output_file": args.output,
+        "note": "This overwrites the output Parquet file if it already exists.",
+    }
+
+    with DryRunContext(args.dry_run) as dry:
+        for pid in pool_ids:
+            dry.record(f"Fetch AMM trades for pool {pid} ({args.since} → {args.until})")
+        dry.record(f"Compute cross-venue features for all affected wallets")
+        dry.record(f"Write output to {args.output}")
+
+        if dry:
+            emit_cli_audit_event("backfill", cli_args, "dry-run")
+            return
+
+    # Interactive confirmation before proceeding with the real mutation
+    try:
+        confirm_destructive(blast_summary, yes=args.yes)
+    except ConfirmationAborted:
+        emit_cli_audit_event("backfill", cli_args, "aborted")
+        raise SystemExit(0)
 
     checkpoint: PipelineCheckpoint | None = None
     checkpoint_dir: Path | None = None
@@ -273,6 +313,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features_df.to_parquet(output_path, index=False)
     logger.info("Cross-venue features written to %s (%d wallets)", output_path, len(features_df))
+    emit_cli_audit_event("backfill", cli_args, "success")
 
 
 if __name__ == "__main__":

@@ -65,3 +65,81 @@ exactly. Both the standalone script and the pytest run are wired into CI.
   runtime behavior (e.g. it won't catch a flag whose value is silently
   ignored). Runtime coverage for individual scripts already exists in
   `tests/test_score_wallet.py`, `tests/test_backtest.py`, etc.
+
+---
+
+## CLI Safety Features (Issues #960–#963)
+
+### `--dry-run` flag (Issue #960)
+
+All state-mutating CLI commands (`backup`, `restore`, `migrate`, `backfill`)
+now accept a `--dry-run` flag. In dry-run mode the command:
+
+1. Prints `[DRY RUN] No data will be written.`
+2. Lists every concrete change that *would* occur (e.g. files written,
+   columns added, rows modified).
+3. Exits cleanly without performing any mutation.
+
+**Recommendation:** always run `--dry-run` before executing a high-blast-radius
+command in production:
+
+```bash
+python -m scripts.restore --dry-run
+python -m scripts.migrate --dry-run
+python -m scripts.backfill_amm_trades --pool-ids <id> --dry-run
+```
+
+### Interactive confirmation + blast-radius summary (Issue #962)
+
+Destructive commands (`restore`, `backfill`) present a blast-radius summary
+before executing. The operator must type `yes` to proceed:
+
+```
+⚠️  DESTRUCTIVE OPERATION — blast-radius summary:
+  operation: restore database and model artifacts from backup
+  target_database: postgresql://prod/ledgerlens
+  backup_timestamp: 2026-09-01T00:00:00Z
+  ...
+
+Type 'yes' to proceed, anything else to abort:
+```
+
+**`--yes` non-interactive override:** passes `--yes` to skip the prompt for
+scripted/CI use. **Use only after reviewing the blast-radius with `--dry-run`
+first.** Never include `--yes` in a one-liner shared in chat without prior
+dry-run confirmation.
+
+### CLI audit logging (Issue #961)
+
+When `LEDGERLENS_ENV=production` every CLI command execution writes a signed
+NDJSON event to `CLI_AUDIT_LOG_PATH` (default `logs/cli_audit.ndjson`):
+
+```json
+{
+  "timestamp": "2026-09-29T09:20:55Z",
+  "actor": "ahmadrabiumustapha",
+  "env": "production",
+  "command": "restore",
+  "args": {"dry_run": false, "yes": false, "backup_dir": "..."},
+  "outcome": "success"
+}
+```
+
+Sensitive arguments (secrets, keys, tokens, passwords) are automatically
+redacted to `[REDACTED]`. Set `CLI_AUDIT_LOG_PATH` in `.env` to override
+the path.
+
+### Migration snapshot testing (Issue #963)
+
+`migrations/snapshot_testing.py` provides utilities used by the CI job
+`migration-snapshot` to:
+
+1. Build a 50 000-row representative snapshot of the production schema.
+2. Apply every migration forward and assert data integrity at each step.
+3. Apply the most recent migration backward (when `down()` is defined).
+4. Flag any migration that takes longer than `MAX_MIGRATION_SECONDS` (5 s
+   on SQLite CI ≈ <1 s on PostgreSQL in production).
+
+The CI job also runs a negative test using `build_corrupting_migration()` to
+confirm the integrity assertion detects data corruption introduced by a bad
+migration.

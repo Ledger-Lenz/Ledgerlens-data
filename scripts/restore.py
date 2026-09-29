@@ -141,8 +141,18 @@ def restore_models(backup_path: Path, restore_dir: Path, manifest: dict) -> bool
 
 def main():
     """Restore from backup with full verification."""
+    import argparse
     import os
     import sys
+
+    from cli.audit_hook import emit_cli_audit_event
+    from cli.confirmation import ConfirmationAborted, add_yes_argument, confirm_destructive
+    from cli.dry_run import DryRunContext, add_dry_run_argument
+
+    parser = argparse.ArgumentParser(description="LedgerLens database and artifact restore")
+    add_dry_run_argument(parser)
+    add_yes_argument(parser)
+    args = parser.parse_args()
 
     backup_dir = Path(os.getenv("BACKUP_DIR", "./backups"))
     db_url = os.getenv("DATABASE_URL", "sqlite:///ledgerlens.db")
@@ -159,25 +169,65 @@ def main():
         logger.error("Failed to load backup manifest")
         return 1
 
-    logger.info(f"Restoring to database: {db_url[:40]}...")
     db_meta = manifest.get("database", {})
+    models_meta = manifest.get("models", {})
+
+    # Compute blast-radius summary
+    blast_summary = {
+        "operation": "restore database and model artifacts from backup",
+        "target_database": db_url[:60] + ("..." if len(db_url) > 60 else ""),
+        "backup_timestamp": manifest.get("timestamp", "unknown"),
+        "database_backup_size": f"{db_meta.get('size_bytes', 0):,} bytes",
+        "models_backup_present": "yes" if models_meta else "no",
+        "target_model_dir": str(model_dir),
+        "irreversible": "existing database will be overwritten (a .bak copy is kept for SQLite)",
+    }
+
+    cli_args = {
+        "dry_run": args.dry_run,
+        "yes": args.yes,
+        "backup_dir": str(backup_dir),
+        "db_url": db_url[:40] + "...",
+    }
+
     db_backup = Path(db_meta.get("path", ""))
 
+    with DryRunContext(args.dry_run) as dry:
+        dry.record(f"Verify checksum of database backup {db_backup}")
+        dry.record(f"Restore database to {db_url[:60]}")
+        if models_meta:
+            dry.record(f"Restore model artifacts to {model_dir}")
+
+        if dry:
+            emit_cli_audit_event("restore", cli_args, "dry-run", force=False)
+            return 0
+
+    # Interactive confirmation (skipped in dry-run already exited above)
+    try:
+        confirm_destructive(blast_summary, yes=args.yes)
+    except ConfirmationAborted:
+        emit_cli_audit_event("restore", cli_args, "aborted")
+        return 1
+
+    logger.info(f"Restoring to database: {db_url[:40]}...")
     if not db_backup.exists():
         logger.error(f"Database backup file not found: {db_backup}")
+        emit_cli_audit_event("restore", cli_args, "error", error=f"Backup not found: {db_backup}")
         return 1
 
     if not restore_database(db_url, db_backup, manifest):
         logger.error("Database restore verification failed")
+        emit_cli_audit_event("restore", cli_args, "error", error="Database restore failed")
         return 1
 
-    models_meta = manifest.get("models", {})
     if models_meta:
         models_backup = Path(models_meta.get("path", ""))
         if not restore_models(models_backup, model_dir, manifest):
             logger.error("Models restore verification failed")
+            emit_cli_audit_event("restore", cli_args, "error", error="Models restore failed")
             return 1
 
+    emit_cli_audit_event("restore", cli_args, "success")
     logger.info("✅ Restore complete and verified")
     return 0
 
