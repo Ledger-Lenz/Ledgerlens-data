@@ -23,6 +23,7 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS` | `CROSS_PAIR_SYNCHRONY_WINDOW_SECONDS` | `int` | No | `'30'` | — |
 | `ALERT_DEDUP_WINDOW_SECONDS` | `ALERT_DEDUP_WINDOW_SECONDS` | `int` | No | `'60'` | Silence window for correlated alert deduplication (alerts/deduplicator.py). |
 | `RISK_SCORE_FLAG_THRESHOLD` | `RISK_SCORE_FLAG_THRESHOLD` | `int` | No | `'70'` | — |
+| `MAD_NONCONFORMITY_THRESHOLD` | `MAD_NONCONFORMITY_THRESHOLD` | `float` | No | `'0.015'` | Benford MAD above this sets benford_flag = true (Nigrini, 2012). |
 | `THRESHOLD_RL_PINNED` | `THRESHOLD_RL_PINNED` | `int` | No | `'0'` | Set to a non-zero integer to pin the alert threshold and disable the RL agent. E.g. THRESHOLD_RL_PINNED=75 → agent is bypassed, threshold is fixed at 75. |
 | `RISK_SCORE_DB_URL` | `RISK_SCORE_DB_URL` | `str` | No | `'sqlite:///ledgerlens.db'` | — |
 | `DB_POOL_SIZE` | `DB_POOL_SIZE` | `int` | No | `'5'` | Database connection pooling |
@@ -117,6 +118,7 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `ZERO_SHOT_MIN_LABELLED_EXAMPLES` | `ZERO_SHOT_MIN_LABELLED_EXAMPLES` | `int` | No | `'20'` | — |
 | `BENFORD_CI_ENABLED` | `BENFORD_CI_ENABLED` | `bool` | No | `'false'` | — |
 | `BRIDGE_ROUNDTRIP_WINDOW_HOURS` | `BRIDGE_ROUNDTRIP_WINDOW_HOURS` | `int` | No | `'72'` | — |
+| `CROSS_CHAIN_MIN_CONFIDENCE` | `CROSS_CHAIN_MIN_CONFIDENCE` | `float` | No | `'0.65'` | Minimum combined confidence for a cross-chain identity link to carry risk (Issue #879); see docs/cross_chain_identity.md for the rationale. |
 | `DP_EPSILON` | `DP_EPSILON` | `float` | No | `'1.0'` | Differential privacy for SHAP explanations (model inversion defence) |
 | `DP_DELTA` | `DP_DELTA` | `float` | No | `'1e-5'` | — |
 | `DP_RENYI_QUERY_THRESHOLD` | `DP_RENYI_QUERY_THRESHOLD` | `int` | No | `'100'` | — |

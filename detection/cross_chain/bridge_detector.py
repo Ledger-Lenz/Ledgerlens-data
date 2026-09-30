@@ -7,6 +7,10 @@ Also implements detect_bridge_wash_trade() for round-trip anchor analysis
 (Issue #278): identifies wallets that send and receive bridge payments to/from
 the same anchor within BRIDGE_ROUNDTRIP_WINDOW_HOURS, computing a ratio that
 flags wash traders exploiting cross-chain opacity.
+
+Bridge transactions carrying on-chain ``events`` are classified by bridge
+mechanism (lock-and-mint vs liquidity-pool) and scored with
+mechanism-specific heuristics from ``bridge_mechanisms`` (Issue #880).
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import os
 import re
 from datetime import UTC, datetime
 from typing import Any
+
+from detection.cross_chain.bridge_mechanisms import analyze_bridge_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -166,18 +172,31 @@ class BridgeDetector:
                     stellar_addr = stellar_addr or tx_from
 
             if stellar_addr:
-                links.append(
-                    {
-                        "stellar_address": stellar_addr,
-                        "linked_address": linked_addr,
-                        "chain": chain,
-                        "tx_id": tx_id,
-                        "memo": str(memo),
-                        "confidence": 1.0,
-                    }
-                )
+                link = {
+                    "stellar_address": stellar_addr,
+                    "linked_address": linked_addr,
+                    "chain": chain,
+                    "tx_id": tx_id,
+                    "memo": str(memo),
+                    "confidence": 1.0,
+                }
+                if tx.get("events"):
+                    analysis = analyze_bridge_transaction(tx)
+                    link["mechanism"] = analysis["mechanism"]
+                    link["mechanism_confidence"] = analysis["confidence"]
+                    link["mechanism_features"] = analysis["features"]
+                links.append(link)
 
         return links
+
+    def classify_transactions(self, transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Classify each transaction by bridge mechanism and score it.
+
+        Returns one ``analyze_bridge_transaction`` result per transaction:
+        ``mechanism``, ``classification_score``, ``features``, ``confidence``
+        and ``is_bridge``.
+        """
+        return [analyze_bridge_transaction(tx) for tx in transactions]
 
 
 # ---------------------------------------------------------------------------

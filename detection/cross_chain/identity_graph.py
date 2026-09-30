@@ -2,6 +2,11 @@
 
 Stores wallets on different chains (Stellar, Ethereum, Solana) and the links
 between them (from bridges, behavioral matching, shared deposits, etc.).
+
+Each edge row is one piece of evidence (one ``link_type``) for an address
+pair; the detector's payload is kept in ``metadata_json`` so it can be
+retrieved for forensic reports.  The confidence of a pair is the noisy-OR
+combination of all its evidence rows (see ``confidence.py``, Issue #879).
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from typing import Any
 from sqlalchemy import Float, Integer, String, UniqueConstraint, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
+from detection.cross_chain.confidence import Evidence, combine_confidence
 from detection.persistence import Base, get_session_factory
 
 logger = logging.getLogger(__name__)
@@ -126,8 +132,56 @@ class IdentityGraph:
             session.refresh(existing)
             return existing
 
-    def get_connected_component(self, start_address: str) -> dict[str, list[dict[str, Any]]]:
-        """BFS traversal to find all transitively linked addresses, grouped by chain."""
+    def add_links(self, links: list[dict[str, Any]], link_type: str) -> int:
+        """Store detector output (BridgeDetector / BehavioralMatcher links) as evidence.
+
+        Each link needs ``stellar_address``, ``linked_address`` and
+        ``confidence``; everything else (tx ids, memo, mechanism, correlation
+        stats, ...) is kept as the edge's forensic evidence payload.
+        """
+        stored = 0
+        for link in links:
+            metadata = dict(link.get("metadata") or {})
+            for key, value in link.items():
+                if key not in ("stellar_address", "linked_address", "confidence", "metadata"):
+                    metadata.setdefault(key, value)
+            self.add_edge(
+                link["stellar_address"],
+                link["linked_address"],
+                link_type,
+                confidence=float(link.get("confidence", 1.0)),
+                metadata=metadata,
+            )
+            stored += 1
+        return stored
+
+    def get_edge_evidence(self, address_a: str, address_b: str) -> list[Evidence]:
+        """Return every piece of evidence linking two addresses (either direction)."""
+        a = normalize_address(address_a)
+        b = normalize_address(address_b)
+        with self._session_factory() as session:
+            edges = session.scalars(
+                select(CrossChainEdge).where(
+                    ((CrossChainEdge.source_address == a) & (CrossChainEdge.target_address == b))
+                    | ((CrossChainEdge.source_address == b) & (CrossChainEdge.target_address == a))
+                )
+            ).all()
+            return [_edge_to_evidence(edge) for edge in edges]
+
+    def get_link_confidence(self, address_a: str, address_b: str) -> float:
+        """Combined confidence that two addresses belong to the same entity."""
+        return combine_confidence(self.get_edge_evidence(address_a, address_b))
+
+    def get_connected_component(
+        self, start_address: str, min_confidence: float = 0.0
+    ) -> dict[str, list[dict[str, Any]]]:
+        """BFS traversal to find all transitively linked addresses, grouped by chain.
+
+        Only address pairs whose combined confidence is at least
+        ``min_confidence`` are traversed, so low-confidence links neither
+        appear in the result nor bridge to further addresses.  Each returned
+        node carries the ``confidence`` of the link it was reached through.
+        """
         start_address = normalize_address(start_address)
         visited = set()
         queue = [start_address]
@@ -158,12 +212,19 @@ class IdentityGraph:
                     )
                 ).all()
 
+                evidence_by_neighbor: dict[str, list[Evidence]] = {}
                 for edge in edges:
                     neighbor = (
                         edge.target_address
                         if edge.source_address == current
                         else edge.source_address
                     )
+                    evidence_by_neighbor.setdefault(neighbor, []).append(_edge_to_evidence(edge))
+
+                for neighbor, evidence in evidence_by_neighbor.items():
+                    confidence = combine_confidence(evidence)
+                    if confidence < min_confidence:
+                        continue
                     if neighbor not in visited and neighbor not in queue:
                         neighbor_node = session.get(CrossChainNode, neighbor)
                         if neighbor_node:
@@ -171,6 +232,7 @@ class IdentityGraph:
                                 "address": neighbor_node.address,
                                 "chain": neighbor_node.chain,
                                 "risk_score": neighbor_node.risk_score,
+                                "confidence": confidence,
                             }
                             queue.append(neighbor)
 
@@ -191,3 +253,10 @@ class IdentityGraph:
                 result[chain_key].append(info)
 
         return result
+
+
+def _edge_to_evidence(edge: CrossChainEdge) -> Evidence:
+    metadata = json.loads(edge.metadata_json) if edge.metadata_json else {}
+    metadata.setdefault("source_address", edge.source_address)
+    metadata.setdefault("target_address", edge.target_address)
+    return Evidence(evidence_type=edge.link_type, strength=edge.confidence, metadata=metadata)

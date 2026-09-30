@@ -890,6 +890,7 @@ We're actively looking for collaborators with experience in:
 | [`docs/checkpointing.md`](docs/checkpointing.md) | Checkpoint/resume contract for long-running batch pipelines |
 | [`docs/simulator.md`](docs/simulator.md) | Wash-trade simulators and the FFD / discriminator-accuracy realism evaluation |
 | [`docs/graph_features.md`](docs/graph_features.md) | Motif-census graph features, with a graph-theory glossary |
+| [`docs/cross_chain_identity.md`](docs/cross_chain_identity.md) | Confidence-scored cross-chain identity edges and mechanism-aware bridge detection |
 
 ## License
 
