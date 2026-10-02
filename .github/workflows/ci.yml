@@ -521,6 +521,35 @@ jobs:
           print("CI metrics self-test passed.")
           EOF
 
+  migration-snapshot:
+    name: Migration Snapshot Testing (Issue #963)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run forward/backward migration tests against representative snapshot
+        # Applies every migration forward against a 50 000-row representative
+        # snapshot and verifies data integrity at each step.  Then validates
+        # backward reversibility for the most recent migration (#963).
+        # Timing threshold: 5 s per migration on SQLite CI ≈ <1 s in production.
+        run: |
+          pytest -q tests/test_issues_960_961_962_963.py::TestRepresentativeSnapshot \
+                    tests/test_issues_960_961_962_963.py::TestForwardMigrationTest \
+                    tests/test_issues_960_961_962_963.py::TestCorruptingMigration \
+                    tests/test_issues_960_961_962_963.py::TestBackwardMigrationTest \
+                    -v
+
   mutation-test:
     name: Mutation Testing (≥80% score)
     runs-on: ubuntu-latest

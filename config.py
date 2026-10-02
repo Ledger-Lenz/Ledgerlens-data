@@ -375,6 +375,9 @@ class Config:
     )
     AUDIT_LOG_PATH: str = os.getenv("AUDIT_LOG_PATH", "data/audit_trail.ndjson")
     AUDIT_VERIFY_PUBLIC_KEY_PATH: str = os.getenv("AUDIT_VERIFY_PUBLIC_KEY_PATH", "")
+    # CLI audit logging (Issue #961) — written for every production CLI command
+    CLI_AUDIT_LOG_PATH: str = os.getenv("CLI_AUDIT_LOG_PATH", "logs/cli_audit.ndjson")
+    LEDGERLENS_ENV: str = os.getenv("LEDGERLENS_ENV", "local")
     BFT_SCORE_DIVERGENCE_THRESHOLD: int = int(os.getenv("BFT_SCORE_DIVERGENCE_THRESHOLD", "30"))
     BFT_MIN_CONSENSUS: int = int(os.getenv("BFT_MIN_CONSENSUS", "2"))
     POISON_LABEL_RATIO_THRESHOLD: float = float(os.getenv("POISON_LABEL_RATIO_THRESHOLD", "0.15"))

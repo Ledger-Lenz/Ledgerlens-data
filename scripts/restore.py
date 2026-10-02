@@ -198,8 +198,27 @@ def main():
     models_meta = manifest.get("models", {})
     db_backup = Path(db_meta.get("path", ""))
 
+    with DryRunContext(args.dry_run) as dry:
+        dry.record(f"Verify checksum of database backup {db_backup}")
+        dry.record(f"Restore database to {db_url[:60]}")
+        if models_meta:
+            dry.record(f"Restore model artifacts to {model_dir}")
+
+        if dry:
+            emit_cli_audit_event("restore", cli_args, "dry-run", force=False)
+            return 0
+
+    # Interactive confirmation (skipped in dry-run already exited above)
+    try:
+        confirm_destructive(blast_summary, yes=args.yes)
+    except ConfirmationAborted:
+        emit_cli_audit_event("restore", cli_args, "aborted")
+        return 1
+
+    logger.info(f"Restoring to database: {db_url[:40]}...")
     if not db_backup.exists():
         logger.error(f"Database backup file not found: {db_backup}")
+        emit_cli_audit_event("restore", cli_args, "error", error=f"Backup not found: {db_backup}")
         return 1
 
     # -----------------------------------------------------------------

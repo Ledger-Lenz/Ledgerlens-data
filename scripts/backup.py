@@ -161,13 +161,38 @@ def create_backup_manifest(
 
 def main():
     """Run full backup suite."""
+    import argparse
     import os
+    import sys
+
+    from cli.audit_hook import emit_cli_audit_event
+    from cli.dry_run import DryRunContext, add_dry_run_argument
+
+    parser = argparse.ArgumentParser(description="LedgerLens database and artifact backup")
+    add_dry_run_argument(parser)
+    args = parser.parse_args()
 
     db_url = os.getenv("DATABASE_URL", "sqlite:///ledgerlens.db")
     model_dir = os.getenv("MODEL_DIR", "./models")
     backup_dir = Path(os.getenv("BACKUP_DIR", "./backups"))
 
-    logger.info(f"Starting backup suite...")
+    timestamp = datetime.now(UTC).isoformat().replace(":", "-")
+    planned_db_backup = backup_dir / f"database_{timestamp}.db"
+    planned_models_backup = backup_dir / f"models_{timestamp}.tar.gz"
+    planned_manifest = backup_dir / "MANIFEST.json"
+
+    cli_args = {"dry_run": args.dry_run, "db_url": db_url[:40] + "...", "backup_dir": str(backup_dir)}
+
+    with DryRunContext(args.dry_run) as dry:
+        dry.record(f"Write database backup to {planned_db_backup}")
+        dry.record(f"Write model archive to {planned_models_backup}")
+        dry.record(f"Write manifest to {planned_manifest}")
+
+        if dry:
+            emit_cli_audit_event("backup", cli_args, "dry-run", force=False)
+            return 0
+
+    logger.info("Starting backup suite...")
     logger.info(f"  Database: {db_url[:40]}...")
     logger.info(f"  Models: {model_dir}")
     logger.info(f"  Backup destination: {backup_dir}")
@@ -177,9 +202,11 @@ def main():
 
     if not database_meta:
         logger.error("Database backup failed")
+        emit_cli_audit_event("backup", cli_args, "error", error="Database backup failed")
         return 1
 
     create_backup_manifest(database_meta, models_meta, backup_dir)
+    emit_cli_audit_event("backup", cli_args, "success")
     logger.info("✅ Backup complete")
     return 0
 

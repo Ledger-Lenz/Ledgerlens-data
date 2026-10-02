@@ -169,6 +169,10 @@ def _compute_features_for_wallets(
 
 
 def main() -> None:
+    from cli.audit_hook import emit_cli_audit_event
+    from cli.confirmation import ConfirmationAborted, add_yes_argument, confirm_destructive
+    from cli.dry_run import DryRunContext, add_dry_run_argument
+
     parser = argparse.ArgumentParser(
         description="Backfill AMM trade history and cross-venue features"
     )
@@ -309,6 +313,7 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features_df.to_parquet(output_path, index=False)
     logger.info("Cross-venue features written to %s (%d wallets)", output_path, len(features_df))
+    emit_cli_audit_event("backfill", cli_args, "success")
 
 
 if __name__ == "__main__":

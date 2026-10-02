@@ -149,6 +149,91 @@ def build_parser() -> argparse.ArgumentParser:
     )
     backfill_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
+    # ── backup ────────────────────────────────────────────────────────────
+    backup_parser = subparsers.add_parser(
+        "backup",
+        help="Back up database and model artifacts (#960: --dry-run supported)",
+    )
+    add_dry_run_argument(backup_parser)
+
+    # ── restore ───────────────────────────────────────────────────────────
+    restore_parser = subparsers.add_parser(
+        "restore",
+        help=(
+            "Restore database and model artifacts from backup "
+            "(#962: requires confirmation; #960: --dry-run supported)"
+        ),
+    )
+    add_dry_run_argument(restore_parser)
+    restore_parser.add_argument(
+        "--yes",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip interactive confirmation (non-interactive override). "
+            "⚠️  USE WITH CAUTION — always run --dry-run first."
+        ),
+    )
+
+    # ── migrate ───────────────────────────────────────────────────────────
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Apply pending database migrations (#960: --dry-run supported; #961: audited)",
+    )
+    migrate_parser.add_argument(
+        "db_url",
+        nargs="?",
+        default=None,
+        help="Database URL (defaults to RISK_SCORE_DB_URL from environment)",
+    )
+    migrate_parser.add_argument(
+        "--target",
+        metavar="ID",
+        default=None,
+        help="Stop after applying this migration ID (e.g. '0002')",
+    )
+    add_dry_run_argument(migrate_parser)
+    migrate_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print current migration status without applying anything",
+    )
+
+    # ── backfill ──────────────────────────────────────────────────────────
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help=(
+            "Backfill AMM trade history and cross-venue features "
+            "(#960: --dry-run; #962: confirmation; #961: audited)"
+        ),
+    )
+    backfill_parser.add_argument(
+        "--pool-ids",
+        nargs="+",
+        default=None,
+        help="AMM pool IDs (64-char hex). Defaults to WATCHED_AMM_POOLS from config.",
+    )
+    backfill_parser.add_argument("--since", default="2024-01-01", help="Start date (YYYY-MM-DD)")
+    backfill_parser.add_argument("--until", default="2024-06-30", help="End date (YYYY-MM-DD)")
+    backfill_parser.add_argument(
+        "--output", default="data/labelled_with_cross_venue.parquet", help="Output Parquet path"
+    )
+    backfill_parser.add_argument("--sdex-trades", default=None, help="Existing SDEX trades Parquet")
+    backfill_parser.add_argument("--checkpoint-file", default=None, help="Resumable checkpoint path")
+    backfill_parser.add_argument(
+        "--fresh", action="store_true", help="Discard existing checkpoint and restart"
+    )
+    add_dry_run_argument(backfill_parser)
+    backfill_parser.add_argument(
+        "--yes",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip interactive confirmation (non-interactive override). "
+            "⚠️  USE WITH CAUTION — always run --dry-run first."
+        ),
+    )
+
     return parser
 
 
@@ -202,6 +287,7 @@ def main(args: list[str] | None = None) -> int:
     opts = parser.parse_args(args)
     setup_logging(opts.verbose)
 
+    # ── healthcheck ────────────────────────────────────────────────────────
     if opts.command == "healthcheck":
         report = run_diagnostics()
         if getattr(opts, "json", False):
@@ -210,6 +296,7 @@ def main(args: list[str] | None = None) -> int:
             print(_format_health_summary(report))
         return 0 if report["overall_status"] == "PASS" else 2
 
+    # ── validate-artifacts ────────────────────────────────────────────────
     elif opts.command == "validate-artifacts":
         res = validate_artifacts(opts.dir)
         # Enrich with schema_version for a stable JSON envelope
