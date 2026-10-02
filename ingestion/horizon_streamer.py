@@ -11,6 +11,17 @@ mode).  A background health-check loop probes each endpoint every
 ``HORIZON_HEALTH_CHECK_INTERVAL_SECONDS`` seconds and marks them healthy or
 unhealthy based on HTTP status and latency.  ``stream_trades`` uses the pool
 automatically when more than one endpoint is configured.
+
+Checkpoint resume (#904)
+------------------------
+When ``stream_trades`` is given a ``WatermarkTracker``, it resumes from the
+pair's last committed watermark on startup and advances the watermark after
+each yielded trade.  If the watermark's ledger has been pruned from the
+queried Horizon node (the node's oldest available trade is newer than the
+watermark), a gap alert is raised and the missing range is backfilled via
+``historical_loader.load_trades`` against ``HORIZON_HISTORY_URL`` (a
+full-history node) before live streaming continues.  See
+``docs/stream_replay_runbook.md``.
 """
 
 from __future__ import annotations
@@ -21,6 +32,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from stellar_sdk import Asset as SdkAsset
 from stellar_sdk import Server
@@ -33,8 +45,56 @@ from streaming.health import HealthStatus, WorkerHealthMonitor, get_health_regis
 from utils.logging import get_logger
 from utils.tracing import get_tracer, hash_span_id
 
+if TYPE_CHECKING:
+    from ingestion.watermark_tracker import WatermarkTracker
+
 logger = get_logger(__name__)
 _tracer = get_tracer(__name__)
+
+
+def _token_key(token: str) -> tuple[int, ...]:
+    """Order Horizon paging tokens (``"<toid>-<index>"``) numerically."""
+    return tuple(int(p) for p in str(token).split("-") if p.isdigit())
+
+
+def _oldest_available_token(horizon_url: str, base: SdkAsset, counter: SdkAsset) -> str | None:
+    """Return the paging token of the oldest trade the Horizon node still retains."""
+    page = (
+        Server(horizon_url=horizon_url)
+        .trades()
+        .for_asset_pair(base, counter)
+        .order(desc=False)
+        .limit(1)
+        .call()
+    )
+    records = page["_embedded"]["records"]
+    return records[0]["paging_token"] if records else None
+
+
+def _alert_history_gap(pair_id: str, watermark: str, oldest: str, horizon_url: str) -> None:
+    """Operator alert: the resume point was pruned from the Horizon node."""
+    logger.critical(
+        "HORIZON_HISTORY_GAP pair=%s watermark=%s oldest_available=%s node=%s — "
+        "falling back to historical backfill (see docs/stream_replay_runbook.md)",
+        pair_id,
+        watermark,
+        oldest,
+        horizon_url,
+        extra={"alert": "horizon_history_gap", "pair_id": pair_id},
+    )
+
+
+def _backfill_pruned_range(
+    base: SdkAsset, counter: SdkAsset, pair_id: str, watermark: str
+) -> Iterator[Trade]:
+    """Replay trades after *watermark* from a full-history node (dedup by token)."""
+    from ingestion.historical_loader import load_trades
+
+    history_url = getattr(config, "HORIZON_HISTORY_URL", None) or config.HORIZON_URL
+    wm_key = _token_key(watermark)
+    for trade in load_trades(base, counter, cursor=watermark, horizon_url=history_url):
+        if _token_key(trade.trade_id) > wm_key:
+            yield trade
 
 
 class HorizonEndpointPool:
@@ -256,6 +316,7 @@ def stream_trades(
     max_reconnect_attempts: int = 5,
     cursor_store: BaseCursorStore | None = None,
     stream_id: str | None = None,
+    watermark_tracker: WatermarkTracker | None = None,
 ) -> Iterator[Trade]:
     """Yield `Trade` objects as they are streamed from Horizon.
 
@@ -268,6 +329,10 @@ def stream_trades(
 
     When a ``cursor_store`` is provided (or if default config cursor store is active),
     the streaming cursor is automatically restored on restart and saved on each event.
+
+    When ``watermark_tracker`` is provided, its committed watermark for the pair
+    takes precedence as the resume point, and the pruned-history fallback
+    described in the module docstring applies (#904).
     """
     pool = _get_pool()
     attempts = 0
@@ -277,6 +342,32 @@ def stream_trades(
 
     # Restore persisted cursor if available
     cursor = active_store.get_cursor(active_stream_id, default=cursor)
+
+    pair_id = f"{base_asset.code}:{counter_asset.code}"
+
+    def _commit(trade: Trade, token: str) -> None:
+        active_store.save_cursor(
+            active_stream_id,
+            token,
+            metadata={"trade_id": trade.trade_id, "timestamp": time.time()},
+        )
+        if watermark_tracker is not None:
+            watermark_tracker.advance(pair_id, token, trade.ledger_close_time)
+
+    if watermark_tracker is not None:
+        wm_cursor = watermark_tracker.get_cursor(pair_id)
+        if wm_cursor:
+            cursor = wm_cursor
+            probe_url = pool.best_url() if pool is not None else config.HORIZON_URL
+            oldest = _oldest_available_token(probe_url, base_asset, counter_asset)
+            if oldest is not None and _token_key(oldest) > _token_key(wm_cursor):
+                _alert_history_gap(pair_id, wm_cursor, oldest, probe_url)
+                for trade in _backfill_pruned_range(base_asset, counter_asset, pair_id, wm_cursor):
+                    yield trade
+                    cursor = trade.trade_id
+                    _commit(trade, cursor)
+            else:
+                logger.info("Resuming %s from watermark %s", pair_id, wm_cursor)
 
     while True:
         horizon_url = pool.best_url() if pool is not None else config.HORIZON_URL
@@ -307,11 +398,7 @@ def stream_trades(
                     span.set_attribute("trade.counter_asset", trade.counter_asset.code)
                 yield trade
                 cursor = response["paging_token"]
-                active_store.save_cursor(
-                    active_stream_id,
-                    cursor,
-                    metadata={"trade_id": trade.trade_id, "timestamp": time.time()},
-                )
+                _commit(trade, cursor)
                 attempts = 0
         except (ConnectionError, TimeoutError, OSError) as exc:
             attempts += 1

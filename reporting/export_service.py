@@ -15,14 +15,39 @@ export layer that sits in front of them (or any tabular report data):
       `ReportExporter` contract; `EXPORT_REGISTRY` and `export_report()` give
       a single call site that picks the exporter by format name.
 
-API::
+Data-minimization profiles (Issue #945)
+----------------------------------------
+Recipient types require different levels of detail. Rather than one-size-fits-all
+exports, every export can be scoped to a named **profile** that specifies
+exactly which fields are included/excluded and whether aggregate-only mode is
+applied.
+
+Profiles are defined in `EXPORT_PROFILES`. Two built-in profiles ship:
+
+* ``"regulator_full"`` — full detail including raw SHAP values, individual
+  trade records, and wallet-level features. Intended for regulators and
+  internal auditors with appropriate data-handling agreements.
+* ``"partner_aggregate"`` — aggregate-only view, stripping all wallet
+  identifiers, individual trade data, and raw SHAP values. Safe for sharing
+  with exchange partners and third-party analytics providers.
+
+The default profile (used when no profile is specified) is always the **most
+restrictive** one — ``"partner_aggregate"`` — following the principle of
+least privilege.
+
+Usage::
 
     schema = ReportSchema(fields=[
         FieldSpec("wallet", str, required=True),
         FieldSpec("risk_score", (int, float), required=True),
     ])
-    result = export_report(records, schema=schema, fmt="csv")
-    result.content_type   # "text/csv"
+    # Full detail for a regulator:
+    result = export_report(records, schema=schema, fmt="csv",
+                           profile="regulator_full")
+    # Aggregate-only for a partner (or omit profile= to use the default):
+    result = export_report(records, schema=schema, fmt="json",
+                           profile="partner_aggregate")
+    result.content_type   # "application/json"
     result.checksum       # sha256 of result.content, for integrity checks
 """
 
@@ -32,7 +57,7 @@ import csv
 import hashlib
 import io
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Protocol
 
@@ -202,6 +227,157 @@ class CSVExporter:
         return _make_result(buffer.getvalue(), self.content_type, "report.csv", len(records))
 
 
+# ---------------------------------------------------------------------------
+# Data-minimization profiles (Issue #945)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExportProfile:
+    """Defines field-level inclusion/exclusion rules for a recipient type.
+
+    Attributes:
+        name: Unique profile identifier (e.g. ``"regulator_full"``).
+        description: Human-readable description for compliance reviewers.
+        excluded_fields: Fields that must **never** appear in exports for this
+            profile. Applied before any schema validation.
+        aggregate_only: When ``True``, wallet-level identifiers and individual
+            trade records are stripped and replaced with aggregate summaries.
+        allowed_fields: When non-empty, acts as an allowlist — only these
+            fields are retained (takes precedence over ``excluded_fields``).
+    """
+
+    name: str
+    description: str
+    excluded_fields: frozenset[str] = field(default_factory=frozenset)
+    aggregate_only: bool = False
+    allowed_fields: frozenset[str] = field(default_factory=frozenset)
+
+    def apply(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return *records* filtered to satisfy this profile's rules.
+
+        If ``aggregate_only`` is ``True``, wallet identifiers and raw trade
+        fields are stripped before field-level exclusion is applied.  The
+        ``allowed_fields`` allowlist (when non-empty) further narrows the
+        output to exactly those fields.
+        """
+        result: list[dict[str, Any]] = []
+        for record in records:
+            filtered = dict(record)
+
+            # Aggregate-only: drop wallet identifiers and individual-trade data
+            if self.aggregate_only:
+                filtered = {
+                    k: v
+                    for k, v in filtered.items()
+                    if k not in _AGGREGATE_EXCLUDED_FIELDS
+                }
+
+            # Explicit exclusion list
+            if self.excluded_fields:
+                filtered = {k: v for k, v in filtered.items() if k not in self.excluded_fields}
+
+            # Allowlist (whitelist): keep only explicitly permitted fields
+            if self.allowed_fields:
+                filtered = {k: v for k, v in filtered.items() if k in self.allowed_fields}
+
+            result.append(filtered)
+        return result
+
+
+#: Fields always stripped in ``aggregate_only`` mode — wallet identifiers,
+#: raw trade-level data, and model-internal details that could de-anonymise
+#: individual trading activity.
+_AGGREGATE_EXCLUDED_FIELDS: frozenset[str] = frozenset(
+    {
+        # Wallet identifiers
+        "wallet",
+        "wallet_id",
+        "account_id",
+        "originator_wallet",
+        "beneficiary_wallet",
+        # Individual trade records (list/dict fields)
+        "trades",
+        "raw_trades",
+        "anomalous_trades",
+        "trade_ids",
+        # Raw SHAP values — can be reverse-engineered to infer wallet activity
+        "shap_values",
+        "shap_contributions",
+        "feature_contributions",
+        "top_shap_features",
+        # Private feature vectors
+        "feature_vector",
+        "feature_row",
+    }
+)
+
+
+# -----------------------------------------------------------------------
+# Built-in profiles
+# -----------------------------------------------------------------------
+
+#: **Regulator full-detail profile** — no field exclusions beyond what the
+#: schema itself requires. Intended for FATF Travel Rule regulators, FinCEN
+#: SAR filings, and internal compliance audits operating under a data-handling
+#: agreement. Includes raw SHAP values, individual trade records, and all
+#: wallet-level identifiers.
+PROFILE_REGULATOR_FULL = ExportProfile(
+    name="regulator_full",
+    description=(
+        "Full detail for regulatory bodies (FATF, FinCEN, SEC) and internal "
+        "compliance auditors. Includes all wallet identifiers, individual trade "
+        "records, and raw SHAP feature attributions. Requires a signed data-"
+        "handling agreement before transmission."
+    ),
+    excluded_fields=frozenset(),
+    aggregate_only=False,
+)
+
+#: **Partner aggregate-only profile** — strips all wallet identifiers, raw
+#: SHAP values, and individual trade records. Safe for exchange partners,
+#: third-party analytics providers, and other recipients without a full
+#: data-handling agreement. This is the **default** profile applied when no
+#: profile is specified, implementing the principle of least privilege.
+PROFILE_PARTNER_AGGREGATE = ExportProfile(
+    name="partner_aggregate",
+    description=(
+        "Aggregate-only view for exchange partners and third-party analytics "
+        "providers. Wallet identifiers, individual trade records, and raw SHAP "
+        "values are stripped. Only aggregated risk metrics and summary statistics "
+        "are included. Safe for sharing without a full data-handling agreement."
+    ),
+    excluded_fields=frozenset(),
+    aggregate_only=True,
+)
+
+#: Registry of all named export profiles.  Add custom profiles here or via
+#: :func:`register_profile` to make them available to :func:`export_report`.
+PROFILE_REGISTRY: dict[str, ExportProfile] = {
+    PROFILE_REGULATOR_FULL.name: PROFILE_REGULATOR_FULL,
+    PROFILE_PARTNER_AGGREGATE.name: PROFILE_PARTNER_AGGREGATE,
+}
+
+#: Name of the default (most restrictive) profile applied when the caller
+#: does not specify one. Changing this constant changes the project-wide
+#: default — always pick the **most restrictive** available profile.
+DEFAULT_PROFILE_NAME: str = PROFILE_PARTNER_AGGREGATE.name
+
+
+class UnknownProfileError(ValueError):
+    """Raised when ``export_report`` is asked for a profile that has no entry
+    in ``PROFILE_REGISTRY``."""
+
+
+def register_profile(profile: ExportProfile) -> None:
+    """Register a custom :class:`ExportProfile` under its ``name``.
+
+    Allows other modules (e.g. tenant-specific exporters) to add profiles
+    without modifying this file.
+    """
+    PROFILE_REGISTRY[profile.name] = profile
+
+
 EXPORT_REGISTRY: dict[str, ReportExporter] = {
     "json": JSONExporter(),
     "ndjson": NDJSONExporter(),
@@ -213,22 +389,46 @@ def export_report(
     records: list[dict[str, Any]],
     fmt: str,
     schema: ReportSchema | None = None,
+    profile: str | None = None,
 ) -> ExportResult:
     """Single call site for exporting a batch of records in any registered format.
 
+    Args:
+        records: The report data to export.
+        fmt: Export format (``"json"``, ``"ndjson"``, or ``"csv"``).
+        schema: Optional typed schema; validated before export.
+        profile: Named data-minimization profile controlling which fields are
+            included. Defaults to ``DEFAULT_PROFILE_NAME`` (``"partner_aggregate"``
+            — the most restrictive built-in profile). Pass
+            ``"regulator_full"`` for exports to regulatory bodies.
+
     Raises:
-        UnsupportedFormatError: `fmt` has no registered exporter. The error
+        UnsupportedFormatError: ``fmt`` has no registered exporter. The error
             message lists the available formats.
-        SchemaValidationError: `schema` is given and a record violates it;
-            the error names the offending row and field.
+        UnknownProfileError: ``profile`` is not in ``PROFILE_REGISTRY``.
+        SchemaValidationError: ``schema`` is given and a record violates it
+            *after* profile filtering; the error names the offending row and
+            field.
     """
+    # Resolve profile — default to most restrictive
+    profile_name = profile if profile is not None else DEFAULT_PROFILE_NAME
+    export_profile = PROFILE_REGISTRY.get(profile_name)
+    if export_profile is None:
+        available = ", ".join(sorted(PROFILE_REGISTRY))
+        raise UnknownProfileError(
+            f"unknown export profile {profile_name!r}; available profiles: {available}"
+        )
+
+    # Apply data-minimization filtering
+    filtered_records = export_profile.apply(records)
+
     exporter = EXPORT_REGISTRY.get(fmt)
     if exporter is None:
         available = ", ".join(sorted(EXPORT_REGISTRY))
         raise UnsupportedFormatError(
             f"unknown export format {fmt!r}; available formats: {available}"
         )
-    return exporter.export(records, schema=schema)
+    return exporter.export(filtered_records, schema=schema)
 
 
 def register_exporter(exporter: ReportExporter) -> None:

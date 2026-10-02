@@ -4,6 +4,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# ---------------------------------------------------------------------------
+# Fusion strategy resolution (Issue #856) — implementation plan
+# ---------------------------------------------------------------------------
+#
+# The issue asks for the fusion strategy to be "resolved via meta_learner.py".
+# Planned additions to this module:
+#
+#   class FusionStrategy(str, enum.Enum):
+#       FIXED_WEIGHT = "fixed_weight"
+#       INVERSE_VARIANCE = "inverse_variance"
+#       STACKED = "stacked"
+#
+#   def resolve_fusion_strategy(value: str | FusionStrategy | None) -> FusionStrategy
+#       - None -> config.ENSEMBLE_FUSION_STRATEGY -> default FIXED_WEIGHT.
+#       - Case-insensitive; an unknown value raises ValueError listing the
+#         valid options (fail fast at startup instead of silently falling
+#         back to fixed weights).
+#
+#   class StackedFusionMetaLearner:
+#       Logistic regression (sklearn) over the feature vector
+#       [score_i / 100 for each model] + [half_width_i / 50 for each model].
+#       - fit(per_model_scores, per_model_half_widths, y) on the conformal
+#         calibration split, never on the training split, to avoid leaking
+#         over-confident in-sample scores into the stacker.
+#       - predict(...) -> (score_0_100, lower, upper); the interval is the
+#         weighted-average interval, using the absolute value of the
+#         normalised logistic coefficients on the score features as weights.
+#       - save/load as JSON with a SHA-256 field, the same integrity pattern
+#         as ConformalCalibrator.save/load (no pickle, per the threat model).
+#
+# `fuse_scores()` in detection/ensemble_calibrator.py dispatches on the
+# resolved strategy; see the plan block there for the fusion math.
+
 
 class LeafEmbeddingExtractor:
     """Extracts leaf indices from a trained ensemble of models."""

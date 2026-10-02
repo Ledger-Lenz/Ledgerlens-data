@@ -532,3 +532,60 @@ estimation was used:
   ...
 }
 ```
+
+## Coreset benchmark & recommended defaults (#889)
+
+Harness: `python -m benchmarks.coreset_benchmark --seed 42 --out reports/coreset_benchmark.json`
+compares `coreset`, `random` and `full_pool` over labelling budgets
+(default 50–800), reporting AUC, accuracy, selection and training wall-clock.
+Output is deterministic for a given `--seed`.
+
+**When coreset is worth its overhead:** at small budgets (≲ 5 % of the pool)
+on multi-modal / imbalanced data, where random sampling under-covers rare
+clusters. Selection cost is O(budget × pool) ANN queries, so as the budget
+grows towards ~10 % of the pool the gain over random shrinks while selection
+time grows; past that point prefer `uncertainty` or random sampling.
+
+**Recommended defaults:**
+
+| Setting | Default | Guidance |
+|---|---|---|
+| `ACTIVE_LEARNING_STRATEGY` | `coreset_hybrid` | Use pure `coreset` only for cold-start rounds |
+| `CORESET_MIN_DISTANCE` | `0.1` | Keep; raise only if the benchmark shows duplicate-heavy picks |
+| Budget per round | ≤ 5 % of pool | Beyond ~10 %, switch to `random`/`uncertainty` |
+| `hnswlib` | installed | Brute-force fallback is O(N²) memory — avoid for pools > 5k |
+## Diversity-aware batch selection (Issue #886)
+
+Strategy `diversity_aware_batch` (`DiversityAwareBatch`) scores each candidate as
+`(1 - w) * uncertainty + w * normalised k-center distance` and picks greedily, so a
+batch does not fill up with near-duplicate borderline wallets. `w` comes from
+`AL_DIVERSITY_WEIGHT` (default `0.5`; `0` = pure uncertainty, `1` = pure coverage), or
+you can pass it to the constructor. If every candidate is identical, the strategy
+falls back to uncertainty order. With a single candidate, it returns that candidate.
+Compare runs with `label_efficiency(acc_curve, n_labelled_curve)` (accuracy gain per
+labelled example) against the `diversity_weight=0` baseline.
+
+## Inter-annotator agreement & adjudication (Issue #887)
+
+1. `assign_overlapping_items(item_ids, annotators)` sends `AL_OVERLAP_FRACTION`
+   (default 10%) of queue items to 2+ annotators.
+2. Record each label with `AgreementTracker.record(item, annotator, label)`.
+3. `AgreementTracker.report()` returns Fleiss' kappa and each annotator's mean Cohen's
+   kappa. Annotators below `AL_MIN_ANNOTATOR_KAPPA` (default 0.4) are flagged.
+4. `resolve()` gives flagged annotators a weight of `flagged_weight` (0 by default, which
+   excludes them) and returns `(resolved_labels, items_needing_adjudication)`.
+5. **Operators:** send every item in `items_needing_adjudication` to a senior reviewer.
+   The reviewer's label is final: record it under an `adjudicator` id and do not
+   re-vote. Look into flagged annotators before assigning them more work; the flag can
+   mean low quality or adversarial labelling.
+
+## Catastrophic-forgetting guardrails (Issue #888)
+
+Pass `forgetting_guardrail=ForgettingGuardrail(regression_set, replay_buffer)` to
+`IncrementalTrainer`. The regression set is a versioned hold-out
+(`REGRESSION_SET_VERSION`) of rare and historical fraud typologies, and it is scored
+after every update. If the AUC on that set drops by more than `AL_FORGETTING_MAX_DROP`
+(default 0.02), the warm-start update is redone with the replay buffer of historical
+hard examples mixed in. If it still regresses, `mode="block"` rolls the update back
+and `mode="warn"` only logs it. Results are written to the report under
+`forgetting_guardrail`.

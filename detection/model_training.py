@@ -27,10 +27,12 @@ import os
 import struct
 import sys
 import threading
+
 try:
     from datetime import UTC, datetime
 except ImportError:
     from datetime import datetime, timezone
+
     UTC = timezone.utc  # type: ignore
 from importlib import import_module
 
@@ -1453,6 +1455,56 @@ def main() -> None:
 
         except Exception as _adv_exc:
             logger.error("Adversarial training step failed: %s", _adv_exc, exc_info=True)
+
+    # Backdoor detection auto-quarantine (Issue #871)
+    if config.BACKDOOR_SCAN_ENABLED:
+        try:
+            from detection.adversarial.backdoor_detector import scan_and_quarantine
+
+            scan_model_name = config.BACKDOOR_SCAN_MODEL_NAME
+            if scan_model_name not in results:
+                logger.warning(
+                    "BACKDOOR_SCAN_ENABLED=true but BACKDOOR_SCAN_MODEL_NAME=%s was not "
+                    "trained this run (trained: %s) — skipping backdoor scan.",
+                    scan_model_name,
+                    list(results),
+                )
+            else:
+                X_scan, y_scan = split_features_labels(df)
+                backdoor_report = scan_and_quarantine(
+                    results[scan_model_name]["model"],
+                    X_scan,
+                    y_scan,
+                    model_dir,
+                    flagged_fraction_threshold=config.BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD,
+                    actor="training-pipeline",
+                )
+                if backdoor_report["quarantine_recommended"]:
+                    logger.warning(
+                        "BACKDOOR SCAN: candidate %s quarantined (version_id=%s): %s",
+                        model_dir,
+                        backdoor_report["quarantine_version_id"],
+                        backdoor_report["reason"],
+                    )
+                else:
+                    logger.info(
+                        "BACKDOOR SCAN: %d/%d samples flagged (%.1f%%) — below the %.0f%% "
+                        "quarantine threshold.",
+                        backdoor_report["n_flagged"],
+                        backdoor_report["total_samples"],
+                        100 * backdoor_report["flagged_fraction"],
+                        100 * config.BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD,
+                    )
+
+                os.makedirs("reports", exist_ok=True)
+                ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+                backdoor_report_path = f"reports/backdoor_scan_{ts}.json"
+                with open(backdoor_report_path, "w") as f:
+                    json.dump(backdoor_report, f, indent=2, default=str)
+                logger.info("Backdoor scan report written to %s", backdoor_report_path)
+
+        except Exception as _backdoor_exc:
+            logger.error("Backdoor scan step failed: %s", _backdoor_exc, exc_info=True)
 
     # Compute DP-noised aggregate statistics and log privacy budget consumed.
     try:

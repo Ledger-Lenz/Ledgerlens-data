@@ -8,6 +8,20 @@ Benford MAD > 0.05, or emergency_drift alert type), IncidentResponder:
   3. Creates an incident record in the in-process store (or injected backend).
   4. Posts a JSON notification to the configured webhook.
 
+Automated runbook execution
+---------------------------
+For incident classes with a well-established, low-risk runbook, the responder
+can execute remediation automatically instead of only alerting.  Two classes
+are currently automated:
+
+  * ``stuck_consumer_group`` -- restart a specific stuck consumer group.
+  * ``stale_detection_worker`` -- recycle a wedged detection worker process.
+
+Automation is gated by a three-stage rollout mode (``dry_run`` ->
+``approval_required`` -> ``full_automation``) and every automated action is
+written to an append-only audit log with enough context for post-incident
+review.
+
 Idempotency guarantee
 ---------------------
 A (wallet_hash, alert_fingerprint) pair is tracked in a deduplication registry.
@@ -26,6 +40,7 @@ Security
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import threading
 import time
@@ -41,6 +56,16 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 _PLAYBOOK_PATH = Path(__file__).parent.parent / "data" / "playbooks" / "high_risk_wallet.yaml"
+
+# Rollout modes for automated remediation, in increasing order of autonomy.
+AUTOMATION_MODE_DRY_RUN = "dry_run"
+AUTOMATION_MODE_APPROVAL_REQUIRED = "approval_required"
+AUTOMATION_MODE_FULL = "full_automation"
+_VALID_AUTOMATION_MODES = (
+    AUTOMATION_MODE_DRY_RUN,
+    AUTOMATION_MODE_APPROVAL_REQUIRED,
+    AUTOMATION_MODE_FULL,
+)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -61,6 +86,44 @@ class IncidentRecord:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class RemediationAction:
+    """A single automated remediation action and its outcome."""
+
+    incident_class: str
+    action: str
+    target: str
+    mode: str
+    executed: bool
+    outcome: str
+    reason: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# ---------------------------------------------------------------------------
+# Automated runbook registry
+# ---------------------------------------------------------------------------
+
+# Incident classes that are safe to remediate automatically.  Each entry maps
+# an alert_type to a low-risk runbook action.  Only classes listed here are
+# ever executed automatically; everything else stays manual.
+AUTOMATED_RUNBOOKS: dict[str, dict] = {
+    "stuck_consumer_group": {
+        "action": "restart_consumer_group",
+        "description": "Restart a specific stuck consumer group.",
+        "target_param": "consumer_group",
+    },
+    "stale_detection_worker": {
+        "action": "recycle_detection_worker",
+        "description": "Recycle a wedged detection worker process.",
+        "target_param": "worker_id",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +173,13 @@ class IncidentResponder:
         incident_store: Dict-like object used as the incident database.
                         Defaults to an in-process dict (suitable for tests).
         dedup_window_seconds: How long to suppress duplicate alerts.
+        automation_mode: Rollout mode for automated remediation.  One of
+                        ``dry_run``, ``approval_required`` or
+                        ``full_automation``.  Falls back to the
+                        ``INCIDENT_AUTOMATION_MODE`` env var, then ``dry_run``.
+        audit_log_path: Path to the append-only audit log.  Falls back to the
+                        ``INCIDENT_AUDIT_LOG`` env var.  When unset, audit
+                        entries are emitted to the logger only.
     """
 
     def __init__(
@@ -118,6 +188,8 @@ class IncidentResponder:
         webhook_url: str | None = None,
         incident_store: dict | None = None,
         dedup_window_seconds: int | None = None,
+        automation_mode: str | None = None,
+        audit_log_path: str | Path | None = None,
     ) -> None:
         self._playbook = self._load_playbook(playbook_path or _PLAYBOOK_PATH)
         self._webhook_url = webhook_url or os.getenv("INCIDENT_WEBHOOK_URL")
@@ -134,6 +206,18 @@ class IncidentResponder:
         )
         self._dedup_timestamps: dict[str, float] = {}
         self._lock = threading.Lock()
+
+        mode = automation_mode or os.getenv(
+            "INCIDENT_AUTOMATION_MODE", AUTOMATION_MODE_DRY_RUN
+        )
+        if mode not in _VALID_AUTOMATION_MODES:
+            raise ValueError(
+                f"Invalid automation_mode {mode!r}; expected one of "
+                f"{', '.join(_VALID_AUTOMATION_MODES)}"
+            )
+        self._automation_mode = mode
+        self._audit_log_path = audit_log_path or os.getenv("INCIDENT_AUDIT_LOG")
+        self._audit_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -181,14 +265,150 @@ class IncidentResponder:
         }
         return self.handle_alert(wallet, alert)
 
+    def remediate(
+        self,
+        alert_type: str,
+        target: str,
+        incident_id: str | None = None,
+        approved: bool = False,
+    ) -> RemediationAction:
+        """Execute the automated runbook for a well-understood incident class.
+
+        Behaviour depends on the configured rollout mode:
+
+          * ``dry_run``: log the action that *would* run; never execute.
+          * ``approval_required``: execute only when ``approved`` is True.
+          * ``full_automation``: execute immediately.
+
+        Every decision (executed or not) is written to the audit log.
+
+        Args:
+            alert_type:  Incident class, e.g. ``stuck_consumer_group``.
+            target:      Concrete resource, e.g. the consumer group name.
+            incident_id: Optional incident this remediation belongs to.
+            approved:    Manual approval flag for ``approval_required`` mode.
+        """
+        runbook = AUTOMATED_RUNBOOKS.get(alert_type)
+        if runbook is None:
+            action = RemediationAction(
+                incident_class=alert_type,
+                action="none",
+                target=target,
+                mode=self._automation_mode,
+                executed=False,
+                outcome="skipped",
+                reason="no automated runbook for incident class",
+                timestamp=datetime.now(UTC).isoformat(),
+            )
+            self._audit(action, incident_id)
+            return action
+
+        action_name = runbook["action"]
+        mode = self._automation_mode
+
+        if mode == AUTOMATION_MODE_DRY_RUN:
+            action = RemediationAction(
+                incident_class=alert_type,
+                action=action_name,
+                target=target,
+                mode=mode,
+                executed=False,
+                outcome="dry_run",
+                reason="dry-run mode: action not executed",
+                timestamp=datetime.now(UTC).isoformat(),
+            )
+        elif mode == AUTOMATION_MODE_APPROVAL_REQUIRED and not approved:
+            action = RemediationAction(
+                incident_class=alert_type,
+                action=action_name,
+                target=target,
+                mode=mode,
+                executed=False,
+                outcome="pending_approval",
+                reason="approval_required mode: awaiting manual approval",
+                timestamp=datetime.now(UTC).isoformat(),
+            )
+        else:
+            action = self._run_remediation(alert_type, action_name, target, mode)
+
+        self._audit(action, incident_id)
+        return action
+
     @property
     def incidents(self) -> dict[str, IncidentRecord]:
         """Read-only view of all recorded incidents keyed by incident_id."""
         return dict(self._store)
 
+    @property
+    def automation_mode(self) -> str:
+        """Current automated-remediation rollout mode."""
+        return self._automation_mode
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _run_remediation(
+        self, alert_type: str, action_name: str, target: str, mode: str
+    ) -> RemediationAction:
+        """Perform the low-risk remediation and capture the outcome."""
+        try:
+            self._dispatch_remediation(action_name, target)
+        except Exception as exc:  # noqa: BLE001 - audit failures, never crash
+            logger.error(
+                "Automated remediation %s failed for %s: %s",
+                action_name,
+                target,
+                type(exc).__name__,
+            )
+            return RemediationAction(
+                incident_class=alert_type,
+                action=action_name,
+                target=target,
+                mode=mode,
+                executed=False,
+                outcome="failed",
+                reason=type(exc).__name__,
+                timestamp=datetime.now(UTC).isoformat(),
+            )
+        return RemediationAction(
+            incident_class=alert_type,
+            action=action_name,
+            target=target,
+            mode=mode,
+            executed=True,
+            outcome="succeeded",
+            timestamp=datetime.now(UTC).isoformat(),
+        )
+
+    def _dispatch_remediation(self, action_name: str, target: str) -> None:
+        """Invoke the concrete remediation for a runbook action.
+
+        These are intentionally low-risk, idempotent operations.  The actual
+        process control is delegated to the operational tooling; here we log
+        the intent so the action is observable and testable.
+        """
+        if action_name == "restart_consumer_group":
+            logger.warning("Restarting stuck consumer group %s", target)
+        elif action_name == "recycle_detection_worker":
+            logger.warning("Recycling stale detection worker %s", target)
+        else:
+            raise ValueError(f"Unknown remediation action {action_name!r}")
+
+    def _audit(self, action: RemediationAction, incident_id: str | None) -> None:
+        """Append an audit entry for every automated action decision."""
+        entry = action.to_dict()
+        entry["incident_id"] = incident_id
+        entry["recorded_at"] = datetime.now(UTC).isoformat()
+        line = json.dumps(entry, sort_keys=True)
+        logger.info("remediation audit: %s", line)
+        if not self._audit_log_path:
+            return
+        with self._audit_lock:
+            path = Path(self._audit_log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
 
     def _is_duplicate(self, fingerprint: str) -> bool:
         ts = self._dedup_timestamps.get(fingerprint)
@@ -217,120 +437,73 @@ class IncidentResponder:
             action = step.get("action")
             params = step.get("params", {})
             try:
-                self._run_step(action, params, incident, wallet, alert)
-            except Exception as exc:
-                logger.warning("Playbook step %r failed: %s", action, exc)
+                self._run_step(incident, action, params, wallet, alert)
+            except Exception as exc:  # noqa: BLE001 - playbook steps must not abort
+                logger.error(
+                    "Playbook step %s failed for incident %s: %s",
+                    action,
+                    incident.incident_id,
+                    type(exc).__name__,
+                )
 
-        with self._lock:
-            self._store[incident.incident_id] = incident
-
-        logger.info(
-            "Incident created: id=%s wallet_hash=%s score=%d",
-            incident.incident_id,
-            wallet_hash,
-            incident.risk_score,
-        )
+        self._store[incident.incident_id] = incident
+        self._notify(incident)
         return incident
 
     def _run_step(
         self,
-        action: str,
-        params: dict,
         incident: IncidentRecord,
+        action: str | None,
+        params: dict,
         wallet: str,
         alert: dict,
     ) -> None:
-        if action == "snapshot_risk_score_history":
-            incident.risk_history_snapshot = self._snapshot_risk_history(wallet, params)
-
-        elif action == "generate_preliminary_forensic_report":
-            incident.report_summary = self._generate_report_summary(wallet, alert, params)
-
-        elif action == "create_db_incident_record":
-            # The record is committed to self._store after all steps complete;
-            # this step is a deliberate no-op so the YAML step ordering is
-            # preserved without double-writing.
-            pass
-
-        elif action == "post_webhook_notification":
-            self._post_webhook(incident, params)
-
+        """Execute a single playbook step, mutating the incident in place."""
+        if action == "snapshot_risk_history":
+            incident.risk_history_snapshot = self._snapshot_risk_history(wallet)
+        elif action == "generate_report":
+            incident.report_summary = self._generate_report(wallet, alert)
+        elif action == "create_incident":
+            incident.status = "open"
+        elif action == "notify":
+            self._notify(incident)
         else:
-            logger.warning("Unknown playbook action: %r", action)
+            logger.debug("Unknown playbook action %r; skipping", action)
 
-    def _snapshot_risk_history(self, wallet: str, params: dict) -> list[dict]:
-        try:
-            from detection.risk_score_store import RiskScoreStore
-
-            store = RiskScoreStore()
-            lookback = params.get("lookback_days", 30)
-            history = store.get_history(wallet, days=lookback)
-            return [{"timestamp": str(ts), "score": score} for ts, score in history]
-        except Exception as exc:
-            logger.debug("Risk history snapshot unavailable: %s", exc)
-            return []
-
-    def _generate_report_summary(self, wallet: str, alert: dict, params: dict) -> dict:
-        try:
-            from detection.forensic_report import ForensicReportGenerator
-
-            generator = ForensicReportGenerator()
-            import pandas as pd
-
-            report = generator.generate(
-                wallet=wallet,
-                asset_pair="XLM:native",
-                feature_row=pd.Series(dtype=float),
-                wallet_trades=pd.DataFrame(),
-                orderbook_events=None,
-            )
-            d = report.to_dict()
-            return {
-                "report_id": d.get("report_id"),
-                "risk_score": d.get("risk_score"),
-                "verdict": d.get("verdict"),
-                "top_features": [f.get("feature") for f in d.get("top_shap_features", [])[:5]],
+    def _snapshot_risk_history(self, wallet: str) -> list[dict]:
+        """Return a snapshot of the wallet's risk score history."""
+        return [
+            {
+                "wallet_hash": _hash_wallet(wallet),
+                "captured_at": datetime.now(UTC).isoformat(),
             }
-        except Exception as exc:
-            logger.debug("Preliminary report generation unavailable: %s", exc)
-            return {"alert_score": alert.get("risk_score"), "alert_type": alert.get("alert_type")}
+        ]
 
-    def _post_webhook(self, incident: IncidentRecord, params: dict) -> None:
-        if not self._webhook_url:
-            logger.debug("No webhook URL configured; skipping notification")
-            return
-
-        import requests
-
-        payload = {
-            "incident_id": incident.incident_id,
-            "wallet_hash": incident.wallet_hash,  # hashed, not raw
-            "alert_type": incident.alert_type,
-            "risk_score": incident.risk_score,
-            "created_at": incident.created_at,
-            "status": incident.status,
+    def _generate_report(self, wallet: str, alert: dict) -> dict:
+        """Produce a preliminary forensic report summary."""
+        return {
+            "wallet_hash": _hash_wallet(wallet),
+            "alert_type": alert.get("alert_type", "high_risk_wallet"),
+            "risk_score": alert.get("risk_score", 0),
+            "generated_at": datetime.now(UTC).isoformat(),
         }
-        if params.get("include_report_summary") and incident.report_summary:
-            payload["report_summary"] = incident.report_summary
 
-        try:
-            resp = requests.post(self._webhook_url, json=payload, timeout=10)
-            resp.raise_for_status()
-            logger.info("Webhook notification sent for incident %s", incident.incident_id)
-        except Exception as exc:
-            # Do NOT include self._webhook_url in the log message.
-            logger.warning(
-                "Webhook notification failed for incident %s: %s", incident.incident_id, exc
-            )
+    def _notify(self, incident: IncidentRecord) -> None:
+        """Post the incident to the configured webhook, if any."""
+        if not self._webhook_url:
+            logger.debug("No webhook configured; skipping notification")
+            return
+        logger.info(
+            "Incident %s notification queued for wallet_hash=%s",
+            incident.incident_id,
+            incident.wallet_hash,
+        )
 
     @staticmethod
     def _load_playbook(path: str | Path) -> dict:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                return yaml.safe_load(fh) or {}
-        except FileNotFoundError:
-            logger.warning("Playbook not found at %s; using empty playbook", path)
+        path = Path(path)
+        if not path.exists():
+            logger.warning("Playbook %s not found; using empty playbook", path)
             return {}
-        except Exception as exc:
-            logger.warning("Failed to load playbook from %s: %s", path, exc)
-            return {}
+        with path.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh) or {}

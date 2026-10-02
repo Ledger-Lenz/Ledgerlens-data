@@ -4,6 +4,7 @@
   "description": "Metadata schema for LedgerLens trained model cards (Google Model Card specification).",
   "type": "object",
   "required": [
+    "schema_version",
     "model_name",
     "training_date",
     "dataset_version",
@@ -14,6 +15,11 @@
     "out_of_scope_uses"
   ],
   "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Report schema version using semver (e.g. '1.0.0'). Used by downstream consumers to detect breaking changes.",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
     "model_name": {
       "type": "string",
       "description": "Canonical name of the model (e.g. 'xgboost', 'random_forest')."

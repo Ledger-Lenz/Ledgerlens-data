@@ -44,6 +44,8 @@ def _parse_pool_ids(raw: str) -> list[str]:
 
 class Config:
     HORIZON_URL: str = os.getenv("HORIZON_URL", "https://horizon.stellar.org")
+    # Full-history Horizon node used to backfill pruned ranges on resume (#904).
+    HORIZON_HISTORY_URL: str = os.getenv("HORIZON_HISTORY_URL", "")
     STELLAR_NETWORK: str = os.getenv("STELLAR_NETWORK", "PUBLIC")
     LOG_FORMAT: str = os.getenv("LOG_FORMAT", "json").lower()
 
@@ -58,6 +60,10 @@ class Config:
     BENFORD_WINDOWS_HOURS: list[int] = _parse_int_list(
         os.getenv("BENFORD_WINDOWS_HOURS", "1,4,24,168,720")
     )
+
+    # Hard cap on wallets held in streaming.FeatureBuffer; LRU-evicted beyond
+    # this (Issue #901). 0 disables the bound.
+    FEATURE_BUFFER_MAX_WALLETS: int = int(os.getenv("FEATURE_BUFFER_MAX_WALLETS", "100000"))
 
     ASSET_BENFORD_WINDOWS: dict[str, list[int]] = {}
 
@@ -119,6 +125,11 @@ class Config:
 
     # Solana RPC endpoint for cross-chain resolution
     SOLANA_RPC_URL: str = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    # Include program-derived / program-owned Solana accounts as identity-graph
+    # edges (#881). Off by default: PDAs are not user-controlled wallets.
+    SOLANA_INCLUDE_PDA_EDGES: bool = (
+        os.getenv("SOLANA_INCLUDE_PDA_EDGES", "false").lower() == "true"
+    )
 
     MIN_TRADES_FOR_SCORING: int = int(os.getenv("MIN_TRADES_FOR_SCORING", "20"))
     LIST_RELOAD_INTERVAL_SECONDS: int = int(os.getenv("LIST_RELOAD_INTERVAL_SECONDS", "60"))
@@ -174,6 +185,11 @@ class Config:
     KAFKA_LAG_ALERT_THRESHOLD: int = int(os.getenv("KAFKA_LAG_ALERT_THRESHOLD", "500"))
     KAFKA_METRICS_PORT: int = int(os.getenv("KAFKA_METRICS_PORT", "9100"))
     TRADE_AVRO_SCHEMA_PATH: str = os.getenv("TRADE_AVRO_SCHEMA_PATH", "data/trade_avro_schema.json")
+    # Confluent-compatible Schema Registry base URL (ingestion/avro_codec.py).
+    # When unset, schemas are registered in an in-process registry instead.
+    SCHEMA_REGISTRY_URL: str | None = os.getenv("SCHEMA_REGISTRY_URL")
+    # NONE, BACKWARD, FORWARD or FULL; enforced when a producer registers its schema.
+    SCHEMA_COMPATIBILITY_MODE: str = os.getenv("SCHEMA_COMPATIBILITY_MODE", "BACKWARD")
 
     # Worker health monitoring (streaming/health.py::WorkerHealthMonitor). A
     # worker is marked UNHEALTHY when it has not heartbeat within this many
@@ -222,6 +238,14 @@ class Config:
     # If the client does not respond with a pong within this interval,
     # the connection is closed and the subscriber entry is cleaned up.
     WS_HEARTBEAT_INTERVAL_SECONDS: float = float(os.getenv("WS_HEARTBEAT_INTERVAL_SECONDS", "30"))
+    # Slow-consumer policy when a client's outbound queue is full (issue #893):
+    # "drop_oldest" (default) or "disconnect". Under drop_oldest, a client that
+    # drops more than WS_SLOW_CONSUMER_MAX_DROPS messages is disconnected (0 = never).
+    WS_SLOW_CONSUMER_POLICY: str = os.getenv("WS_SLOW_CONSUMER_POLICY", "drop_oldest")
+    WS_SLOW_CONSUMER_MAX_DROPS: int = int(os.getenv("WS_SLOW_CONSUMER_MAX_DROPS", "0"))
+    # In-band token refresh (issue #894): seconds of grace after token expiry
+    # before the connection is force-closed with code 4001.
+    WS_TOKEN_EXPIRY_GRACE_SECONDS: float = float(os.getenv("WS_TOKEN_EXPIRY_GRACE_SECONDS", "0"))
 
     # WebSocket abuse detection (issue #223)
     WS_ABUSE_MAX_REQUESTS_PER_MINUTE: int = int(
@@ -230,6 +254,14 @@ class Config:
     WS_ABUSE_MAX_DISTINCT_WALLETS: int = int(os.getenv("WS_ABUSE_MAX_DISTINCT_WALLETS", "50"))
     WS_ABUSE_WALLET_WINDOW_SECONDS: int = int(os.getenv("WS_ABUSE_WALLET_WINDOW_SECONDS", "60"))
     WS_ABUSE_BLOCK_DURATION_SECONDS: int = int(os.getenv("WS_ABUSE_BLOCK_DURATION_SECONDS", "300"))
+    # Reputation-based adaptive rate limit (issue #895)
+    WS_ABUSE_MAX_REPUTATION_MULTIPLIER: float = float(
+        os.getenv("WS_ABUSE_MAX_REPUTATION_MULTIPLIER", "3.0")
+    )
+    WS_ABUSE_NEW_CLIENT_MULTIPLIER: float = float(os.getenv("WS_ABUSE_NEW_CLIENT_MULTIPLIER", "1.0"))
+    WS_ABUSE_REPUTATION_HALF_LIFE_SECONDS: float = float(
+        os.getenv("WS_ABUSE_REPUTATION_HALF_LIFE_SECONDS", "3600")
+    )
 
     # Differentially private neural training (DP-SGD via Opacus)
     DP_TARGET_EPSILON: float = float(os.getenv("DP_TARGET_EPSILON", "8.0"))
@@ -258,6 +290,46 @@ class Config:
     ADV_TRAINING_EPOCHS: int = int(os.getenv("ADV_TRAINING_EPOCHS", "3"))
     ADV_TRAINING_EPSILON: float = float(os.getenv("ADV_TRAINING_EPSILON", "0.1"))
     ADV_TRAINING_RATIO: float = float(os.getenv("ADV_TRAINING_RATIO", "0.5"))
+
+    # Adversarial-training curriculum + early stopping (Issue #872)
+    # Weak-to-strong epsilon ramp-up instead of a fixed budget every epoch.
+    # "" (default) keeps the pre-#872 fixed-epsilon behavior unchanged;
+    # "linear" ramps epsilon continuously from ADV_TRAINING_CURRICULUM_START_EPSILON
+    # to ADV_TRAINING_EPSILON; "step" ramps it in 4 discrete stages.
+    # Recommended default when enabling: ADV_TRAINING_CURRICULUM=linear with
+    # ADV_TRAINING_EPOCHS>=5 (a 2-3 epoch run barely ramps at all) — see
+    # docs/adversarial_curriculum.md.
+    ADV_TRAINING_CURRICULUM: str = os.getenv("ADV_TRAINING_CURRICULUM", "")
+    # Starting epsilon for the ramp. "" (default) falls back to
+    # ADV_TRAINING_EPSILON / 4 at call time.
+    ADV_TRAINING_CURRICULUM_START_EPSILON: float | None = (
+        float(os.getenv("ADV_TRAINING_CURRICULUM_START_EPSILON"))
+        if os.getenv("ADV_TRAINING_CURRICULUM_START_EPSILON")
+        else None
+    )
+    # Consecutive epochs with no robust (adversarial) validation AUC
+    # improvement before stopping early. 0 (default) disables early stopping,
+    # matching the pre-#872 behavior of always running every requested epoch.
+    ADV_TRAINING_EARLY_STOP_PATIENCE: int = int(os.getenv("ADV_TRAINING_EARLY_STOP_PATIENCE", "0"))
+    # Path the curriculum training loop appends per-epoch clean/robust
+    # accuracy runs to via mlops.experiment_tracking.JsonlExperimentTracker.
+    # "" (default) disables experiment logging (no file writes).
+    ADV_TRAINING_EXPERIMENT_LOG_PATH: str = os.getenv("ADV_TRAINING_EXPERIMENT_LOG_PATH", "")
+
+    # Backdoor detection auto-quarantine (Issue #871)
+    # Set BACKDOOR_SCAN_ENABLED=true to run activation-clustering backdoor
+    # detection after every training run and auto-quarantine a flagged
+    # candidate (detection.model_governance.quarantine_candidate) pending
+    # human review.
+    BACKDOOR_SCAN_ENABLED: bool = os.getenv("BACKDOOR_SCAN_ENABLED", "false").lower() == "true"
+    BACKDOOR_SCAN_MODEL_NAME: str = os.getenv("BACKDOOR_SCAN_MODEL_NAME", "random_forest")
+    # Fraction of training samples flagged by activation clustering above
+    # which a candidate is auto-quarantined. See
+    # detection.adversarial.backdoor_detector.DEFAULT_QUARANTINE_FLAGGED_FRACTION_THRESHOLD
+    # for the measured false-positive rate at the default value.
+    BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD: float = float(
+        os.getenv("BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD", "0.5")
+    )
 
     # Model integrity & BFT voting
     MODEL_SIGNING_PRIVATE_KEY_PATH: str = os.getenv("MODEL_SIGNING_PRIVATE_KEY_PATH", "")
@@ -346,6 +418,13 @@ class Config:
     AL_BATCH_SIZE: int = int(os.getenv("AL_BATCH_SIZE", "20"))
     AL_RETRAIN_THRESHOLD: int = int(os.getenv("AL_RETRAIN_THRESHOLD", "50"))
     AL_ROLLBACK_AUC_DROP: float = float(os.getenv("AL_ROLLBACK_AUC_DROP", "0.01"))
+    # Issue #886: diversity vs. uncertainty tradeoff for batch acquisition (0=uncertainty only)
+    AL_DIVERSITY_WEIGHT: float = float(os.getenv("AL_DIVERSITY_WEIGHT", "0.5"))
+    # Issue #887: inter-annotator agreement
+    AL_OVERLAP_FRACTION: float = float(os.getenv("AL_OVERLAP_FRACTION", "0.1"))
+    AL_MIN_ANNOTATOR_KAPPA: float = float(os.getenv("AL_MIN_ANNOTATOR_KAPPA", "0.4"))
+    # Issue #888: max allowed AUC drop on the forgetting regression set
+    AL_FORGETTING_MAX_DROP: float = float(os.getenv("AL_FORGETTING_MAX_DROP", "0.02"))
     AL_QUEUE_PATH: str = os.getenv("AL_QUEUE_PATH", "data/annotation_queue.json")
 
     # Core-set selection (Issue #253)
@@ -554,6 +633,9 @@ class Config:
     TRADE_DEDUP_CACHE_KEY_PREFIX: str = os.getenv(
         "TRADE_DEDUP_CACHE_KEY_PREFIX", "ledgerlens:trades:"
     )
+
+    # Pipeline stage idempotency-key TTL (pipeline/idempotency.py); see docs/idempotency.md
+    IDEMPOTENCY_TTL_HOURS: int = int(os.getenv("IDEMPOTENCY_TTL_HOURS", "48"))
 
     # ---------------------------------------------------------------------------
     # Parallel processing controls — Issue #528

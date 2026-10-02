@@ -183,7 +183,10 @@ class CausalForensicReportGenerator:
 
         sensitivity_results: list[dict] = []
         if causal and causal_attribution is not None:
-            from detection.causal_sensitivity import analyse_attribution
+            from detection.causal_sensitivity import (
+                EVALUE_LOW_CONFIDENCE_THRESHOLD,
+                analyse_attribution,
+            )
 
             base_rr = risk_score.get("score", 50) / 50.0 if risk_score.get("score", 0) > 0 else 1.0
             cf_rr = (
@@ -207,6 +210,8 @@ class CausalForensicReportGenerator:
                             "evalue": sr.evalue,
                             "low_confidence": sr.low_confidence,
                             "interpretation": sr.interpretation,
+                            "robust_threshold": EVALUE_LOW_CONFIDENCE_THRESHOLD,
+                            "is_robust": not sr.low_confidence,
                         }
                     )
                 except Exception:  # noqa: BLE001

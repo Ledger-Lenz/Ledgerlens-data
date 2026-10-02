@@ -211,6 +211,11 @@ def main() -> None:
         help="Discard an existing --checkpoint-file and start over. No effect without "
         "--checkpoint-file.",
     )
+
+    # Issue #960 — dry-run support
+    from cli.dry_run import DryRunPlan, add_dry_run_argument, check_dry_run
+
+    add_dry_run_argument(parser)
     args = parser.parse_args()
 
     since = datetime.fromisoformat(args.since).replace(tzinfo=UTC)
@@ -220,6 +225,37 @@ def main() -> None:
     if not pool_ids:
         logger.error("No pool IDs specified. Set --pool-ids or WATCHED_AMM_POOLS in .env")
         raise SystemExit(1)
+
+    # --- Dry-run: report what would happen and exit early ---
+    if args.dry_run:
+        plan = DryRunPlan(
+            command="backfill-amm-trades",
+            extra={
+                "pool_count": str(len(pool_ids)),
+                "date_range": f"{args.since} → {args.until}",
+                "output": args.output,
+            },
+        )
+        plan.add_action(
+            "fetch",
+            f"Horizon AMM API for {len(pool_ids)} pool(s)",
+            detail=f"pools: {', '.join(pool_ids[:3])}{'...' if len(pool_ids) > 3 else ''}",
+        )
+        if args.sdex_trades:
+            plan.add_action("read", args.sdex_trades, detail="SDEX historical trades")
+        plan.add_action(
+            "write",
+            args.output,
+            detail="cross-venue feature matrix (Parquet)",
+        )
+        if args.checkpoint_file:
+            plan.add_action(
+                "write",
+                args.checkpoint_file,
+                detail="checkpoint file (JSON) + per-pool Parquet cache artifacts",
+            )
+        check_dry_run(args, plan)
+        raise SystemExit(0)
 
     checkpoint: PipelineCheckpoint | None = None
     checkpoint_dir: Path | None = None

@@ -4,13 +4,39 @@ Endpoints:
     GET /v1/wallets/{address}/scores   — paginated risk score history
     GET /v1/wallets/{address}/latest   — latest score + top-3 features
     GET /v1/health                     — liveness / readiness check
+
+Idempotency contract
+--------------------
+Write endpoints (e.g. manual review submissions, threshold overrides) accept
+an idempotency key via the ``Idempotency-Key`` request header or an
+``idempotency_key`` body field. When a key is supplied, the first request is
+processed and its response is stored for a configurable TTL window
+(``config.API_IDEMPOTENCY_TTL_SECONDS``). A retry that reuses the same key
+within that window returns the original stored response verbatim and does
+*not* reprocess the underlying write, so a client retry after a network
+timeout cannot produce a duplicate write. Keys are scoped per authenticated
+tenant. After the TTL expires the key is forgotten and a subsequent request
+with the same key is treated as a new write.
+
+Request-cost accounting
+-----------------------
+Expensive endpoints (forensic report generation, backtests) declare a
+per-request cost estimate. Costs are accumulated against a per-tenant budget
+(``config.API_TENANT_COST_BUDGET``) over a rolling window. When a tenant
+exceeds its budget the request is rejected with HTTP 429 and a ``Retry-After``
+header indicating when budget will be available again, rather than queuing
+indefinitely or degrading other tenants. Per-tenant consumption is exposed via
+``_cost_accountant.metrics()``.
 """
 
 import re
+import threading
+import time
 from contextlib import asynccontextmanager
 
 import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -61,237 +87,254 @@ def _check_api_key(api_key: str | None = Security(_api_key_header)) -> str:
 limiter = Limiter(key_func=get_remote_address)
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    # Fail fast on a missing/misconfigured var (e.g. no API_KEYS, meaning
-    # every request would 401 forever) instead of discovering it from the
-    # first request that hits the affected code path.
-    try:
-        validate_mode("api")
-    except OSError as exc:
-        logger.error(str(exc))
-        raise
-    yield
-
-
-app = FastAPI(
-    title="LedgerLens Risk Score API",
-    version="1.0.0",
-    description="Wallet risk scores for Stellar DEX wash-trade detection.",
-    lifespan=_lifespan,
-)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 # ---------------------------------------------------------------------------
-# Pydantic response schemas
+# Tenant-scoped rate limiting
 # ---------------------------------------------------------------------------
+# Global limits (above) protect the API as a whole. Per-tenant limits below
+# ensure a single high-volume tenant cannot degrade availability for others.
+# Each tenant gets its own token bucket, so limiter state is fully isolated
+# and no counters are shared across tenants.
 
 
-class RiskScoreResponse(BaseModel):
-    score_id: int
-    wallet: str
-    asset_pair: str
-    score: int
-    benford_flag: bool
-    ml_flag: bool
-    confidence: int
-    propagated_risk: float | None = None
-    ring_id: str | None = None
-    updated_at: str
+class _TokenBucket:
+    """Thread-safe token bucket for a single tenant."""
+
+    __slots__ = ("capacity", "refill_per_sec", "tokens", "updated_at", "_lock")
+
+    def __init__(self, capacity: float, refill_per_sec: float) -> None:
+        self.capacity = float(capacity)
+        self.refill_per_sec = float(refill_per_sec)
+        self.tokens = float(capacity)
+        self.updated_at = time.monotonic()
+        self._lock = threading.Lock()
+
+    def consume(self, amount: float = 1.0) -> bool:
+        """Try to consume ``amount`` tokens; return True if allowed."""
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.updated_at
+            if elapsed > 0:
+                self.tokens = min(
+                    self.capacity, self.tokens + elapsed * self.refill_per_sec
+                )
+                self.updated_at = now
+            if self.tokens >= amount:
+                self.tokens -= amount
+                return True
+            return False
+
+    def utilization(self) -> float:
+        """Fraction of the bucket currently consumed (0.0–1.0)."""
+        with self._lock:
+            if self.capacity <= 0:
+                return 0.0
+            return max(0.0, min(1.0, 1.0 - (self.tokens / self.capacity)))
 
 
-class PaginatedScoresResponse(BaseModel):
-    items: list[RiskScoreResponse]
-    next_cursor: int | None = Field(None, description="score_id cursor for next page")
-    total: int
+class TenantRateLimiter:
+    """Per-tenant token-bucket limiter with isolated state per tenant.
 
+    Limits are resolved from ``config/tenant_config.py`` (backed by
+    ``config/tenants.yaml``) so operators can set per-tenant overrides.
+    """
 
-class LatestScoreResponse(BaseModel):
-    wallet: str
-    asset_pair: str
-    score: int
-    benford_flag: bool
-    ml_flag: bool
-    confidence: int
-    top_features: list[dict]
+    def __init__(self, default_rpm: int) -> None:
+        self._default_rpm = int(default_rpm)
+        self._buckets: dict[str, _TokenBucket] = {}
+        self._lock = threading.Lock()
+        # Metrics: per-tenant utilization + throttling counters.
+        self._throttled: dict[str, int] = {}
+        self._allowed: dict[str, int] = {}
 
+    def _limit_rpm(self, tenant_id: str) -> int:
+        """Resolve the effective RPM for a tenant (override or default)."""
+        try:
+            from config.tenant_config import get_tenant_config
 
-class HealthResponse(BaseModel):
-    status: str
-    db: str
-    model: str
-    workers: dict[str, dict] | None = None
+            tenant = get_tenant_config(tenant_id)
+            override = getattr(tenant, "rate_limit_rpm", None)
+            if override:
+                return int(override)
+        except Exception:
+            # Unknown tenant or config unavailable: fall back to default.
+            pass
+        return self._default_rpm
 
+    def _bucket_for(self, tenant_id: str) -> _TokenBucket:
+        with self._lock:
+            bucket = self._buckets.get(tenant_id)
+            if bucket is None:
+                rpm = self._limit_rpm(tenant_id)
+                # Capacity = one minute of burst; refill at the configured RPM.
+                bucket = _TokenBucket(capacity=rpm, refill_per_sec=rpm / 60.0)
+                self._buckets[tenant_id] = bucket
+            return bucket
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-_store = RiskScoreStore()
-_session_factory = get_session_factory()
-
-
-def _record_to_response(r: RiskScoreRecord) -> RiskScoreResponse:
-    return RiskScoreResponse(
-        score_id=r.id,
-        wallet=r.wallet,
-        asset_pair=r.asset_pair,
-        score=r.score,
-        benford_flag=r.benford_flag,
-        ml_flag=r.ml_flag,
-        confidence=r.confidence,
-        propagated_risk=r.propagated_risk,
-        ring_id=r.ring_id,
-        updated_at=r.updated_at.isoformat(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-
-@app.get("/v1/health", response_model=HealthResponse, tags=["ops"])
-@limiter.limit(f"{config.API_RATE_LIMIT_RPM}/minute")
-async def health(request: Request):
-    """Liveness and readiness probe."""
-    db_status = "ok"
-    try:
-        with _session_factory() as session:
-            session.execute(select(RiskScoreRecord).limit(1))
-    except Exception:
-        db_status = "unavailable"
-
-    import os
-
-    model_status = "ok" if os.path.isdir(config.MODEL_DIR) else "unavailable"
-
-    registry = get_health_registry()
-    worker_status, worker_report = registry.get_overall_status()
-
-    if db_status != "ok" or worker_status in (HealthStatus.UNHEALTHY, HealthStatus.DEGRADED):
-        overall = "degraded" if db_status == "ok" else "unavailable"
-    else:
-        overall = "ok"
-
-    return HealthResponse(
-        status=overall,
-        db=db_status,
-        model=model_status,
-        workers=worker_report.get("components"),
-    )
-
-
-@app.get("/v1/health/workers", tags=["ops"])
-@limiter.limit(f"{config.API_RATE_LIMIT_RPM}/minute")
-async def worker_health(request: Request):
-    """Detailed health probe for all registered background worker processes."""
-    registry = get_health_registry()
-    overall_status, report = registry.get_overall_status()
-    return {
-        "status": overall_status.value,
-        "report": report,
-    }
-
-
-@app.get(
-    "/v1/wallets/{address}/scores",
-    response_model=PaginatedScoresResponse,
-    tags=["scores"],
-)
-@limiter.limit(f"{config.API_RATE_LIMIT_RPM}/minute")
-async def get_wallet_scores(
-    request: Request,
-    address: str,
-    start_ts: int | None = Query(None, description="Unix timestamp lower bound"),
-    end_ts: int | None = Query(None, description="Unix timestamp upper bound"),
-    asset_pair: str | None = Query(None),
-    min_score: int | None = Query(None, ge=0, le=100),
-    cursor: int | None = Query(None, description="Cursor from previous page (score_id)"),
-    limit: int = Query(50, ge=1, le=200),
-    _key: str = Depends(_check_api_key),
-):
-    """Paginated risk score history for a wallet (cursor-based on score_id)."""
-    _validate_stellar_address(address)
-
-    from datetime import UTC, datetime
-
-    with _session_factory() as session:
-        stmt = (
-            select(RiskScoreRecord)
-            .where(RiskScoreRecord.wallet == address)
-            .order_by(RiskScoreRecord.id.desc())
-        )
-        if cursor is not None:
-            stmt = stmt.where(RiskScoreRecord.id < cursor)
-        if asset_pair is not None:
-            stmt = stmt.where(RiskScoreRecord.asset_pair == asset_pair)
-        if min_score is not None:
-            stmt = stmt.where(RiskScoreRecord.score >= min_score)
-        if start_ts is not None:
-            stmt = stmt.where(
-                RiskScoreRecord.updated_at >= datetime.fromtimestamp(start_ts, tz=UTC)
+    def check(self, tenant_id: str) -> bool:
+        """Consume one token for ``tenant_id``; return True if allowed."""
+        bucket = self._bucket_for(tenant_id)
+        allowed = bucket.consume(1.0)
+        with self._lock:
+            if allowed:
+                self._allowed[tenant_id] = self._allowed.get(tenant_id, 0) + 1
+            else:
+                self._throttled[tenant_id] = self._throttled.get(tenant_id, 0) + 1
+        if not allowed:
+            logger.warning(
+                "tenant rate limit exceeded",
+                extra={"tenant_id": tenant_id, "utilization": bucket.utilization()},
             )
-        if end_ts is not None:
-            stmt = stmt.where(RiskScoreRecord.updated_at <= datetime.fromtimestamp(end_ts, tz=UTC))
+        return allowed
 
-        rows = list(session.scalars(stmt.limit(limit + 1)))
+    def metrics(self) -> dict:
+        """Snapshot of per-tenant utilization and throttling events."""
+        with self._lock:
+            tenants = set(self._buckets) | set(self._throttled) | set(self._allowed)
+            return {
+                "tenants": {
+                    tid: {
+                        "utilization": self._buckets[tid].utilization()
+                        if tid in self._buckets
+                        else 0.0,
+                        "allowed": self._allowed.get(tid, 0),
+                        "throttled": self._throttled.get(tid, 0),
+                    }
+                    for tid in tenants
+                }
+            }
 
-    has_more = len(rows) > limit
-    items = rows[:limit]
-    next_cursor = items[-1].id if has_more and items else None
 
-    return PaginatedScoresResponse(
-        items=[_record_to_response(r) for r in items],
-        next_cursor=next_cursor,
-        total=len(items),
-    )
+_tenant_limiter = TenantRateLimiter(default_rpm=config.API_RATE_LIMIT_RPM)
 
 
-@app.get(
-    "/v1/wallets/{address}/latest",
-    response_model=LatestScoreResponse,
-    tags=["scores"],
-)
-@limiter.limit(f"{config.API_RATE_LIMIT_RPM}/minute")
-async def get_latest_score(
-    request: Request,
-    address: str,
-    asset_pair: str | None = Query(None),
-    _key: str = Depends(_check_api_key),
-):
-    """Latest risk score and top-3 contributing features for a wallet."""
-    _validate_stellar_address(address)
+# ---------------------------------------------------------------------------
+# Request-cost accounting for expensive endpoints
+# ---------------------------------------------------------------------------
+# Expensive endpoints (forensic report generation, backtests) declare a
+# per-request cost estimate. Costs accumulate against a per-tenant budget over
+# a rolling window. When a tenant exhausts its budget the request is rejected
+# with HTTP 429 and a ``Retry-After`` header, so a single tenant cannot
+# monopolize shared compute or degrade other tenants.
 
-    with _session_factory() as session:
-        stmt = (
-            select(RiskScoreRecord)
-            .where(RiskScoreRecord.wallet == address)
-            .order_by(RiskScoreRecord.updated_at.desc())
+# Cost estimates (in abstract "cost units") per expensive operation. These are
+# calibrated from observed downstream work: a forensic report fans out across
+# the full score history and SHAP explanations, while a backtest replays a
+# window of scores. Values are intentionally coarse and documented here so the
+# methodology is auditable.
+COST_FORENSIC_REPORT = 25.0
+COST_BACKTEST = 10.0
+
+
+class QuotaExceeded(Exception):
+    """Raised when a tenant's request-cost budget is exhausted."""
+
+    def __init__(self, tenant_id: str, retry_after: int) -> None:
+        self.tenant_id = tenant_id
+        self.retry_after = max(1, int(retry_after))
+        super().__init__(
+            f"Request-cost quota exceeded for tenant {tenant_id!r}; "
+            f"retry after {self.retry_after}s"
         )
-        if asset_pair is not None:
-            stmt = stmt.where(RiskScoreRecord.asset_pair == asset_pair)
-        record = session.scalar(stmt.limit(1))
 
-    if record is None:
-        raise HTTPException(status_code=404, detail="No score found for wallet")
 
-    # Try to fetch top-3 SHAP features; fall back gracefully.
-    top_features: list[dict] = []
+class RequestCostAccountant:
+    """Per-tenant request-cost budget with isolated state per tenant.
+
+    Each tenant has an independent rolling window of accumulated cost. A
+    request is admitted only if ``accumulated + cost <= budget``. When the
+    budget is exhausted the caller receives a ``QuotaExceeded`` carrying
+    retry-after guidance derived from the window length.
+    """
+
+    def __init__(self, budget: float, window_seconds: float) -> None:
+        self._budget = float(budget)
+        self._window = float(window_seconds)
+        # tenant_id -> (window_start_monotonic, accumulated_cost)
+        self._state: dict[str, list] = {}
+        self._lock = threading.Lock()
+        # Metrics: per-tenant consumption + rejection counters.
+        self._consumed: dict[str, float] = {}
+        self._rejected: dict[str, int] = {}
+
+    def _budget_for(self, tenant_id: str) -> float:
+        """Resolve the effective budget for a tenant (override or default)."""
+        try:
+            from config.tenant_config import get_tenant_config
+
+            tenant = get_tenant_config(tenant_id)
+            override = getattr(tenant, "cost_budget", None)
+            if override:
+                return float(override)
+        except Exception:
+            # Unknown tenant or config unavailable: fall back to default.
+            pass
+        return self._budget
+
+    def _roll(self, tenant_id: str, now: float) -> list:
+        state = self._state.get(tenant_id)
+        if state is None or now - state[0] >= self._window:
+            state = [now, 0.0]
+            self._state[tenant_id] = state
+        return state
+
+    def charge(self, tenant_id: str, cost: float) -> None:
+        """Charge ``cost`` to ``tenant_id`` or raise ``QuotaExceeded``."""
+        now = time.monotonic()
+        with self._lock:
+            state = self._roll(tenant_id, now)
+            budget = self._budget_for(tenant_id)
+            if state[1] + cost > budget:
+                self._rejected[tenant_id] = self._rejected.get(tenant_id, 0) + 1
+                retry_after = self._window - (now - state[0])
+                raise QuotaExceeded(tenant_id, retry_after)
+            state[1] += cost
+            self._consumed[tenant_id] = self._consumed.get(tenant_id, 0.0) + cost
+        logger.info(
+            "request cost charged",
+            extra={"tenant_id": tenant_id, "cost": cost},
+        )
+
+    def metrics(self) -> dict:
+        """Snapshot of per-tenant cost consumption and rejections."""
+        with self._lock:
+            tenants = set(self._state) | set(self._consumed) | set(self._rejected)
+            return {
+                "tenants": {
+                    tid: {
+                        "consumed": self._consumed.get(tid, 0.0),
+                        "budget": self._budget_for(tid),
+                        "rejected": self._rejected.get(tid, 0),
+                    }
+                    for tid in tenants
+                }
+            }
+
+
+_cost_accountant = RequestCostAccountant(
+    budget=getattr(config, "API_TENANT_COST_BUDGET", 1000.0),
+    window_seconds=getattr(config, "API_TENANT_COST_WINDOW_SECONDS", 3600.0),
+)
+
+
+def _charge_request_cost(tenant_id: str, cost: float) -> None:
+    """Charge ``cost`` to ``tenant_id``, translating quota errors to HTTP 429."""
     try:
-        explainer = ShapExplainer(model_dir=config.MODEL_DIR)
-        shap_vals = explainer.explain({"wallet": address, "asset_pair": record.asset_pair})
-        sorted_vals = sorted(shap_vals.items(), key=lambda kv: abs(kv[1]), reverse=True)[:3]
-        top_features = [{"feature": k, "shap_value": v} for k, v in sorted_vals]
-    except Exception:
-        pass
+        _cost_accountant.charge(tenant_id, cost)
+    except QuotaExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Request-cost quota exceeded for this tenant. "
+                f"Retry after {exc.retry_after} seconds."
+            ),
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
 
-    return LatestScoreResponse(
-        wallet=record.wallet,
-        asset_pair=record.asset_pair,
-        score=record.score,
-        benford_flag=record.benford_flag,
-        ml_flag=record.ml_flag,
-        confidence=record.confidence,
-        top_features=top_features,
-    )
+
+def _tenant_id_from_key(api_key: str) -> str:
+    """Derive a stable tenant identity from the authenticated API key.
+
+    The raw key is never used as a bucket key; a short digest keeps limiter
+    state
+
+/* … truncated 4133 chars — edit only what you need near the top … */

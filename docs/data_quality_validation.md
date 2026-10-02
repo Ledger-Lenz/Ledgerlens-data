@@ -80,3 +80,73 @@ per-record indices, `fail_fast` early exit, loading rules from
   guard, and adding a `SchemaRule` that validates against
   `data/trade_avro_schema.json` directly for parity with the Avro codec
   path (`ingestion/avro_codec.py`).
+
+## Stream-level anomaly detection (issue #913)
+
+Per-record rules cannot see a systemic upstream fault whose records are each
+valid but collectively wrong: a feed that silently drops most trades, or a
+field that starts arriving null for every record. `StreamQualityMonitor` in
+`ingestion/data_quality.py` adds rolling statistical checks on top of the
+per-record rules.
+
+For every batch passed to `observe_batch(source, batch)` it computes:
+
+| Metric | Meaning |
+|---|---|
+| `volume` | number of records in the batch |
+| `null_rate:<field>` | null ratio of each configured `key_fields` column |
+| `mean:<field>` | mean of each configured numeric `distribution_fields` column |
+
+Each value is compared with a rolling window (`window`, default 24 batches) of
+that source's previous values. Once `min_history` batches exist, a value whose
+z-score exceeds `z_threshold` (default 4) is a `StreamAnomaly` (`spike` or
+`drop`). The spread is floored at 5% of the baseline mean (1 percentage point
+for null rates), so a near-constant baseline does not turn normal jitter into
+alerts. Anomalous values are kept out of the baseline; after an intended level
+change, call `reset_baseline(source)`.
+
+Unsuppressed anomalies go through `alerts.router.AlertRouter` with
+`detectors: ["stream_quality_monitor"]` plus `source`, `metric`, `direction`,
+`observed`, `baseline` and `magnitude` (the z-score). The shipped
+`alerts/routing_config.yaml` sends these to `#data-quality`. `AlertRouter` only
+picks destinations; the monitor calls the `dispatch(destination, alert)`
+function you pass in to deliver each one.
+
+```python
+from alerts.router import AlertRouter
+from ingestion.data_quality import StreamQualityMonitor
+
+monitor = StreamQualityMonitor(
+    router=AlertRouter.from_yaml("alerts/routing_config.yaml"),
+    dispatch=send_alert,
+    key_fields=["amount", "price"],
+    distribution_fields=["amount"],
+)
+monitor.observe_batch("horizon_trades", trades_df)
+```
+
+### Acknowledging expected changes
+
+Planned maintenance or a known backfill will change volume on purpose.
+Acknowledge the window so it does not flood on-call:
+
+```python
+monitor.acknowledge(
+    "horizon_trades", start, end,
+    reason="Horizon maintenance CHG-1234",
+    metrics=["volume"],  # omit to cover every metric; source="*" covers every source
+)
+```
+
+Anomalies inside the window are still returned and counted
+(`suppressed="true"`), but they are not routed. Expired windows are dropped
+automatically.
+
+Metrics `ledgerlens_ingestion_stream_metric_value`,
+`ledgerlens_ingestion_stream_metric_zscore` and
+`ledgerlens_ingestion_stream_anomalies_total` are shown on the
+`monitoring/grafana/dashboards/ingestion_stream_quality.json` dashboard.
+
+```
+pytest tests/test_stream_quality_monitor.py -v
+```

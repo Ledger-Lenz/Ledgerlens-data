@@ -553,3 +553,56 @@ def test_benford_leading_digits_extraction_consistency(amounts_list):
     # All digits must be in range [1-9]
     for digit in digits:
         assert 1 <= digit <= 9, f"Digit {digit} out of valid range [1-9]"
+
+
+class TestEmptyTradeHistory:
+    """Tests for empty trade-history edge cases in the Benford engine (#676)."""
+
+    def test_compute_benford_metrics_empty_returns_nan(self):
+        """An empty amounts series returns NaN metrics, not an exception."""
+        empty = pd.Series([], dtype=float)
+        metrics = benford_engine.compute_benford_metrics(empty)
+
+        assert metrics.chi_square is np.nan or str(metrics.chi_square) == "nan"
+        assert metrics.mad is np.nan or str(metrics.mad) == "nan"
+        assert metrics.mad_nonconforming is False
+        assert metrics.sample_size == 0
+        assert all(v is np.nan or str(v) == "nan" for v in metrics.z_scores.values())
+
+    def test_compute_benford_metrics_single_trade_returns_nan(self):
+        """A single trade is below the MIN_TRADES threshold and returns NaN."""
+        single = pd.Series([100.0])
+        metrics = benford_engine.compute_benford_metrics(single)
+
+        # MIN_TRADES_FOR_SCORING is typically > 1
+        assert metrics.sample_size == 1
+        assert metrics.mad is np.nan or str(metrics.mad) == "nan"
+
+    def test_z_scores_empty_returns_empty(self):
+        """z_scores on an empty series returns empty dict or NaN values."""
+        empty = pd.Series([], dtype=float)
+        with np.errstate(invalid="ignore"):
+            zs = z_scores(empty)
+        # Should not raise ZeroDivisionError
+        assert isinstance(zs, dict)
+
+    def test_mad_score_empty_returns_nan(self):
+        """mad_score on an empty series returns NaN without raising."""
+        empty = pd.Series([], dtype=float)
+        result = mad_score(empty)
+        assert result is np.nan or str(result) == "nan"
+
+    def test_chi_square_empty_returns_nan(self):
+        """chi_square_statistic on an empty series returns NaN without raising."""
+        empty = pd.Series([], dtype=float)
+        result = chi_square_statistic(empty)
+        assert result is np.nan or str(result) == "nan"
+
+    def test_compute_metrics_for_windows_empty_df(self):
+        """compute_benford_metrics_for_windows on an empty DataFrame returns empty list."""
+        import pandas as pd
+
+        empty_df = pd.DataFrame(columns=["amount", "base_asset"])
+        results = benford_engine.compute_benford_metrics_for_windows(empty_df)
+        assert isinstance(results, list)
+        assert len(results) == 0

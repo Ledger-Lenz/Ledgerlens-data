@@ -14,7 +14,7 @@ Thread-safety model
 from __future__ import annotations
 
 import threading
-from collections import deque
+from collections import OrderedDict, deque
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -30,15 +30,54 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+try:  # pragma: no cover - metrics are optional at import time
+    from prometheus_client import Counter, Gauge
+
+    _EVICTIONS_TOTAL = Counter(
+        "ledgerlens_feature_buffer_evictions_total",
+        "Wallets evicted from the FeatureBuffer by the LRU bound (Issue #901)",
+    )
+    _BUFFER_WALLETS = Gauge(
+        "ledgerlens_feature_buffer_wallets", "Wallets currently held in the FeatureBuffer"
+    )
+    _BUFFER_TRADES = Gauge(
+        "ledgerlens_feature_buffer_trades", "Trades currently held in the FeatureBuffer"
+    )
+    _BUFFER_OCCUPANCY = Gauge(
+        "ledgerlens_feature_buffer_occupancy_ratio",
+        "Wallet occupancy of the FeatureBuffer relative to max_wallets (0-1)",
+    )
+except ImportError:  # pragma: no cover
+    _EVICTIONS_TOTAL = _BUFFER_WALLETS = _BUFFER_TRADES = _BUFFER_OCCUPANCY = None
+
 
 class FeatureBuffer:
-    """Per-wallet rolling deque of recent trades, safe for concurrent access."""
+    """Per-wallet rolling deque of recent trades, safe for concurrent access.
 
-    def __init__(self, max_trades: int = 1000) -> None:
+    Memory bound (Issue #901)
+    -------------------------
+    Memory is hard-bounded at ``max_wallets * max_trades`` trade records:
+
+    - ``max_trades`` caps each wallet's deque (oldest trade dropped first).
+    - ``max_wallets`` caps the number of tracked wallets.  When a *new*
+      wallet arrives and the buffer is full, the **least-recently-used**
+      wallet (by last ``update``/``get_feature_row`` access) is evicted with
+      all its state (trades, dedup index, Benford sketches).
+
+    ``max_wallets=None`` (or ``0``) disables the wallet bound.  See
+    ``docs/streaming_architecture.md`` for operator tradeoffs.
+    """
+
+    def __init__(self, max_trades: int = 1000, max_wallets: int | None = None) -> None:
         self.max_trades = max_trades
+        if max_wallets is None:
+            max_wallets = int(getattr(config, "FEATURE_BUFFER_MAX_WALLETS", 0) or 0)
+        self.max_wallets = max_wallets or None
+        self.evictions_total = 0
         # Guards creation of new wallet entries in _buffers/_locks.
         self._registry_lock = threading.RLock()
-        self._buffers: dict[str, deque] = {}
+        # OrderedDict doubles as the LRU index: most-recently-used at the end.
+        self._buffers: OrderedDict[str, deque] = OrderedDict()
         self._wallet_locks: dict[str, threading.Lock] = {}
         # trade_id -> None per wallet, kept in the same append/evict order as
         # ``_buffers[wallet]`` so membership checks for the "have I already
@@ -60,7 +99,12 @@ class FeatureBuffer:
     def _ensure_wallet(self, wallet: str) -> threading.Lock:
         """Return the lock for *wallet*, creating both lock and deque if absent."""
         with self._registry_lock:
-            if wallet not in self._wallet_locks:
+            if wallet in self._buffers:
+                self._buffers.move_to_end(wallet)
+            else:
+                if self.max_wallets is not None:
+                    while len(self._buffers) >= self.max_wallets:
+                        self._evict_lru()
                 self._wallet_locks[wallet] = threading.Lock()
                 self._buffers[wallet] = deque(maxlen=self.max_trades)
                 self._benford_sketches[wallet] = {
@@ -69,6 +113,18 @@ class FeatureBuffer:
                 self._pair_benford_sketches[wallet] = {}
                 self._seen_trade_ids[wallet] = {}
             return self._wallet_locks[wallet]
+
+    def _evict_lru(self) -> None:
+        """Drop the least-recently-used wallet. Caller holds ``_registry_lock``."""
+        victim, _ = self._buffers.popitem(last=False)
+        self._wallet_locks.pop(victim, None)
+        self._benford_sketches.pop(victim, None)
+        self._pair_benford_sketches.pop(victim, None)
+        self._seen_trade_ids.pop(victim, None)
+        self.evictions_total += 1
+        if _EVICTIONS_TOTAL is not None:
+            _EVICTIONS_TOTAL.inc()
+        logger.debug("FeatureBuffer: evicted LRU wallet=%s", victim)
 
     # ------------------------------------------------------------------
     # Public API
@@ -102,7 +158,9 @@ class FeatureBuffer:
         for wallet in (trade.base_account, trade.counter_account):
             lock = self._ensure_wallet(wallet)
             with lock:
-                seen = self._seen_trade_ids[wallet]
+                seen = self._seen_trade_ids.get(wallet)
+                if seen is None:  # evicted concurrently by the LRU bound
+                    continue
                 if trade.trade_id in seen:
                     logger.debug(
                         "FeatureBuffer.update: trade_id=%s already applied to wallet=%s — "
@@ -141,6 +199,8 @@ class FeatureBuffer:
         """
         lock = self._ensure_wallet(wallet)
         with lock:
+            if wallet not in self._buffers:  # evicted concurrently
+                return None
             records = list(self._buffers[wallet])
             # Prepare pre-computed Benford metrics
             benford_metrics = {h: s.to_metrics() for h, s in self._benford_sketches[wallet].items()}
@@ -176,3 +236,22 @@ class FeatureBuffer:
         """Return all wallets currently tracked in the buffer."""
         with self._registry_lock:
             return list(self._buffers.keys())
+
+    def stats(self) -> dict[str, float | int | None]:
+        """Return occupancy/eviction stats and publish them as Prometheus gauges."""
+        with self._registry_lock:
+            wallets = len(self._buffers)
+            trades = sum(len(b) for b in self._buffers.values())
+        occupancy = wallets / self.max_wallets if self.max_wallets else 0.0
+        if _BUFFER_WALLETS is not None:
+            _BUFFER_WALLETS.set(wallets)
+            _BUFFER_TRADES.set(trades)
+            _BUFFER_OCCUPANCY.set(occupancy)
+        return {
+            "wallets": wallets,
+            "trades": trades,
+            "max_wallets": self.max_wallets,
+            "max_trades": self.max_trades,
+            "occupancy": occupancy,
+            "evictions_total": self.evictions_total,
+        }

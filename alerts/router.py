@@ -95,6 +95,20 @@ class Alert(TypedDict, total=False):
     detectors: list[str]
     risk_score: float
     tenant: str
+    # Stream-level data-quality context (ingestion.data_quality.StreamQualityMonitor)
+    source: str
+    metric: str
+    direction: str
+    observed: float
+    baseline: float
+    magnitude: float
+    detected_at: str
+    message: str
+    # Per-pair degradation context (issue #971). Populated by the per-pair
+    # metric tracker when a single pair's model quality degrades while
+    # aggregate metrics stay flat.
+    metric: str
+    degradation_magnitude: float
 
 
 @dataclass(frozen=True)
@@ -208,120 +222,126 @@ def _parse_rule(raw: dict[str, Any], index: int) -> RoutingRule:
     )
 
 
-def load_routing_config(path: str) -> list[RoutingRule]:
-    """Load an ordered list of :class:`RoutingRule` from a YAML file.
-
-    See ``alerts/routing_config.yaml`` for the expected shape. Raises
-    :class:`RoutingConfigError` (with the offending rule's name/index) on
-    any structurally invalid rule, so a broken config is rejected at
-    startup rather than producing silent no-op routing at alert time.
-    """
-    with open(path) as f:
-        data = yaml.safe_load(f) or {}
-
-    raw_rules = data.get("rules", [])
-    if not isinstance(raw_rules, list):
-        raise RoutingConfigError("<root>", "'rules' must be a list")
-
-    return [_parse_rule(raw, i) for i, raw in enumerate(raw_rules)]
-
-
 class AlertRouter:
     """Evaluates alerts against an ordered list of routing rules.
 
-    Thread-safe: rules are read-only after construction/`` set_rules``, and
-    routing evaluation holds no mutable shared state, so concurrent calls
-    to `route()` from multiple streaming workers are safe without external
-    locking. `set_rules()` (a config hot-reload) is itself lock-protected
-    so a reload cannot race with an in-flight `route()` call reading a
-    half-updated rule list.
+    Thread-safe: rule lists are immutable after construction, and the
+    Prometheus counters used for observability are themselves thread-safe.
     """
 
     def __init__(
         self,
-        rules: Iterable[RoutingRule] | None = None,
+        rules: Iterable[RoutingRule],
         default_destinations: Iterable[RouteDestination] | None = None,
-    ) -> None:
-        self._lock = threading.RLock()
-        self._rules: list[RoutingRule] = list(rules or [])
-        self._default_destinations: list[RouteDestination] = list(default_destinations or [])
+    ):
+        self._rules = list(rules)
+        self._default_destinations = list(default_destinations or [])
+        self._lock = threading.Lock()
 
-    @classmethod
-    def from_yaml(cls, path: str) -> AlertRouter:
-        rules = load_routing_config(path)
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        default_raw = data.get("default_destinations", [])
-        defaults = [_parse_destination(d, "<default>") for d in default_raw]
-        return cls(rules=rules, default_destinations=defaults)
-
-    def set_rules(self, rules: Iterable[RoutingRule]) -> None:
-        """Atomically replace the active rule set (config hot-reload)."""
-        with self._lock:
-            self._rules = list(rules)
+    @property
+    def rules(self) -> list[RoutingRule]:
+        return list(self._rules)
 
     def route(self, alert: Alert) -> list[RouteDestination]:
-        """Return the deduplicated, ordered list of destinations for *alert*.
+        """Return the union of destinations for every matching rule.
 
-        Rules are evaluated in registration order. Every matching rule's
-        destinations are unioned (deduplicated by ``(channel, target)``,
-        first occurrence wins) unless a matching rule sets
-        ``stop_on_match``, in which case evaluation stops after that rule
-        and any destinations collected from earlier rules are discarded in
-        favor of exclusivity semantics -- a `stop_on_match` rule owns the
-        alert outright.
-
-        Falls back to ``default_destinations`` if no rule matches at all.
+        Rules are evaluated in order. If a matching rule sets
+        ``stop_on_match``, evaluation stops immediately after collecting
+        that rule's destinations. If no rule matches, the configured
+        default destinations are returned (which may be empty).
         """
-        with self._lock:
-            rules = list(self._rules)
-            defaults = list(self._default_destinations)
+        matched: list[RouteDestination] = []
+        seen: set[tuple[str, str]] = set()
 
-        collected: dict[tuple[str, str], RouteDestination] = {}
-        matched_any = False
-
-        for rule in rules:
+        for rule in self._rules:
             if not rule.matches(alert):
                 continue
-            matched_any = True
+
+            for destination in rule.destinations:
+                if destination.key() in seen:
+                    continue
+                seen.add(destination.key())
+                matched.append(destination)
+                if alert_routing_matches_total is not None:
+                    alert_routing_matches_total.labels(
+                        rule_name=rule.name, channel=destination.channel
+                    ).inc()
+
             if rule.stop_on_match:
-                collected = {d.key(): d for d in rule.destinations}
-                self._record_matches(rule, rule.destinations)
-                return list(collected.values())
+                break
 
-            for dest in rule.destinations:
-                collected.setdefault(dest.key(), dest)
-            self._record_matches(rule, rule.destinations)
-
-        if not matched_any:
-            if not defaults and alert_routing_unmatched_total is not None:
+        if not matched:
+            if alert_routing_unmatched_total is not None:
                 alert_routing_unmatched_total.inc()
-            return defaults
+            return list(self._default_destinations)
 
-        return list(collected.values())
-
-    def explain(self, alert: Alert) -> list[str]:
-        """Return the names of every rule that matches *alert*, in order.
-
-        Diagnostic helper: when an alert goes to an unexpected destination
-        (or nowhere), `explain()` shows exactly which rules fired so an
-        operator can find the config change responsible without manually
-        re-evaluating every rule's predicate by hand.
-        """
-        with self._lock:
-            rules = list(self._rules)
-
-        matched = []
-        for rule in rules:
-            if rule.matches(alert):
-                matched.append(rule.name)
-                if rule.stop_on_match:
-                    break
         return matched
 
-    @staticmethod
-    def _record_matches(rule: RoutingRule, destinations: list[RouteDestination]) -> None:
-        if alert_routing_matches_total is None:
-            return
-        for dest in destinations:
-            alert_routing_matches_total.labels(rule_name=rule.name, channel=dest.channel).inc()
+    def explain(self, alert: Alert) -> list[str]:
+        """Return the names of rules that match ``alert`` (diagnostics)."""
+        return [rule.name for rule in self._rules if rule.matches(alert)]
+
+
+def load_routing_config(path: str) -> tuple[list[RoutingRule], list[RouteDestination]]:
+    """Parse a routing config YAML file into rules and default destinations.
+
+    Expected shape (see ``alerts/routing_config.yaml``)::
+
+        rules:
+          - name: critical
+            min_risk_score: 90
+            destinations:
+              - channel: pagerduty
+                target: https://events.pagerduty.com/...
+        default_destinations:
+          - channel: webhook
+            target: https://example.com/alerts
+    """
+    with open(path, encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle) or {}
+
+    if not isinstance(raw, dict):
+        raise RoutingConfigError("<root>", "config root must be a mapping")
+
+    raw_rules = raw.get("rules") or []
+    if not isinstance(raw_rules, list):
+        raise RoutingConfigError("<root>", "'rules' must be a list")
+
+    rules = [_parse_rule(rule, index) for index, rule in enumerate(raw_rules)]
+
+    raw_defaults = raw.get("default_destinations") or []
+    if not isinstance(raw_defaults, list):
+        raise RoutingConfigError("<root>", "'default_destinations' must be a list")
+
+    defaults = [_parse_destination(d, "<default>") for d in raw_defaults]
+    return rules, defaults
+
+
+def build_per_pair_degradation_alert(
+    asset_pair: str,
+    metric: str,
+    degradation_magnitude: float,
+    *,
+    detector: str = "per_pair_cusum",
+    risk_score: float = 0.0,
+    tenant: str | None = None,
+) -> Alert:
+    """Build a routing-ready alert for a single pair's model degradation.
+
+    Issue #971: per-pair metric tracking detects when one pair's model
+    quality degrades while aggregate metrics stay flat. The resulting
+    alert must carry pair-level context -- the pair identifier, the
+    affected metric, and the magnitude of the degradation -- so routing
+    rules can target it (e.g. via ``asset_pair_patterns``) and downstream
+    consumers can act on it.
+    """
+    alert: Alert = {
+        "asset_pair": asset_pair,
+        "detectors": [detector],
+        "risk_score": float(risk_score),
+        "metric": metric,
+        "degradation_magnitude": float(degradation_magnitude),
+    }
+    if tenant is not None:
+        alert["tenant"] = tenant
+    return alert

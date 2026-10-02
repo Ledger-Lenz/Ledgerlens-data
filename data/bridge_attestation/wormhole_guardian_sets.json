@@ -1,0 +1,26 @@
+{
+  "_source": "Wormhole core contract 0x98f3c9e6E3fAce36bAAd05FE09d375Ef1464288B (Ethereum mainnet), getGuardianSet(uint32), fetched 2026-09-30. Add new sets by index when the guardian set rotates.",
+  "guardian_sets": {
+    "7": [
+      "0x5893b5a76c3f739645648885bdccc06cd70a3cd3",
+      "0xff6cb952589bde862c25ef4392132fb9d4a42157",
+      "0x114de8460193bdf3a2fcf81f86a09765f4762fd1",
+      "0x107a0086b32d7a0977926a205131d8731d39cbeb",
+      "0x8c82b2fd82faed2711d59af0f2499d16e726f6b2",
+      "0x42579bffbcf4276e290ab8e4c162bd4052b97970",
+      "0x938f104aeb5581293216ce97d771e0cb721221b1",
+      "0xf3ea0ad4ffb5a178ae4ebc21861651b25bdcbb91",
+      "0x9d16870160e703324d057c3361c34c5befba2c34",
+      "0x000ac0076727b35fbea2dac28fee5ccb0fea768e",
+      "0xaf45ced136b9d9e24903464ae889f5c8a723fc14",
+      "0xf93124b7c738843cbb89e864c862c38cddcccf95",
+      "0xd2cc37a4dc036a8d232b48f62cdd4731412f4890",
+      "0xda798f6896a3331f64b48c12d1d57fd9cbe70811",
+      "0xae565927bb8db25cd8bf3e7bb663d70023e4ea78",
+      "0x3f851ad586a47cef8d04748f33ab0d71395f06b4",
+      "0x178e21ad2e77ae06711549cfbb1f9c7a9d8096e8",
+      "0x7899ceab1dc961dae9defdb7a4f521269a5448fc",
+      "0x61d9800f9fcb4160fb0c6cf3a0902592bac2b434"
+    ]
+  }
+}

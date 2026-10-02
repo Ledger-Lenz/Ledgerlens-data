@@ -50,8 +50,16 @@ Environment variables
     (``sqlite:///:memory:``) in unit tests.
 
 ``IDEMPOTENCY_TTL_HOURS``
-    How many hours a completed checkpoint is considered valid.  Checkpoints
-    older than this are treated as stale (re-run).  Defaults to ``48``.
+    How many hours a checkpoint (idempotency key) is honoured.  Checkpoints
+    older than this are treated as stale (re-run) and are evicted from the
+    store, so it stays bounded.  Defaults to ``48``; see ``docs/idempotency.md``
+    for the reasoning behind that value.
+
+Metrics
+-------
+``ledgerlens_idempotency_store_entries{status}`` (gauge) tracks store size and
+``ledgerlens_idempotency_store_evicted_total`` (counter) the TTL evictions;
+both feed the "Idempotency Key Store" Grafana dashboard.
 """
 
 from __future__ import annotations
@@ -59,16 +67,45 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+    create_engine,
+    delete,
+    func,
+    or_,
+    select,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from config import config
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+try:
+    from prometheus_client import Counter, Gauge
+
+    IDEMPOTENCY_STORE_ENTRIES = Gauge(
+        "ledgerlens_idempotency_store_entries",
+        "Pipeline idempotency-key (checkpoint) entries currently stored, by status",
+        ["status"],
+    )
+    IDEMPOTENCY_STORE_EVICTED = Counter(
+        "ledgerlens_idempotency_store_evicted_total",
+        "Pipeline idempotency-key entries evicted after exceeding IDEMPOTENCY_TTL_HOURS",
+    )
+except ImportError:  # pragma: no cover - prometheus_client is a hard dependency in prod
+    IDEMPOTENCY_STORE_ENTRIES = None
+    IDEMPOTENCY_STORE_EVICTED = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -78,6 +115,12 @@ _IDEMPOTENCY_DB_URL: str = getattr(
     config, "IDEMPOTENCY_DB_URL", "sqlite:///pipeline_checkpoints.db"
 )
 _IDEMPOTENCY_TTL_HOURS: int = int(getattr(config, "IDEMPOTENCY_TTL_HOURS", "48"))
+
+# Minimum spacing between automatic TTL evictions triggered by stage starts.
+_EVICTION_INTERVAL_SECONDS = 3600.0
+
+# Statuses reported by the store-size gauge (see CheckpointRecord.status).
+_STATUSES: tuple[str, ...] = ("pending", "running", "done", "failed")
 
 # Stage names recognised by the pipeline — ordered by execution position.
 PIPELINE_STAGES: tuple[str, ...] = (
@@ -127,13 +170,17 @@ class CheckpointStore:
 
     Thread-safe: each public method opens its own session.
 
+    Entries older than the TTL are evicted when the store is opened and then
+    at most once per hour as stages start, so the store only ever holds keys
+    from the last ``ttl_hours``.
+
     Parameters
     ----------
     db_url:
         SQLAlchemy URL.  Defaults to ``IDEMPOTENCY_DB_URL`` from the
         environment (see module docstring).
     ttl_hours:
-        Completed checkpoints older than this are treated as stale.
+        Checkpoints older than this are treated as stale and evicted.
     """
 
     def __init__(
@@ -151,6 +198,8 @@ class CheckpointStore:
         )
         _Base.metadata.create_all(engine, checkfirst=True)
         self._session_factory: sessionmaker[Session] = sessionmaker(bind=engine, future=True)
+        self._last_eviction = 0.0
+        self.evict_expired()
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -208,6 +257,8 @@ class CheckpointStore:
 
     def mark_started(self, run_id: str, pair_id: str, stage: str) -> None:
         """Record that a stage has begun (status → running)."""
+        if time.monotonic() - self._last_eviction >= _EVICTION_INTERVAL_SECONDS:
+            self.evict_expired()
         self._upsert_status(run_id, pair_id, stage, "running", started_at=datetime.now(UTC))
 
     def mark_done(
@@ -295,6 +346,52 @@ class CheckpointStore:
                 session.delete(r)
             session.commit()
             return len(rows)
+
+    def evict_expired(self) -> int:
+        """Delete entries whose last update is older than the TTL.
+
+        Such keys no longer block reprocessing (``is_complete`` already treats
+        them as stale), so dropping them only bounds storage.  Returns the
+        number of rows evicted and refreshes the store-size metrics.
+        """
+        cutoff = datetime.now(UTC) - timedelta(hours=self._ttl_hours)
+        with self._lock, self._session_factory() as session:
+            result = session.execute(
+                delete(CheckpointRecord).where(
+                    or_(
+                        CheckpointRecord.completed_at < cutoff,
+                        and_(
+                            CheckpointRecord.completed_at.is_(None),
+                            CheckpointRecord.started_at < cutoff,
+                        ),
+                    )
+                )
+            )
+            session.commit()
+            evicted = int(result.rowcount or 0)
+        self._last_eviction = time.monotonic()
+        if evicted:
+            logger.info(
+                "Evicted %d idempotency key(s) older than ttl=%dh", evicted, self._ttl_hours
+            )
+        if IDEMPOTENCY_STORE_EVICTED is not None:
+            IDEMPOTENCY_STORE_EVICTED.inc(evicted)
+        self.size()
+        return evicted
+
+    def size(self) -> dict[str, int]:
+        """Return entry counts by status and publish them to the size gauge."""
+        with self._session_factory() as session:
+            counts = dict(
+                session.execute(
+                    select(CheckpointRecord.status, func.count()).group_by(CheckpointRecord.status)
+                ).all()
+            )
+        sizes = {status: int(counts.get(status, 0)) for status in _STATUSES}
+        if IDEMPOTENCY_STORE_ENTRIES is not None:
+            for status, count in sizes.items():
+                IDEMPOTENCY_STORE_ENTRIES.labels(status=status).set(count)
+        return sizes
 
     # ------------------------------------------------------------------
     # Internal helpers

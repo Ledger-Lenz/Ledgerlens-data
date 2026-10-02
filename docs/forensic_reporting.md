@@ -41,6 +41,7 @@ Every forensic report is a JSON object with the following top-level fields.
 | `model_metadata` | object | Model name, version, dataset hash, schema version. |
 | `report_sha256` | string | SHA-256 fingerprint of all other fields. |
 | `soroban_anchor_tx` | string \| null | Stellar transaction hash of the on-chain anchor. |
+| `asset_metadata` | object (optional) | Asset supply used for the report, with its `trust_tier`, `source`, `fetched_at`, `age_seconds` and `is_stale`. Present only when the report was generated with asset metadata; see [Asset Metadata: Staleness and Trust Tiers](asset_metadata_trust_tiers.md). |
 
 ### SHAP Feature Attribution Entry
 

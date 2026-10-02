@@ -292,11 +292,117 @@ Risk score records have a `certified_robust` boolean column (NULL when not evalu
 
 ---
 
+## Trigger-Feature Localization & Model-Level Auto-Quarantine — Issue #871
+
+The sections above cover **per-sample** quarantine in the active-learning
+annotation queue (`scripts/inspect_quarantine.py`, `quarantine=True` on a
+row). Issue #871 adds two complementary, **model-level** capabilities on
+top of the same `ActivationClusteringDetector`:
+
+1. **Trigger-feature localization** — which *input features* define the
+   anomaly the flagged samples share, not just which rows are anomalous.
+2. **Auto-quarantine of the trained candidate itself** in
+   `detection.model_governance` — separate from, and in addition to,
+   quarantining individual training rows. A candidate model can be
+   auto-quarantined even if the per-sample defence above was never
+   triggered (e.g. when scanning a model trained outside the active
+   learning pipeline).
+
+### `localize_trigger_features`
+
+```python
+from detection.adversarial.backdoor_detector import localize_trigger_features
+
+ranked = localize_trigger_features(X, flagged_indices, top_k=5)
+# [{"feature": "feat_0", "score": 3.42, "direction": "higher"}, ...]
+```
+
+For each feature, this computes a Cohen's-d-style standardized effect size
+— `(mean(flagged) - mean(clean)) / pooled_std` — between the flagged
+(suspected-backdoor) rows and the rest of `X`. This is a simplified
+spectral-signature decomposition (Tran, Li & Madry, 2018): the
+difference-of-means vector approximates the dominant direction of
+covariance a consistent trigger pattern introduces, without needing the
+full SVD of the activation covariance matrix their paper computes. Results
+are sorted by `|score|` descending; `direction` says whether the flagged
+group's mean is higher or lower.
+
+`ActivationClusteringDetector.structured_report(X, y, flagged_indices)`
+wraps this together with the existing `report()` stats, the affected
+sample indices (and wallet IDs, when a `wallet` column is present), and —
+when `in_wash_trading_ring` is a feature column — the fraction of flagged
+vs. clean samples inside a detected wash-trading ring (a cheap
+graph-substructure signal alongside the feature-space localization).
+
+### `scan_and_quarantine`
+
+```python
+from detection.adversarial.backdoor_detector import scan_and_quarantine
+
+report = scan_and_quarantine(model, X, y, candidate_dir="models/candidate")
+if report["quarantine_recommended"]:
+    print(report["reason"], report["quarantine_version_id"])
+```
+
+Runs detection + localization, and — when the flagged fraction of samples
+is `>= flagged_fraction_threshold` (default
+`DEFAULT_QUARANTINE_FLAGGED_FRACTION_THRESHOLD = 0.5`) — calls
+`detection.model_governance.quarantine_candidate(candidate_dir, reason,
+report, ...)`, which inserts a `ModelVersionRecord` with
+`status="quarantined"`. From that point on,
+`detection.model_governance.promote_candidate` raises
+`QuarantinedModelError` for that exact `candidate_dir` on **every**
+subsequent promotion attempt, whether or not `backdoor_report` is passed
+again — there is deliberately no "un-quarantine" API; clearing a
+quarantine means training and promoting a new candidate.
+
+### Wiring into the training pipeline
+
+Set `BACKDOOR_SCAN_ENABLED=true` (see `.env.example`) to run this
+automatically after every `python -m detection.model_training` run,
+scanning `BACKDOOR_SCAN_MODEL_NAME` (default `random_forest`) against the
+full training set. The report is written to
+`reports/backdoor_scan_{timestamp}.json` **regardless of outcome** — read
+it even when auto-quarantine doesn't fire, since `candidate_trigger_features`
+can still surface a suspicious pattern worth a manual look (see the
+threshold caveat below).
+
+### Measured false-positive rate, and why the default is 0.5
+
+Per-class k=2 clustering on RandomForest/XGBoost/LightGBM activations turns
+out to have a **high, noisy baseline flagged fraction on entirely clean
+data** — 25-47% across 15 clean synthetic seeds, independent of dataset
+size (checked up to n=2000) and largely independent of how extreme an
+injected trigger is (a deliberately obvious, cohesive, 10-sigma-shifted
+trigger cluster still did not reliably separate from that same noise band
+in this per-class k=2 formulation). In other words: `n_flagged /
+total_samples` alone does not cleanly separate clean from backdoored models
+at these dataset scales with the current detector.
+
+Given that, `DEFAULT_QUARANTINE_FLAGGED_FRACTION_THRESHOLD` is set to 0.5 —
+above the observed clean ceiling — specifically to keep the **false
+positive rate low** (measured 0/15 clean synthetic runs quarantined at this
+threshold, see
+`tests/test_backdoor_detector.py::TestScanAndQuarantine::test_false_positive_rate_on_clean_models_is_documented`).
+The tradeoff is **recall**: this default will only catch unusually
+large-scale poisoning (a large fraction of the training set), not subtle,
+small-fraction attacks — the same class of attack the per-sample AC
+defence above is also honest about missing (see "Known Limitations").
+
+**Recommendation:** don't rely on auto-quarantine alone. Review
+`candidate_trigger_features` in every `reports/backdoor_scan_*.json` (large
+effect sizes there are worth a manual look even when
+`quarantine_recommended` is `false`), and tune
+`BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD` (or `flagged_fraction_threshold`
+when calling directly) against your own dataset's measured clean baseline
+before relying on this gate in production — it will differ from the
+synthetic numbers above.
+
 ## References
 
 - Wang et al. (2019) "Activation Clustering: An Approach to Detecting Backdoor Attacks"
   https://arxiv.org/abs/1811.03728
-- Chen et al. (2019) "Spectral Signatures in Backdoor Attacks"
+- Tran, Li & Madry (2018) "Spectral Signatures in Backdoor Attacks"
   https://arxiv.org/abs/1811.00636
 - Turner et al. (2018) "Clean-Label Backdoor Attacks on Video Recognition Models"
   https://arxiv.org/abs/1912.02765

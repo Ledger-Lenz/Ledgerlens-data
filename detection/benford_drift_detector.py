@@ -121,6 +121,23 @@ class BenfordDriftModel(Base):
     mad_variance = Column(Float, nullable=False)
     mad_count = Column(Integer, nullable=False)
     per_window_baselines = Column(JSON, nullable=False, default={})
+    # Planned for Issue #855: persist change-point segment boundaries next to
+    # the drift statistics so forensic reports can cite them.
+    #   last_segment_boundaries = Column(JSON, nullable=True)
+    #       {"method": "pelt" | "fixed_fallback", "window_hours": int,
+    #        "boundaries": [ISO-8601 str, ...], "computed_at": ISO-8601 str}
+    # - `check()` gains an optional keyword `segment=None` (an AdaptiveWindow
+    #   from benford_window_optimizer). When given, it is stored in the column
+    #   above via `_save_baseline_to_db`. When omitted, behaviour is unchanged,
+    #   so existing call sites need no edits.
+    # - `BenfordBaseline.to_dict/from_dict` read the key with `.get()`, so
+    #   rows and JSON written before this change still load.
+    # - `Base.metadata.create_all` does not add columns to an existing table,
+    #   so a migration (next free number in migrations/versions/) adds the
+    #   nullable column, in the same pattern as
+    #   0006_add_risk_score_finality.py.
+    # - Test: fit baseline, call check(..., segment=...), reload the detector
+    #   from the same SQLite URL, and assert the boundaries round-trip.
     last_drift_timestamp = Column(String)
     drift_count_total = Column(Integer, default=0)
     updated_at = Column(DateTime, nullable=True)

@@ -310,3 +310,19 @@ Each weight update appends rows to the `ensemble_weight_history` table:
 ```bash
 pytest tests/test_ensemble_dynamic_weights.py -v
 ```
+
+## Embedding-space drift (contrastive encoder, #891)
+
+`monitoring.drift_detector.EmbeddingDriftMonitor` tracks the output of
+`detection/contrastive/encoder.py` on a rolling window (`window_size`, default
+1000) against a frozen reference window:
+
+| Metric | Definition | Default alert threshold |
+|---|---|---|
+| `ledgerlens_embedding_centroid_shift` | `‖μ_cur − μ_ref‖ / √tr(Σ_ref)` | `0.25` |
+| `ledgerlens_embedding_covariance_drift` | `‖Σ_cur − Σ_ref‖_F / ‖Σ_ref‖_F` | `0.30` |
+
+Both gauges are exported to Prometheus for the monitoring dashboard. Exceeding
+either threshold routes an `embedding_drift` alert through
+`alerts.router.AlertRouter`. Response runbook: `data/playbooks/embedding_drift.yaml`
+(investigate → re-baseline / fine-tune / re-pretrain).

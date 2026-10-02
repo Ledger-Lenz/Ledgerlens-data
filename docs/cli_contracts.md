@@ -65,3 +65,112 @@ exactly. Both the standalone script and the pytest run are wired into CI.
   runtime behavior (e.g. it won't catch a flag whose value is silently
   ignored). Runtime coverage for individual scripts already exists in
   `tests/test_score_wallet.py`, `tests/test_backtest.py`, etc.
+
+---
+
+## Dry-run mode (Issue #960)
+
+All state-mutating CLI commands must support a `--dry-run` flag.  When
+active, the command:
+
+1. Displays a formatted plan enumerating *exactly* which writes would occur
+   (file paths, table names, row counts, date ranges).
+2. Exits **without** performing any mutation — zero side effects guaranteed.
+3. Exits with code `0`.
+
+**Recommendation: always run `--dry-run` first before executing any
+state-mutating command in production.**
+
+```bash
+python -m scripts.restore --dry-run           # preview restore plan
+python -m scripts.backfill_amm_trades --dry-run --pool-ids <id>
+ledgerlens-ops validate-artifacts --dry-run
+```
+
+The `cli.dry_run` module provides:
+- `add_dry_run_argument(parser)` — consistent flag registration
+- `DryRunPlan` / `DryRunAction` — structured plan description
+- `check_dry_run(args, plan)` — print & return True if dry-run active
+
+Tests: `tests/test_cli_dry_run.py`
+
+---
+
+## Interactive confirmation & blast-radius summary (Issue #962)
+
+Destructive commands present a **blast-radius summary** before prompting
+for explicit confirmation.  The summary includes:
+
+- Operation name
+- Affected record counts (by table)
+- Date range of affected data
+- Affected tenants / environments
+- Any additional context (backup timestamp, target database URL, etc.)
+
+The operator must type exactly `yes` to proceed; any other input cancels.
+
+```bash
+python -m scripts.restore     # shows blast-radius, prompts for confirmation
+```
+
+**Non-interactive override (`--yes`):**
+
+```bash
+python -m scripts.restore --yes   # ⚠️  skips confirmation — CI/automation only
+# or
+LEDGERLENS_YES=1 python -m scripts.restore
+```
+
+> **Warning:** `--yes` / `LEDGERLENS_YES=1` bypasses the human safety gate
+> entirely.  Only use it in CI pipelines or automation scripts where the
+> blast radius has already been reviewed.  **Never** use it as a shortcut
+> during ad-hoc production operations.
+
+The `cli.confirmation` module provides:
+- `BlastRadiusSummary` — structured blast-radius description
+- `confirm_destructive_action(summary, non_interactive=False)` — prompt logic
+
+Tests: `tests/test_cli_confirmation.py`
+
+---
+
+## CLI audit logging (Issue #961)
+
+Every state-mutating CLI command produces an audit-log entry when running
+in a production-configured environment (`LEDGERLENS_ENV=production`).  The
+entry is appended to the same NDJSON trail as forensic-report entries
+(`AUDIT_LOG_PATH`, default `data/audit_trail.ndjson`).
+
+Each entry captures:
+- `event_type`: `"cli_command"`
+- `command`: command name
+- `actor`: from `LEDGERLENS_ACTOR`, `USER`, or `"unknown"`
+- `args`: redacted argument dict (secrets replaced with `"[REDACTED]"`)
+- `outcome`: `"success"` or `"failure"`
+- `error`: error message on failure
+- `timestamp`: UTC ISO-8601
+
+**Activating production auditing:**
+
+```bash
+export LEDGERLENS_ENV=production
+python -m scripts.restore --yes         # audit entry written on exit
+```
+
+**Force auditing in non-production (staging/CI):**
+
+```bash
+export AUDIT_ALL_ENVIRONMENTS=1
+```
+
+**Secret redaction:** any argument key matching `secret`, `password`,
+`token`, `key`, `credential`, `passphrase`, or `private` (case-insensitive)
+has its value replaced with `"[REDACTED]"` in the audit entry.
+
+The `cli.audit` module provides:
+- `audit_cli_command(command, args)` — context manager
+- `cli_audit_hook(command)` — decorator
+- `is_production_env()` — production detection
+- `redact_secrets(args)` — secret scrubbing
+
+Tests: `tests/test_cli_audit.py`

@@ -62,6 +62,20 @@ def _clip(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+def _write_trade_output(trades: pd.DataFrame, path: str) -> str:
+    """Write generated trades, falling back to CSV if Parquet is unavailable."""
+    try:
+        trades.to_parquet(path, index=False)
+        return path
+    except ImportError as exc:
+        if not path.endswith(".parquet"):
+            raise
+        fallback = f"{path}.csv"
+        trades.to_csv(fallback, index=False)
+        print(f"Parquet engine unavailable ({exc}); wrote CSV fallback to {fallback}")
+        return fallback
+
+
 def _random_individual(rng: np.random.Generator) -> dict:
     ind = {k: rng.uniform(lo, hi) for k, (lo, hi) in _PARAM_BOUNDS.items()}
     ind["use_round_numbers"] = bool(rng.integers(0, 2))
@@ -106,6 +120,87 @@ def _make_trades(ind: dict, seed: int = 0) -> pd.DataFrame:
         "amount": amounts,
         "price": rng.uniform(0.09, 0.11, size=n),
     }
+    return pd.DataFrame(rows)
+
+
+def make_cross_venue_round_trip(n_cycles: int = 5, seed: int = 0) -> pd.DataFrame:
+    """Generate A→B→A wash cycles split across two trading venues.
+
+    The returned rows retain the normal trade columns and add ``venue`` and
+    ``cycle_id`` so cross-venue feature extractors can distinguish each leg.
+    """
+    if n_cycles < 1:
+        raise ValueError("n_cycles must be at least 1")
+    rng = np.random.default_rng(seed)
+    rows: list[dict[str, object]] = []
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    for cycle in range(n_cycles):
+        amount = float(rng.uniform(100.0, 1_000.0))
+        for leg, (venue, source, target) in enumerate(
+            (("venue_a", "GROSSRC", "GROSSMID"), ("venue_b", "GROSSMID", "GROSSRC"))
+        ):
+            rows.append(
+                {
+                    "trade_id": f"xvenue-{cycle}-{leg}",
+                    "ledger_close_time": str(start + pd.Timedelta(minutes=cycle * 2 + leg)),
+                    "base_account": source,
+                    "counter_account": target,
+                    "base_asset": "XLM:native",
+                    "counter_asset": "USDC:GA5Z",
+                    "amount": amount * float(rng.uniform(0.98, 1.02)),
+                    "price": float(rng.uniform(0.09, 0.11)),
+                    "venue": venue,
+                    "cycle_id": cycle,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def make_cross_chain_bridge_wash_trade(n_cycles: int = 5, seed: int = 0) -> pd.DataFrame:
+    """Generate wash cycles whose return leg crosses a bridge and chain.
+
+    Each cycle contains an origin-chain trade, a bridge transfer marker, and a
+    destination-chain return trade. ``bridge_id`` links the legs without
+    pretending the bridge itself is a normal wallet counterparty.
+    """
+    if n_cycles < 1:
+        raise ValueError("n_cycles must be at least 1")
+    rng = np.random.default_rng(seed)
+    rows: list[dict[str, object]] = []
+    start = pd.Timestamp("2024-01-01", tz="UTC")
+    for cycle in range(n_cycles):
+        bridge_id = f"bridge-{cycle:06d}"
+        amount = float(rng.uniform(100.0, 1_000.0))
+        rows.extend(
+            [
+                {
+                    "trade_id": f"xchain-{cycle}-origin",
+                    "ledger_close_time": str(start + pd.Timedelta(minutes=cycle * 3)),
+                    "base_account": "GCHAIN_SRC",
+                    "counter_account": "GCHAIN_HUB",
+                    "base_asset": "XLM:native",
+                    "counter_asset": "USDC:GA5Z",
+                    "amount": amount,
+                    "price": 0.1,
+                    "chain": "stellar",
+                    "bridge_id": bridge_id,
+                    "cycle_id": cycle,
+                },
+                {
+                    "trade_id": f"xchain-{cycle}-return",
+                    "ledger_close_time": str(start + pd.Timedelta(minutes=cycle * 3 + 2)),
+                    "base_account": "GCHAIN_HUB",
+                    "counter_account": "GCHAIN_SRC",
+                    "base_asset": "USDC:GA5Z",
+                    "counter_asset": "XLM:native",
+                    "amount": amount * float(rng.uniform(0.97, 1.01)),
+                    "price": 10.0,
+                    "chain": "ethereum",
+                    "bridge_id": bridge_id,
+                    "cycle_id": cycle,
+                },
+            ]
+        )
     return pd.DataFrame(rows)
 
 
@@ -266,17 +361,33 @@ class AdversarialWashTradeSimulator:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Adversarial wash trade simulator")
+    parser.add_argument(
+        "--mode",
+        choices=("genetic", "cross-venue", "cross-chain"),
+        default="genetic",
+        help="Pattern to generate; genetic retains the original evolutionary mode",
+    )
+    parser.add_argument("--cycles", type=int, default=5, help="Cycles for graph-pattern modes")
     parser.add_argument("--generations", type=int, default=100)
     parser.add_argument("--population", type=int, default=50)
     parser.add_argument("--output", default="data/adversarial_trades.parquet")
     parser.add_argument("--model-dir", default="./models")
     args = parser.parse_args()
 
-    sim = AdversarialWashTradeSimulator(model_dir=args.model_dir)
-    result = sim.run(n_generations=args.generations, population_size=args.population)
+    if args.mode == "cross-venue":
+        trades = make_cross_venue_round_trip(args.cycles)
+        result = {"best_score": _heuristic_score(trades), "best_strategy": {"mode": args.mode}}
+        _write_trade_output(trades, args.output)
+    elif args.mode == "cross-chain":
+        trades = make_cross_chain_bridge_wash_trade(args.cycles)
+        result = {"best_score": _heuristic_score(trades), "best_strategy": {"mode": args.mode}}
+        _write_trade_output(trades, args.output)
+    else:
+        sim = AdversarialWashTradeSimulator(model_dir=args.model_dir)
+        result = sim.run(n_generations=args.generations, population_size=args.population)
+        sim.save_to_dataset(args.output)
     print(f"Best adversarial risk score: {result['best_score']:.2f}")
     print(f"Best strategy: {result['best_strategy']}")
-    sim.save_to_dataset(args.output)
     print(f"Adversarial trades saved to {args.output}")
 
 

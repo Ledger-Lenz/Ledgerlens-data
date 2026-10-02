@@ -287,6 +287,58 @@ def _warm_start_update(
     return updated
 
 
+# ---------------------------------------------------------------------------
+# Issue #888: catastrophic-forgetting guardrails
+# ---------------------------------------------------------------------------
+
+REGRESSION_SET_VERSION = "1"
+
+
+class ForgettingGuardrail:
+    """Detect and mitigate catastrophic forgetting on a versioned regression set.
+
+    Args:
+        regression_set: Held-out labelled rows covering rare/historical fraud typologies.
+                        It is never used for training.
+        replay_buffer:  Historical hard examples mixed into warm-start updates when
+                        forgetting is detected (replay mitigation).
+        max_drop:       Maximum allowed AUC drop on the regression set
+                        (default ``config.AL_FORGETTING_MAX_DROP``).
+        mode:           ``"block"`` rolls back an update that still regresses after
+                        mitigation; ``"warn"`` only logs it.
+        version:        Regression-set version, recorded in every report.
+    """
+
+    def __init__(
+        self,
+        regression_set: pd.DataFrame,
+        replay_buffer: pd.DataFrame | None = None,
+        max_drop: float | None = None,
+        mode: str = "block",
+        version: str = REGRESSION_SET_VERSION,
+    ):
+        if mode not in ("block", "warn"):
+            raise ValueError(f"mode must be 'block' or 'warn', got {mode!r}")
+        if regression_set is None or regression_set["label"].nunique() < 2:
+            raise ValueError("regression_set must contain both classes")
+        self.regression_set = regression_set
+        self.replay_buffer = replay_buffer
+        self.max_drop = config.AL_FORGETTING_MAX_DROP if max_drop is None else max_drop
+        self.mode = mode
+        self.version = version
+
+    def evaluate(self, models: dict) -> float:
+        return _auc_on_df(models, self.regression_set)
+
+    def regressed(self, auc_before: float, auc_after: float) -> bool:
+        return (auc_before - auc_after) > self.max_drop
+
+    def replay_mix(self, training_data: pd.DataFrame) -> pd.DataFrame:
+        if self.replay_buffer is None or self.replay_buffer.empty:
+            return training_data
+        return pd.concat([training_data, self.replay_buffer], ignore_index=True)
+
+
 class IncrementalTrainer:
     """Incrementally update LedgerLens ensemble models with new annotations.
 
@@ -304,7 +356,9 @@ class IncrementalTrainer:
         historical_data_path: str | None = None,
         val_size: float = 0.2,
         random_state: int = 42,
+        forgetting_guardrail: ForgettingGuardrail | None = None,
     ):
+        self.forgetting_guardrail = forgetting_guardrail
         self.model_dir = model_dir or config.MODEL_DIR
         self.historical_data_path = historical_data_path
         self.val_size = val_size
@@ -404,6 +458,8 @@ class IncrementalTrainer:
             )
 
         auc_before = _auc_on_df(models_before, val_df)
+        guard = self.forgetting_guardrail
+        reg_auc_before = guard.evaluate(models_before) if guard else None
         original_shas = _backup_models(model_dir)
 
         strategy: str
@@ -434,11 +490,44 @@ class IncrementalTrainer:
                 updated_models = {name: res["model"] for name, res in results.items()}
                 save_models(results, model_dir)
 
+            forgetting: dict | None = None
+            if guard is not None:
+                reg_auc_after = guard.evaluate(updated_models)
+                forgetting = {
+                    "regression_set_version": guard.version,
+                    "auc_before": round(reg_auc_before, 6),
+                    "auc_after_unmitigated": round(reg_auc_after, 6),
+                    "mitigated": False,
+                    "blocked": False,
+                }
+                if guard.regressed(reg_auc_before, reg_auc_after) and strategy == "warm_start":
+                    logger.warning("Forgetting detected on regression set — applying replay")
+                    _restore_models(model_dir, original_shas)
+                    original_shas = _backup_models(model_dir)
+                    updated_models = _warm_start_update(
+                        self._load_models(), guard.replay_mix(training_data), model_dir
+                    )
+                    reg_auc_after = guard.evaluate(updated_models)
+                    forgetting["mitigated"] = True
+                forgetting["auc_after"] = round(reg_auc_after, 6)
+                if guard.regressed(reg_auc_before, reg_auc_after):
+                    logger.warning(
+                        "Regression-set AUC dropped %.4f (> %.4f)",
+                        reg_auc_before - reg_auc_after,
+                        guard.max_drop,
+                    )
+                    forgetting["blocked"] = guard.mode == "block"
+                report["forgetting_guardrail"] = forgetting
+
             auc_after = _auc_on_df(updated_models, val_df)
             auc_delta = auc_after - auc_before
 
             rolled_back = False
-            if auc_delta < -rollback_threshold:
+            if forgetting and forgetting["blocked"]:
+                _restore_models(model_dir, original_shas)
+                rolled_back = True
+                auc_after = auc_before
+            elif auc_delta < -rollback_threshold:
                 logger.warning(
                     "AUC-ROC dropped %.4f (threshold %.4f) — rolling back",
                     auc_delta,

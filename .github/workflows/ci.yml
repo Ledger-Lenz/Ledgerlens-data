@@ -72,6 +72,71 @@ jobs:
               print("verify_chain check passed.")
           EOF
 
+      - name: Check metric label cardinality (Issue #934)
+        # Rejects metric emissions whose label values are sourced directly from
+        # user/transaction identifiers (wallet addresses, tx hashes, ids), which
+        # cause unbounded label cardinality and metrics-backend overload.
+        run: |
+          python - <<'EOF'
+          import re, sys, pathlib
+
+          # Label names that are known high-cardinality risks when their value
+          # comes straight from a user/transaction identifier.
+          RISKY_LABELS = {
+              "wallet", "wallet_address", "address", "account", "account_id",
+              "user", "user_id", "tx", "tx_id", "tx_hash", "transaction",
+              "transaction_id", "hash", "signature", "request_id", "trace_id",
+          }
+          # Identifier-ish value expressions that must never be used as a label value.
+          RISKY_VALUE = re.compile(
+              r"(wallet|address|account|user|tx|transaction|hash|signature|request|trace)"
+              r"(_id|_hash|_address|_signature)?\b",
+              re.IGNORECASE,
+          )
+          # Metric emission call sites (prometheus_client style + local wrappers).
+          EMIT = re.compile(
+              r"\.(labels|label|with_labels)\(|\b(inc|observe|set|add|record|emit|gauge|histogram|counter)\(",
+              re.IGNORECASE,
+          )
+
+          issues = []
+          for f in pathlib.Path(".").rglob("*.py"):
+              if any(part in {".git", "tests", "test", "venv", ".venv"} for part in f.parts):
+                  continue
+              for i, line in enumerate(f.read_text().splitlines(), start=1):
+                  if not EMIT.search(line):
+                      continue
+                  # keyword form: labels(wallet=wallet_address)
+                  for m in re.finditer(r"(\w+)\s*=\s*([\w\.\[\]'\"]+)", line):
+                      name, value = m.group(1).lower(), m.group(2)
+                      if name in RISKY_LABELS and RISKY_VALUE.search(value):
+                          issues.append(
+                              f"{f}:{i}: high-cardinality label '{name}' sourced from "
+                              f"identifier '{value}'"
+                          )
+                  # positional form: labels(wallet_address)
+                  for m in re.finditer(r"\(([^)]*)\)", line):
+                      for arg in m.group(1).split(","):
+                          arg = arg.strip()
+                          if arg and RISKY_VALUE.search(arg) and "=" not in arg:
+                              issues.append(
+                                  f"{f}:{i}: high-cardinality label value '{arg}' "
+                                  f"passed positionally"
+                              )
+
+          if issues:
+              print("Metric cardinality guardrail failures:")
+              for issue in issues:
+                  print(" ", issue)
+              print(
+                  "\nUse bounded label values (status, asset, endpoint, error_class) "
+                  "instead of raw identifiers. See docs/metrics_labeling.md."
+              )
+              sys.exit(1)
+          else:
+              print("Metric cardinality check passed.")
+          EOF
+
       - name: Validate Grafana dashboard JSON schema (Issue #242)
         run: |
           python - <<'EOF'
@@ -109,6 +174,11 @@ jobs:
 
       - name: Validate documentation internal links (Issue #512)
         run: python -m scripts.validate_docs
+
+      - name: Feature label / dictionary consistency check (Issue #946)
+        run: python scripts/check_feature_label_consistency.py
+        # Exits 1 if any key in reporting/feature_labels.FEATURE_LABELS is
+        # missing a corresponding entry in data/feature_dictionary.md.
 
       - name: Check import cycles (Issue #546)
         run: |
@@ -165,8 +235,25 @@ jobs:
       - name: Check typed service boundaries (utils/boundaries.py)
         run: python scripts/check_service_boundaries.py
 
-      - name: Check module dependency rules (config/module_boundaries.yml)
+      - name: Check module dependency rules (config/module_boundaries.yml) (Issue #957)
+        # Enforces that no lower-layer package imports a higher-layer one.
+        # Exit 1 = at least one violation — required check, blocks PR merge.
         run: python scripts/check_module_dependencies.py
+
+      - name: Stale-entry check for repo_maturity.yaml (Issue #958)
+        # Fails if config/repo_maturity.yaml references a path that no longer
+        # exists — prevents the maturity report from quietly mis-scoring the repo.
+        run: python scripts/generate_maturity_report.py --check-stale --quiet
+
+      - name: Generate repository maturity report (Issue #958)
+        # Produces docs/maturity_report.md — informational, never blocks CI.
+        run: python scripts/generate_maturity_report.py --output docs/maturity_report.md --quiet
+        continue-on-error: true
+
+      - name: Secret-detection scan (Issue #956)
+        # Regex + entropy scan of config files and .env.example for accidentally
+        # committed secret-shaped values. Exit 1 = secrets found — required check.
+        run: python scripts/scan_secrets.py
 
       - name: Check public API compatibility (tests/fixtures/api_baseline.json)
         run: python scripts/check_api_compatibility.py
@@ -282,6 +369,12 @@ jobs:
 
       - name: Check Avro schema compatibility
         run: make check-schema-compatibility
+
+      - name: Check report schema compatibility (Issue #947)
+        run: python scripts/check_report_schema_compatibility.py
+        # Exits 1 on breaking changes to reporting/schemas/*.json.
+        # See docs/report_schema_deprecation_policy.md for the allowed change
+        # categories and the version-bump procedure.
 
       # -----------------------------------------------------------------------
       # Issue #545 — Static analysis gates (mypy + bandit + radon)
@@ -452,12 +545,15 @@ jobs:
         # Keep each mutant paired with the tests that exercise this module.
         # Mutmut restores every mutant after testing,
         # so no mutated code is ever persisted to disk or the workspace.
+        # Issue #964: test_mutation_coverage.py added to kill surviving mutants
+        # in benford_engine, score_normaliser, and risk_propagation.
         run: |
           timeout 10m mutmut run \
             --paths-to-mutate "detection/benford_engine.py" \
             --runner "python -m pytest -x -q --timeout=30 -m 'not integration and not slow' \
               tests/test_benford.py \
-              tests/test_benford_ci.py" \
+              tests/test_benford_ci.py \
+              tests/test_mutation_coverage.py" \
             --no-progress || true
 
       - name: Print mutation results summary

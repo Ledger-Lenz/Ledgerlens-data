@@ -39,6 +39,7 @@ from detection.model_inference import RiskScorer
 
 if TYPE_CHECKING:
     from detection.counterfactual_explainer import CounterfactualResult
+    from ingestion.asset_metadata_fetcher import AssetMetadataRecord
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -106,6 +107,8 @@ class ForensicReport:
     causal_attribution: CausalAttribution | None = None
     propagation_path: PropagationPath | None = None
     counterfactual_result: CounterfactualResult | None = None
+    # AssetMetadataRecord.to_dict(): supply plus trust tier and staleness (issue #917)
+    asset_metadata: dict | None = None
 
     def __post_init__(self) -> None:
         self.report_sha256 = self._compute_sha256()
@@ -143,7 +146,18 @@ class ForensicReport:
             d["propagation_path"] = asdict(self.propagation_path)
         if self.counterfactual_result is not None:
             d["counterfactual_result"] = self.counterfactual_result.to_dict()
+        if self.asset_metadata is not None:
+            d["asset_metadata"] = self.asset_metadata
         return d
+
+    @property
+    def asset_metadata_degraded(self) -> bool:
+        """True when the asset metadata used is not fresh primary-source data."""
+        if self.asset_metadata is None:
+            return False
+        return self.asset_metadata.get("trust_tier") != "primary" or bool(
+            self.asset_metadata.get("is_stale")
+        )
 
     def to_dict(self) -> dict:
         from utils.version_stamp import stamp_artifact
@@ -255,6 +269,7 @@ class ForensicReportGenerator:
         co_trade_graph: nx.Graph | None = None,
         propagation_alpha: float = 0.15,
         provenance: dict[str, list[str]] | None = None,
+        asset_metadata: AssetMetadataRecord | None = None,
     ) -> ForensicReport:
         if risk_score_dict is None and feature_row is not None:
             risk_score_dict = self._scorer.score(feature_row)
@@ -317,6 +332,7 @@ class ForensicReportGenerator:
             model_metadata=metadata,
             causal_attribution=causal_attribution,
             propagation_path=propagation_path,
+            asset_metadata=asset_metadata.to_dict() if asset_metadata is not None else None,
         )
 
 

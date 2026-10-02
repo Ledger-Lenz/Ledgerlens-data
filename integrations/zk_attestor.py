@@ -52,7 +52,9 @@ import json
 import logging
 import math
 import struct
-from dataclasses import asdict, dataclass
+import threading
+import time
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
@@ -503,3 +505,288 @@ def attach_benford_proof_to_alert(
         **alert_payload,
         "benford_zk_proof": proof.to_dict(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Issue #952 — Proof-verification caching
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CacheEntry:
+    """Internal cache entry holding a verification result and expiry time."""
+
+    result: bool
+    expires_at: float  # monotonic clock seconds
+
+
+class ProofVerificationCache:
+    """Thread-safe TTL cache for ZK proof verification results.
+
+    Caches the boolean result of :meth:`BenfordZKProver.verify` keyed on the
+    SHA-256 of the serialised proof.  This eliminates redundant re-verification
+    of the same proof within a time window, while guaranteeing that:
+
+    * **Stale results are never returned** — each entry has a hard TTL; once
+      expired the proof is re-verified from scratch.
+    * **Explicit invalidation** — callers can evict a proof by its hash at any
+      time (e.g., after learning a private key was compromised).
+    * **No false positives** — only successful verifications (``result=True``)
+      are cached for the full TTL; *failed* verifications are cached with a
+      short ``failure_ttl_seconds`` to limit hammering overhead but not to mask
+      genuine failures.
+
+    **Invalidation policy (documented):**
+
+    1. **TTL eviction**: every ``put`` stores a monotonic expiry timestamp.
+       ``get`` returns ``None`` (cache miss) when the entry has expired, forcing
+       fresh verification.  Default TTL: 300 seconds (5 minutes).
+    2. **Explicit eviction**: ``invalidate(proof_hash)`` removes a specific
+       entry immediately — use when you learn that a proof or its underlying
+       data should no longer be trusted.
+    3. **Full flush**: ``clear()`` evicts all entries — use on model rotation
+       or after a security incident.
+    4. **No mutation**: cached verification results are immutable once stored.
+       Updating a proof automatically gets a different hash → a different cache
+       key → a fresh verification on first access.
+
+    Thread safety
+    -------------
+    All mutations are protected by a ``threading.Lock``.  Reads that detect
+    expiry also acquire the lock to remove the stale entry.
+
+    Parameters
+    ----------
+    ttl_seconds:
+        Seconds before a *successful* verification result expires.
+        Default 300 s.
+    failure_ttl_seconds:
+        Seconds before a *failed* verification result expires.
+        Default 30 s (short, to re-check transient failures quickly).
+    max_size:
+        Maximum number of entries.  When reached, the oldest entry is evicted
+        before inserting a new one.  Default 10 000.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = 300.0,
+        failure_ttl_seconds: float = 30.0,
+        max_size: int = 10_000,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self.failure_ttl_seconds = failure_ttl_seconds
+        self.max_size = max_size
+        self._store: dict[str, _CacheEntry] = {}
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def proof_hash(proof: BenfordZKProof) -> str:
+        """Return the SHA-256 hex of the canonical serialisation of *proof*.
+
+        This is the cache key.  Two structurally identical proofs always
+        produce the same key; a single changed field (e.g., a tampered
+        ``claimed_mad``) produces a completely different key.
+        """
+        raw = json.dumps(proof.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def get(self, proof: BenfordZKProof) -> bool | None:
+        """Return the cached verification result, or ``None`` on a cache miss.
+
+        A ``None`` return means the entry is absent or expired — the caller
+        *must* perform fresh verification and call :meth:`put`.
+
+        This method **never** returns a result that has exceeded its TTL.
+        """
+        key = self.proof_hash(proof)
+        now = time.monotonic()
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if now >= entry.expires_at:
+                # Evict expired entry; caller must re-verify
+                del self._store[key]
+                return None
+            return entry.result
+
+    def put(self, proof: BenfordZKProof, result: bool) -> None:
+        """Store a verification *result* for *proof*.
+
+        Successful verifications (``result=True``) are cached for
+        ``ttl_seconds``; failures for ``failure_ttl_seconds``.
+
+        If the cache is full, the oldest entry is evicted first.
+        """
+        key = self.proof_hash(proof)
+        ttl = self.ttl_seconds if result else self.failure_ttl_seconds
+        expires_at = time.monotonic() + ttl
+        with self._lock:
+            if key not in self._store and len(self._store) >= self.max_size:
+                # Evict the entry with the smallest (oldest) expiry
+                oldest_key = min(self._store, key=lambda k: self._store[k].expires_at)
+                del self._store[oldest_key]
+            self._store[key] = _CacheEntry(result=result, expires_at=expires_at)
+
+    def invalidate(self, proof_hash: str) -> bool:
+        """Explicitly remove the entry for *proof_hash*.
+
+        Returns ``True`` if an entry was removed, ``False`` if not present.
+        """
+        with self._lock:
+            return self._store.pop(proof_hash, None) is not None
+
+    def clear(self) -> int:
+        """Flush all cache entries.  Returns the number of entries removed."""
+        with self._lock:
+            count = len(self._store)
+            self._store.clear()
+            return count
+
+    def verify_cached(self, proof: BenfordZKProof, prover: BenfordZKProver | None = None) -> bool:
+        """Verify *proof*, using the cache to skip re-verification if possible.
+
+        Parameters
+        ----------
+        proof:
+            The ``BenfordZKProof`` to verify.
+        prover:
+            ``BenfordZKProver`` instance to use when a cache miss occurs.
+            Defaults to a freshly constructed ``BenfordZKProver()``.
+
+        Returns
+        -------
+        bool
+            ``True`` if the proof is valid; ``False`` otherwise.
+        """
+        cached = self.get(proof)
+        if cached is not None:
+            return cached
+        if prover is None:
+            prover = BenfordZKProver()
+        result = prover.verify(proof)
+        self.put(proof, result)
+        return result
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+
+# ---------------------------------------------------------------------------
+# Issue #952 — Proof-verification benchmarking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProofVerificationBenchmarkResult:
+    """Results of a :func:`benchmark_proof_verification` run."""
+
+    n_verifications: int
+    total_seconds: float
+    throughput_per_second: float
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    cache_hit_rate: float  # fraction of verifications served from cache (0.0–1.0)
+    mode: str  # "no_cache" or "with_cache"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "n_verifications": self.n_verifications,
+            "total_seconds": round(self.total_seconds, 4),
+            "throughput_per_second": round(self.throughput_per_second, 2),
+            "p50_ms": round(self.p50_ms, 3),
+            "p95_ms": round(self.p95_ms, 3),
+            "p99_ms": round(self.p99_ms, 3),
+            "cache_hit_rate": round(self.cache_hit_rate, 4),
+            "mode": self.mode,
+        }
+
+
+def benchmark_proof_verification(
+    n_verifications: int = 1000,
+    n_unique_proofs: int = 50,
+    amounts_per_proof: int = 100,
+    use_cache: bool = True,
+    rng_seed: int = 42,
+) -> ProofVerificationBenchmarkResult:
+    """Benchmark ZK proof verification at representative production volume.
+
+    Generates ``n_unique_proofs`` distinct BenfordZKProofs (from synthetic
+    trade-amount arrays), then repeatedly verifies them in a round-robin
+    pattern to reach ``n_verifications`` total calls.  This simulates
+    real-world traffic where a hot set of proofs is re-submitted frequently.
+
+    Metrics reported:
+
+    * **p50/p95/p99 latency (ms)** — per-call wall-clock time distribution.
+    * **throughput (verifications/sec)** — total calls / total elapsed seconds.
+    * **cache_hit_rate** — fraction of calls that were served from cache
+      (0.0 when ``use_cache=False``).
+
+    Parameters
+    ----------
+    n_verifications:
+        Total number of verification calls to measure (default 1000).
+    n_unique_proofs:
+        Number of distinct proofs to generate before the loop (default 50).
+    amounts_per_proof:
+        Trade amounts per proof (default 100; matches typical wallet window).
+    use_cache:
+        Whether to use :class:`ProofVerificationCache` (default True).
+    rng_seed:
+        NumPy RNG seed for reproducibility (default 42).
+
+    Returns
+    -------
+    ProofVerificationBenchmarkResult
+    """
+    rng = np.random.default_rng(rng_seed)
+    prover = BenfordZKProver()
+    cache = ProofVerificationCache() if use_cache else None
+
+    # Pre-generate distinct proofs (excluded from timing)
+    proofs: list[BenfordZKProof] = []
+    for _ in range(n_unique_proofs):
+        amounts = (rng.lognormal(mean=2.0, sigma=1.2, size=amounts_per_proof) * 100).tolist()
+        proofs.append(prover.prove(amounts))
+
+    latencies_ms: list[float] = []
+    cache_hits = 0
+
+    t_start = time.perf_counter()
+    for i in range(n_verifications):
+        proof = proofs[i % n_unique_proofs]
+        t0 = time.perf_counter()
+        if cache is not None:
+            cached = cache.get(proof)
+            if cached is not None:
+                cache_hits += 1
+                result = cached  # noqa: F841  — measured path
+            else:
+                result = prover.verify(proof)
+                cache.put(proof, result)
+        else:
+            result = prover.verify(proof)  # noqa: F841
+        t1 = time.perf_counter()
+        latencies_ms.append((t1 - t0) * 1000.0)
+    t_end = time.perf_counter()
+
+    total_seconds = t_end - t_start
+    arr = np.array(latencies_ms)
+    return ProofVerificationBenchmarkResult(
+        n_verifications=n_verifications,
+        total_seconds=total_seconds,
+        throughput_per_second=n_verifications / total_seconds if total_seconds > 0 else 0.0,
+        p50_ms=float(np.percentile(arr, 50)),
+        p95_ms=float(np.percentile(arr, 95)),
+        p99_ms=float(np.percentile(arr, 99)),
+        cache_hit_rate=cache_hits / n_verifications if n_verifications > 0 else 0.0,
+        mode="with_cache" if use_cache else "no_cache",
+    )

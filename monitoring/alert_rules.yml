@@ -241,3 +241,58 @@ groups:
             regression gate, or trust-chain failure) in the last 15 minutes. Check the
             promotion_audit_log table for the actor and reason.
           runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/model_rollback_runbook.md#authorization-failures"
+
+  # ---------------------------------------------------------------------------
+  # Per-stage latency SLO burn (Issue #921)
+  #
+  # Each stage has its own latency budget (monitoring/latency_budget.py,
+  # docs/latency_slos.md); budgets sum to the 10s p99 end-to-end detection
+  # target. Burn rate is computed per stage against that stage's own budget,
+  # so a slow stage alerts on its own series without blaming its neighbours.
+  # Multi-window (1h / 5m) burn-rate alerting per the Google SRE workbook.
+  # In-process alerts from LatencyBudgetTracker are routed via alerts/router.py
+  # (rule: latency-slo-burn-oncall).
+  # ---------------------------------------------------------------------------
+  - name: ledgerlens_stage_latency_slo
+    rules:
+      - record: ledgerlens:stage_latency_slo_burn_rate:1h
+        expr: |
+          sum by (stage) (rate(ledgerlens_stage_latency_budget_breaches_total[1h]))
+            / clamp_min(sum by (stage) (rate(ledgerlens_stage_latency_seconds_count[1h])), 1e-9)
+            / 0.01
+      - record: ledgerlens:stage_latency_slo_burn_rate:5m
+        expr: |
+          sum by (stage) (rate(ledgerlens_stage_latency_budget_breaches_total[5m]))
+            / clamp_min(sum by (stage) (rate(ledgerlens_stage_latency_seconds_count[5m])), 1e-9)
+            / 0.01
+
+      - alert: StageLatencySLOBurnCritical
+        expr: |
+          ledgerlens:stage_latency_slo_burn_rate:1h > 14.4
+            and ledgerlens:stage_latency_slo_burn_rate:5m > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          slo: "detection_latency"
+        annotations:
+          summary: "Stage {{ $labels.stage }} is burning its latency SLO budget fast"
+          description: >
+            Stage {{ $labels.stage }} is exceeding its latency budget at
+            {{ $value | printf "%.1f" }}x the sustainable rate, threatening the 10s
+            end-to-end detection latency SLO.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/latency_slos.md#responding-to-an-slo-burn-alert"
+
+      - alert: StageLatencySLOBurnWarning
+        expr: |
+          ledgerlens:stage_latency_slo_burn_rate:1h > 2
+            and ledgerlens:stage_latency_slo_burn_rate:5m > 2
+        for: 15m
+        labels:
+          severity: warning
+          slo: "detection_latency"
+        annotations:
+          summary: "Stage {{ $labels.stage }} latency SLO burn rate elevated"
+          description: >
+            Stage {{ $labels.stage }} is consuming its latency error budget at
+            {{ $value | printf "%.1f" }}x the sustainable rate.
+          runbook_url: "https://github.com/Ledger-Lenz/Ledgerlens-data/docs/latency_slos.md#responding-to-an-slo-burn-alert"

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import networkx as nx
 
@@ -188,6 +189,11 @@ class StreamingScorer:
         feature_cache: FeatureCache | None = None,
     ) -> None:
         self._risk_scorer = RiskScorer(model_dir=model_dir)
+        # Double-buffered hot reload (Issue #897): the active scorer is a single
+        # reference replaced atomically; the previous one is kept for rollback.
+        self._previous_scorer: RiskScorer | None = None
+        self._swap_lock = threading.Lock()
+        self.last_swap_latency_ms: float | None = None
         self.min_trades: int = config.MIN_TRADES_FOR_SCORING
         self._gnn_encoder = gnn_encoder
         self._funding_graph: nx.DiGraph = (
@@ -196,6 +202,59 @@ class StreamingScorer:
         self._feature_cache: FeatureCache = (
             feature_cache if feature_cache is not None else FeatureCache()
         )
+
+    # ------------------------------------------------------------------
+    # Model hot reload (Issue #897)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _version_of(scorer: RiskScorer) -> str:
+        meta = getattr(scorer, "metadata", None)
+        return meta.get("model_version", "unknown") if meta else "unknown"
+
+    @property
+    def model_version(self) -> str:
+        return self._version_of(self._risk_scorer)
+
+    def swap_model(self, model_dir: str | None = None, scorer: RiskScorer | None = None) -> float:
+        """Load a new model and atomically make it active.
+
+        The new :class:`RiskScorer` is fully constructed *before* the swap, so
+        scoring never pauses. In-flight :meth:`score_wallet` calls hold their
+        own reference to the scorer they started with and finish on that
+        version — no request ever mixes versions. Returns swap latency in ms
+        (promotion request → new model active).
+        """
+        t0 = time.perf_counter()
+        new_scorer = scorer if scorer is not None else RiskScorer(model_dir=model_dir)
+        with self._swap_lock:
+            self._previous_scorer = self._risk_scorer
+            self._risk_scorer = new_scorer  # single reference assignment: atomic
+        self.last_swap_latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "Model hot-swapped",
+            extra={
+                "model_version": self._version_of(new_scorer),
+                "previous_version": self._version_of(self._previous_scorer),
+                "swap_latency_ms": self.last_swap_latency_ms,
+            },
+        )
+        return self.last_swap_latency_ms
+
+    def swap_model_async(self, model_dir: str | None = None) -> threading.Thread:
+        """Run :meth:`swap_model` on a background thread (load off the hot path)."""
+        t = threading.Thread(target=self.swap_model, args=(model_dir,), daemon=True)
+        t.start()
+        return t
+
+    def rollback_model(self) -> bool:
+        """Swap back to the previously active model. Returns False if none."""
+        with self._swap_lock:
+            if self._previous_scorer is None:
+                return False
+            self._risk_scorer, self._previous_scorer = self._previous_scorer, self._risk_scorer
+        logger.warning("Model rolled back", extra={"model_version": self.model_version})
+        return True
 
     # ------------------------------------------------------------------
     # Incremental GNN update
@@ -251,7 +310,9 @@ class StreamingScorer:
         Returns a risk-score dict ``{score, benford_flag, ml_flag, confidence}``
         or ``None`` if the wallet has fewer than ``min_trades`` buffered trades.
         """
-        override_val = self._risk_scorer.list_override.check(wallet)
+        # Pin one model version for the whole request (hot-swap safety).
+        scorer = self._risk_scorer
+        override_val = scorer.list_override.check(wallet)
         if override_val in (0, 100):
             return {
                 "score": override_val,
@@ -271,21 +332,19 @@ class StreamingScorer:
             self._feature_cache.put(wallet, feature_row)
 
         try:
-            import time
-
             t0 = time.time()
 
             # Use score_with_uncertainty when calibration artifacts are available;
             # fall back to score() otherwise.
-            if self._risk_scorer.calibrators:
-                res = self._risk_scorer.score_with_uncertainty(feature_row)
+            if scorer.calibrators:
+                res = scorer.score_with_uncertainty(feature_row)
             else:
-                res = self._risk_scorer.score(feature_row)
+                res = scorer.score(feature_row)
 
             latency_ms = (time.time() - t0) * 1000
             model_version = (
-                self._risk_scorer.metadata.get("model_version", "unknown")
-                if self._risk_scorer.metadata
+                scorer.metadata.get("model_version", "unknown")
+                if scorer.metadata
                 else "unknown"
             )
 

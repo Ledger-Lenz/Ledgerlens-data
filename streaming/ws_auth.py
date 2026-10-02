@@ -3,9 +3,18 @@
 Validates bearer tokens using RS256 (asymmetric). Public key is loaded from
 config.JWT_PUBLIC_KEY_PATH. Validates claims: exp (expiry), iss (issuer),
 sub (subject/client_id), and scope (must contain "scores:read").
+
+Token refresh (issue #894): long-lived connections may send an in-band
+``{"type": "refresh_token", "token": "<jwt>"}`` message before their current
+token expires. Close codes used by the server:
+
+- ``4001 token_expired``          — no valid refresh arrived before expiry.
+- ``4003 token_refresh_rejected`` — refresh token invalid, for a different
+  subject, or sent after the current token already expired.
 """
 
 import os
+import time
 from typing import Any, cast
 
 from jose import JWTError, jwt
@@ -15,6 +24,10 @@ from config import config
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+CLOSE_TOKEN_EXPIRED = 4001
+CLOSE_TOKEN_REFRESH_REJECTED = 4003
 
 
 class JWTAuthenticator:
@@ -92,6 +105,35 @@ class JWTAuthenticator:
         except Exception as exc:
             logger.error("Unexpected error during JWT verification: %s", str(exc))
             return None
+
+    def verify_refresh(
+        self, token: str, current_sub: str, current_exp: float, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Validate an in-band refresh token for an existing session.
+
+        The refresh is accepted only if the session's current token has not yet
+        expired, the new token verifies, and its ``sub`` matches the session.
+
+        Returns:
+            New claims dict, or None if the refresh must be rejected.
+        """
+        now = time.time() if now is None else now
+        if now >= current_exp:
+            logger.warning("JWT refresh rejected: session token already expired (%s)", current_sub)
+            return None
+        claims = self.verify(token)
+        if claims is None:
+            return None
+        if claims.get("sub") != current_sub:
+            logger.warning("JWT refresh rejected: subject mismatch (session=%s)", current_sub)
+            return None
+        return claims
+
+    @staticmethod
+    def token_expiry(claims: dict[str, Any]) -> float:
+        """Return the token's ``exp`` claim as a UNIX timestamp (inf if absent)."""
+        exp = claims.get("exp")
+        return float(exp) if exp is not None else float("inf")
 
     def extract_permissions(self, claims: dict[str, Any]) -> set[str]:
         """Extract allowed channel prefixes from scope claim.

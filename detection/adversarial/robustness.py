@@ -18,6 +18,8 @@ All gradients flow through `RiskScorer.score_continuous` (see
 `detection.adversarial.attack`).
 """
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 
@@ -29,6 +31,9 @@ from detection.adversarial.attack import (
 )
 from detection.model_contracts import FEATURE_COLUMNS_EXCLUDE
 from utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from mlops.experiment_tracking import JsonlExperimentTracker
 
 logger = get_logger(__name__)
 
@@ -359,6 +364,11 @@ def run_adversarial_training(
     test_size: float = 0.2,
     random_state: int = 42,
     model_dir: str | None = None,
+    curriculum: str | None = None,
+    curriculum_start_epsilon: float | None = None,
+    early_stopping_patience: int | None = None,
+    early_stopping_min_delta: float = 0.001,
+    experiment_tracker: "JsonlExperimentTracker | None" = None,
 ) -> dict:
     """Train the ensemble with FGSM adversarial augmentation for ``epochs`` epochs.
 
@@ -372,6 +382,30 @@ def run_adversarial_training(
     Benchmarks clean accuracy (AUC-ROC on unperturbed test set) and
     adversarial accuracy (AUC-ROC on FGSM-perturbed test set) after the
     final epoch.
+
+    Issue #872 additions (all opt-in; the defaults reproduce the exact
+    pre-#872 behavior):
+
+    - ``curriculum``: ``None`` (default) uses a fixed ``epsilon`` every
+      epoch, same as before. ``"linear"``/``"step"`` ramp the *training*
+      perturbation budget from ``curriculum_start_epsilon`` (default
+      ``epsilon / 4``) up to ``epsilon`` via `CurriculumScheduler` — see
+      that class for the two strategies. The *adversarial validation set*
+      used to measure ``adversarial_auc`` is always perturbed at the final
+      target ``epsilon``, so per-epoch robust-accuracy numbers stay
+      comparable across the whole run regardless of curriculum stage.
+    - ``early_stopping_patience``: ``None``/``0`` (default) disables early
+      stopping — every requested epoch runs, exactly as before. When set,
+      training stops once ``adversarial_auc`` (robust validation accuracy,
+      *not* clean accuracy — the issue's explicit requirement) fails to
+      improve by more than ``early_stopping_min_delta`` for that many
+      consecutive epochs. ``report["epochs_run"]`` reflects the actual
+      number of epochs executed; ``report["epochs"]`` stays the originally
+      requested value.
+    - ``experiment_tracker``: ``None`` (default) skips experiment logging
+      entirely (no file writes). When given a
+      ``mlops.experiment_tracking.JsonlExperimentTracker``, both
+      ``clean_auc`` and ``adversarial_auc`` are logged as one run per epoch.
 
     Returns a report dict that is JSON-serialisable and is logged at INFO
     level by ``detection.model_training.main`` when
@@ -389,8 +423,25 @@ def run_adversarial_training(
     from sklearn.metrics import roc_auc_score
     from sklearn.model_selection import train_test_split
 
+    # Lazy import: `detection.adversarial.augmentation` imports
+    # `feature_scale_from_matrix` from *this* module at its own module
+    # level, so importing it back here at module level would be circular.
+    from detection.adversarial.augmentation import CurriculumScheduler
     from detection.model_inference import RiskScorer
-    from detection.model_training import save_models, split_features_labels, train_models
+    from detection.model_training import (
+        compute_feature_schema_hash,
+        save_models,
+        sha256_dataframe,
+        split_features_labels,
+        train_models,
+    )
+
+    scheduler = None
+    if curriculum is not None:
+        start = curriculum_start_epsilon if curriculum_start_epsilon is not None else epsilon / 4
+        scheduler = CurriculumScheduler(
+            start=start, end=epsilon, epochs=epochs, strategy=curriculum
+        )
 
     train_df, test_df = train_test_split(
         df, test_size=test_size, random_state=random_state, stratify=df["label"]
@@ -398,10 +449,22 @@ def run_adversarial_training(
     X_test, y_test = split_features_labels(test_df)
     feature_scale = feature_scale_from_matrix(df.drop(columns=["label"], errors="ignore"))
 
+    dataset_sha256 = sha256_dataframe(df) if experiment_tracker is not None else ""
+    feature_schema_hash = (
+        compute_feature_schema_hash(list(X_test.columns)) if experiment_tracker is not None else ""
+    )
+
     current_train = train_df.copy()
     epoch_log = []
+    epsilon_schedule = []
+    best_adv_auc = float("-inf")
+    epochs_since_improvement = 0
+    early_stopped = False
 
     for epoch in range(epochs):
+        train_epsilon = scheduler.epsilon_for_epoch(epoch) if scheduler is not None else epsilon
+        epsilon_schedule.append(train_epsilon)
+
         results = train_models(
             current_train,
             test_size=0.0 if len(current_train) < 5 else 0.1,
@@ -425,7 +488,9 @@ def run_adversarial_training(
         except Exception:
             clean_auc = float("nan")
 
-        # Adversarial accuracy: FGSM-perturb the test set
+        # Adversarial (robust) validation accuracy: always measured at the
+        # final target `epsilon`, not `train_epsilon`, so this number is
+        # comparable across every epoch of a curriculum run.
         X_test_adv = X_test.copy()
         for idx in X_test_adv.index:
             row = X_test_adv.loc[idx]
@@ -440,14 +505,68 @@ def run_adversarial_training(
         except Exception:
             adv_auc = float("nan")
 
-        epoch_log.append({"epoch": epoch, "clean_auc": clean_auc, "adversarial_auc": adv_auc})
+        epoch_log.append(
+            {
+                "epoch": epoch,
+                "train_epsilon": train_epsilon,
+                "clean_auc": clean_auc,
+                "adversarial_auc": adv_auc,
+            }
+        )
         logger.info(
-            "Adversarial training epoch %d/%d — clean_auc=%.4f  adversarial_auc=%.4f",
+            "Adversarial training epoch %d/%d (train_epsilon=%.4f) — "
+            "clean_auc=%.4f  adversarial_auc=%.4f",
             epoch + 1,
             epochs,
+            train_epsilon,
             clean_auc,
             adv_auc,
         )
+
+        if experiment_tracker is not None:
+            from mlops.experiment_tracking import ExperimentRun
+
+            run = ExperimentRun(
+                name="adversarial_training_epoch",
+                params={
+                    "epoch": epoch,
+                    "train_epsilon": train_epsilon,
+                    "target_epsilon": epsilon,
+                    "adv_ratio": adv_ratio,
+                    "curriculum": curriculum,
+                },
+                feature_schema_hash=feature_schema_hash,
+                dataset_sha256=dataset_sha256,
+            )
+            experiment_tracker.log_run(
+                run, metrics={"clean_auc": clean_auc, "adversarial_auc": adv_auc}
+            )
+
+        # Early stopping on *robust* (adversarial) validation accuracy, per
+        # the issue's explicit requirement — clean accuracy is tracked but
+        # never gates stopping.
+        if not np.isnan(adv_auc):
+            if adv_auc > best_adv_auc + early_stopping_min_delta:
+                best_adv_auc = adv_auc
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+
+        if (
+            early_stopping_patience
+            and epochs_since_improvement >= early_stopping_patience
+            and epoch < epochs - 1
+        ):
+            logger.info(
+                "Adversarial training early-stopped after epoch %d/%d — "
+                "no robust-accuracy improvement > %.4f for %d epoch(s)",
+                epoch + 1,
+                epochs,
+                early_stopping_min_delta,
+                early_stopping_patience,
+            )
+            early_stopped = True
+            break
 
         # Augment training set for the next epoch (not needed after last epoch)
         if epoch < epochs - 1:
@@ -456,7 +575,7 @@ def run_adversarial_training(
                 X_train,
                 y_train,
                 scorer,
-                epsilon=epsilon,
+                epsilon=train_epsilon,
                 adv_ratio=adv_ratio,
                 feature_scale=feature_scale,
                 random_state=random_state + epoch,
@@ -473,7 +592,7 @@ def run_adversarial_training(
                 aug_df["wallet"] = aug_wallets
             current_train = aug_df
 
-    # Final metrics from last epoch
+    # Final metrics from last epoch actually run
     first_clean = epoch_log[0]["clean_auc"] if epoch_log else float("nan")
     last_clean = epoch_log[-1]["clean_auc"] if epoch_log else float("nan")
     first_adv = epoch_log[0]["adversarial_auc"] if epoch_log else float("nan")
@@ -484,6 +603,10 @@ def run_adversarial_training(
 
     report = {
         "epochs": epochs,
+        "epochs_run": len(epoch_log),
+        "early_stopped": early_stopped,
+        "curriculum": curriculum,
+        "epsilon_schedule": epsilon_schedule,
         "epsilon": epsilon,
         "adv_ratio": adv_ratio,
         "epoch_log": epoch_log,
@@ -496,8 +619,12 @@ def run_adversarial_training(
         "clean_degradation_within_tolerance": bool(clean_degradation <= 0.03),
     }
     logger.info(
-        "Adversarial training complete — clean_auc: %.4f→%.4f (Δ=%.4f, within_3pt_tol=%s) "
+        "Adversarial training complete (epochs_run=%d/%d, early_stopped=%s) — "
+        "clean_auc: %.4f→%.4f (Δ=%.4f, within_3pt_tol=%s) "
         "adversarial_auc: %.4f→%.4f (Δ=%.4f)",
+        len(epoch_log),
+        epochs,
+        early_stopped,
         first_clean,
         last_clean,
         clean_degradation,

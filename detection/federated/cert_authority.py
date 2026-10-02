@@ -33,6 +33,10 @@ logger = get_logger(__name__)
 
 _DB_URL = os.getenv("RISK_SCORE_DB_URL", "sqlite:///ledgerlens.db")
 
+# Default certificate lifetime (days) used for issuance and rotation.  Override
+# per-call via ``validity_days`` or globally via the env var below.
+DEFAULT_CERT_LIFETIME_DAYS = int(os.getenv("FEDERATED_CERT_LIFETIME_DAYS", "365"))
+
 # ---------------------------------------------------------------------------
 # ORM
 # ---------------------------------------------------------------------------
@@ -54,10 +58,55 @@ class ParticipantCertRecord(_Base):
     cert_pem: str = Column(String, nullable=False)
 
 
+class CertAuditLog(_Base):
+    """Append-only audit trail of certificate lifecycle events.
+
+    Records who/what/when for every issuance, rotation, and revocation so the
+    federation can be audited without relying on transient log files.
+    """
+
+    __tablename__ = "federated_cert_audit_log"
+
+    id: int = Column(String, primary_key=True)  # uuid4 hex
+    event: str = Column(String, nullable=False)  # issued|rotated|revoked
+    cn: str = Column(String, nullable=False)
+    actor: str = Column(String, nullable=False)
+    allowed_models: str | None = Column(String, nullable=True)
+    expires_at: datetime.datetime | None = Column(DateTime, nullable=True)
+    occurred_at: datetime.datetime = Column(DateTime, nullable=False)
+    detail: str | None = Column(String, nullable=True)
+
+
 def _get_session_factory(db_url: str = _DB_URL):
     engine = create_engine(db_url)
     _Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
+
+
+def _record_audit(
+    session,
+    event: str,
+    cn: str,
+    actor: str,
+    allowed_models: str | None = None,
+    expires_at: datetime.datetime | None = None,
+    detail: str | None = None,
+) -> None:
+    """Append a certificate lifecycle event to the audit log."""
+    import uuid
+
+    session.add(
+        CertAuditLog(
+            id=uuid.uuid4().hex,
+            event=event,
+            cn=cn,
+            actor=actor,
+            allowed_models=allowed_models,
+            expires_at=expires_at,
+            occurred_at=datetime.datetime.now(datetime.UTC),
+            detail=detail,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +161,9 @@ def issue_certificate(
     allowed_models: Sequence[str],
     ca_key: ec.EllipticCurvePrivateKey,
     ca_cert: x509.Certificate,
-    validity_days: int = 365,
+    validity_days: int | None = None,
     db_url: str = _DB_URL,
+    actor: str = "ca",
 ) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
     """Issue a new participant certificate signed by the CA.
 
@@ -122,9 +172,13 @@ def issue_certificate(
     coordinator NEVER stores or sees it after this call returns.
 
     The allowed model IDs are encoded in the OU field for retrieval during auth.
+    ``validity_days`` defaults to ``DEFAULT_CERT_LIFETIME_DAYS`` (configurable
+    via the ``FEDERATED_CERT_LIFETIME_DAYS`` env var).
 
     Returns (participant_private_key, participant_cert).
     """
+    if validity_days is None:
+        validity_days = DEFAULT_CERT_LIFETIME_DAYS
     part_key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.datetime.now(datetime.UTC)
     expires_at = now + datetime.timedelta(days=validity_days)
@@ -168,6 +222,14 @@ def issue_certificate(
                 cert_pem=cert_pem,
             )
         )
+        _record_audit(
+            session,
+            event="issued",
+            cn=cn,
+            actor=actor,
+            allowed_models=models_str,
+            expires_at=expires_at,
+        )
         session.commit()
 
     logger.info(
@@ -176,11 +238,12 @@ def issue_certificate(
     return part_key, cert
 
 
-def revoke_certificate(cn: str, db_url: str = _DB_URL) -> None:
+def revoke_certificate(cn: str, db_url: str = _DB_URL, actor: str = "ca") -> None:
     """Mark a participant certificate as revoked in the DB.
 
     The coordinator reloads the revocation list every ≤60 s, so revocation
-    takes effect within 60 seconds.
+    takes effect within 60 seconds.  The revocation is recorded in the audit
+    log with the acting principal and timestamp.
     """
     SessionFactory = _get_session_factory(db_url)
     with SessionFactory() as session:
@@ -189,6 +252,14 @@ def revoke_certificate(cn: str, db_url: str = _DB_URL) -> None:
             raise KeyError(f"No certificate found for CN={cn!r}")
         record.revoked = True
         record.revoked_at = datetime.datetime.now(datetime.UTC)
+        _record_audit(
+            session,
+            event="revoked",
+            cn=cn,
+            actor=actor,
+            allowed_models=record.allowed_models,
+            expires_at=record.expires_at,
+        )
         session.commit()
     logger.info("Revoked certificate for CN=%r", cn)
 
@@ -198,18 +269,79 @@ def rotate_certificate(
     allowed_models: Sequence[str],
     ca_key: ec.EllipticCurvePrivateKey,
     ca_cert: x509.Certificate,
-    validity_days: int = 365,
+    validity_days: int | None = None,
     db_url: str = _DB_URL,
+    actor: str = "ca",
 ) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
     """Revoke the existing certificate for *cn* and issue a fresh one.
 
+    Rotation is atomic from the coordinator's perspective: the old record is
+    revoked and the new one issued in a single transaction, so an in-progress
+    federated round for unaffected participants is not disrupted.
+
     Returns (new_private_key, new_cert).
     """
-    try:
-        revoke_certificate(cn, db_url)
-    except KeyError:
-        pass  # first issuance — nothing to revoke
-    return issue_certificate(cn, allowed_models, ca_key, ca_cert, validity_days, db_url)
+    if validity_days is None:
+        validity_days = DEFAULT_CERT_LIFETIME_DAYS
+    SessionFactory = _get_session_factory(db_url)
+    with SessionFactory() as session:
+        existing = session.get(ParticipantCertRecord, cn)
+        if existing is not None:
+            existing.revoked = True
+            existing.revoked_at = datetime.datetime.now(datetime.UTC)
+            _record_audit(
+                session,
+                event="revoked",
+                cn=cn,
+                actor=actor,
+                allowed_models=existing.allowed_models,
+                expires_at=existing.expires_at,
+                detail="superseded by rotation",
+            )
+        session.commit()
+
+    part_key, cert = issue_certificate(
+        cn, allowed_models, ca_key, ca_cert, validity_days, db_url, actor=actor
+    )
+    SessionFactory = _get_session_factory(db_url)
+    with SessionFactory() as session:
+        _record_audit(
+            session,
+            event="rotated",
+            cn=cn,
+            actor=actor,
+            allowed_models=",".join(allowed_models),
+            expires_at=cert.not_valid_after_utc,
+        )
+        session.commit()
+    return part_key, cert
+
+
+def is_revoked(cn: str, db_url: str = _DB_URL) -> bool:
+    """Return True if the participant's certificate is revoked or unknown.
+
+    The coordinator calls this before accepting a participant's contribution;
+    unknown CNs are treated as revoked (fail-closed).
+    """
+    SessionFactory = _get_session_factory(db_url)
+    with SessionFactory() as session:
+        record = session.get(ParticipantCertRecord, cn)
+        if record is None:
+            return True
+        return bool(record.revoked)
+
+
+def is_expired(cn: str, db_url: str = _DB_URL) -> bool:
+    """Return True if the participant's certificate has expired."""
+    SessionFactory = _get_session_factory(db_url)
+    with SessionFactory() as session:
+        record = session.get(ParticipantCertRecord, cn)
+        if record is None:
+            return True
+        expires_at = record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=datetime.UTC)
+        return expires_at <= datetime.datetime.now(datetime.UTC)
 
 
 def list_expiring_soon(within_days: int = 30, db_url: str = _DB_URL) -> list[ParticipantCertRecord]:
@@ -217,84 +349,8 @@ def list_expiring_soon(within_days: int = 30, db_url: str = _DB_URL) -> list[Par
     threshold = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=within_days)
     SessionFactory = _get_session_factory(db_url)
     with SessionFactory() as session:
-        return (
-            session.query(ParticipantCertRecord)
-            .filter(
-                ParticipantCertRecord.expires_at <= threshold,
-                ParticipantCertRecord.revoked == False,  # noqa: E712
-            )
-            .all()
-        )
-
-
-def list_all_participants(db_url: str = _DB_URL) -> list[ParticipantCertRecord]:
-    SessionFactory = _get_session_factory(db_url)
-    with SessionFactory() as session:
-        return session.query(ParticipantCertRecord).all()
-
-
-# ---------------------------------------------------------------------------
-# RevocationCache
-# ---------------------------------------------------------------------------
-
-
-class RevocationCache:
-    """In-memory revocation list, refreshed from the DB every *refresh_interval_seconds*.
-
-    The coordinator instantiates one cache and calls ``is_revoked()`` on every
-    request.  The background refresh ensures revocation takes effect ≤60 s after
-    ``revoke_certificate()`` is called.
-    """
-
-    def __init__(
-        self,
-        refresh_interval_seconds: int = 30,
-        db_url: str = _DB_URL,
-    ) -> None:
-        self._db_url = db_url
-        self._refresh_interval = refresh_interval_seconds
-        self._revoked_cns: set[str] = set()
-        self._lock = threading.RLock()
-        self._refresh()
-
-    def is_revoked(self, cn: str) -> bool:
-        with self._lock:
-            return cn in self._revoked_cns
-
-    def get_allowed_models(self, cn: str, db_url: str | None = None) -> list[str] | None:
-        """Return the allowed model list for *cn*, or None if unknown."""
-        url = db_url or self._db_url
-        SessionFactory = _get_session_factory(url)
-        with SessionFactory() as session:
-            record = session.get(ParticipantCertRecord, cn)
-            if record is None or record.revoked:
-                return None
-            return [m.strip() for m in record.allowed_models.split(",") if m.strip()]
-
-    def refresh(self) -> None:
-        """Force an immediate reload from the DB."""
-        self._refresh()
-
-    def _refresh(self) -> None:
-        try:
-            SessionFactory = _get_session_factory(self._db_url)
-            with SessionFactory() as session:
-                revoked = {
-                    r.cn
-                    for r in session.query(ParticipantCertRecord)
-                    .filter(ParticipantCertRecord.revoked == True)  # noqa: E712
-                    .all()
-                }
-            with self._lock:
-                self._revoked_cns = revoked
-        except Exception as exc:
-            logger.warning("RevocationCache refresh failed: %s", exc)
-        finally:
-            import threading as _threading
-
-            t = _threading.Timer(self._refresh_interval, self._refresh)
-            t.daemon = True
-            t.start()
-
-
-import threading  # noqa: E402 — used by RevocationCache above
+        records = session.query(ParticipantCertRecord).filter(
+            ParticipantCertRecord.revoked.is_(False),
+            ParticipantCertRecord.expires_at <= threshold,
+        ).all()
+        return list(records)

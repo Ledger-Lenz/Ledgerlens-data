@@ -1,0 +1,50 @@
+name: Adversarial Robustness Regression
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  robustness:
+    name: Cross-venue and cross-chain robustness baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore prior robustness history
+        uses: actions/download-artifact@v4
+        with:
+          name: adversarial-robustness-history
+          path: reports/robustness
+        continue-on-error: true
+
+      - name: Seed history from tracked baseline when no artifact exists
+        run: |
+          mkdir -p reports/robustness
+          if [ ! -s reports/robustness/history.jsonl ]; then
+            cp ci_metrics/robustness_history.jsonl reports/robustness/history.jsonl
+          fi
+
+      - name: Run adversarial robustness regression gate
+        run: >-
+          python -m scripts.ci_adversarial_robustness
+          --store-path reports/robustness/history.jsonl
+          --fail-on-critical
+
+      - name: Upload robustness history
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adversarial-robustness-history
+          path: reports/robustness/history.jsonl
+          retention-days: 90

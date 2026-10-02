@@ -385,6 +385,20 @@ def compute_benford_metrics(
     )
 
 
+# Planned for Issue #855 (adaptive change-point windows):
+# `compute_benford_metrics_for_windows` keeps its signature and its return
+# shape, `{hours: {...}}` with int keys, unchanged. Existing consumers iterate
+# those keys as ints, so no string "adaptive" key is added here. Instead:
+#   - New sibling `compute_benford_metrics_adaptive(df, *, amount_col,
+#     time_col, reference_time=None, asset=None) -> AdaptiveBenfordResult`,
+#     which calls benford_window_optimizer.select_adaptive_window() and then
+#     `compute_benford_metrics` on the selected segment only.
+#     AdaptiveBenfordResult = {"window_hours", "method", "segment_start",
+#     "boundaries", **the same metric keys as one entry above}.
+#   - Callers opt in only when config.BENFORD_ADAPTIVE_SEGMENTATION is true.
+#     With the flag off, this module's behaviour is byte-for-byte unchanged.
+#     A regression test pins that by comparing outputs before and after on a
+#     fixed seed.
 def compute_benford_metrics_for_windows(
     df: pd.DataFrame,
     amount_col: str = "amount",

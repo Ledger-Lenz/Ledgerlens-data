@@ -5,6 +5,13 @@ Resolution Strategy
 If a wallet appears in both the allowlist and denylist (a conflict), the
 allowlist takes precedence and the wallet is treated as allowed (score 0).
 This prioritizes operator intent to explicitly allow over deny decisions.
+
+Audit Logging
+-------------
+Administrative list mutations (add/remove on the allowlist or denylist) emit
+structured, append-only audit events via ``audit_trail`` so that every override
+is reconstructable (actor, action, before/after state, timestamp) and
+hash-chained for tamper-evidence.
 """
 
 from __future__ import annotations
@@ -15,6 +22,11 @@ import time
 
 from config import config
 from utils.logging import get_logger
+
+try:
+    from audit_trail import record_audit_event
+except Exception:  # pragma: no cover - audit trail is optional at import time
+    record_audit_event = None
 
 logger = get_logger(__name__)
 
@@ -75,6 +87,45 @@ class ListOverride:
             self._denylist = set()
 
         self._last_loaded = time.time()
+
+    def _audit(self, action: str, wallet: str, before: bool, after: bool) -> None:
+        """Emit a structured audit event for an administrative list mutation."""
+        if record_audit_event is None:
+            return
+        try:
+            record_audit_event(
+                actor=os.environ.get("AUDIT_ACTOR", "system"),
+                action=action,
+                target=wallet,
+                before={"listed": before},
+                after={"listed": after},
+            )
+        except Exception as e:  # pragma: no cover - never break overrides on audit failure
+            logger.warning("Failed to record audit event for %s: %s", action, e)
+
+    def add_to_allowlist(self, wallet: str) -> None:
+        """Administratively add a wallet to the allowlist (audited)."""
+        before = wallet in self._allowlist
+        self._allowlist.add(wallet)
+        self._audit("allowlist.add", wallet, before, True)
+
+    def remove_from_allowlist(self, wallet: str) -> None:
+        """Administratively remove a wallet from the allowlist (audited)."""
+        before = wallet in self._allowlist
+        self._allowlist.discard(wallet)
+        self._audit("allowlist.remove", wallet, before, False)
+
+    def add_to_denylist(self, wallet: str) -> None:
+        """Administratively add a wallet to the denylist (audited)."""
+        before = wallet in self._denylist
+        self._denylist.add(wallet)
+        self._audit("denylist.add", wallet, before, True)
+
+    def remove_from_denylist(self, wallet: str) -> None:
+        """Administratively remove a wallet from the denylist (audited)."""
+        before = wallet in self._denylist
+        self._denylist.discard(wallet)
+        self._audit("denylist.remove", wallet, before, False)
 
     def check(self, wallet: str) -> int | None:
         """Returns 0 (allowlist), 100 (denylist), or None (not listed)."""

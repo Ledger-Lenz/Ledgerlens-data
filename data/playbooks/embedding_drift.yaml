@@ -1,0 +1,45 @@
+# Runbook: contrastive-encoder embedding drift (#891).
+#
+# Triggered by monitoring.drift_detector.EmbeddingDriftMonitor via
+# alerts/router.py (alert detectors: [embedding_drift]).
+# Dashboard panels: ledgerlens_embedding_centroid_shift,
+#                   ledgerlens_embedding_covariance_drift
+
+name: embedding_drift
+version: "1.0"
+description: >
+  Response procedure when the rolling distribution of detection/contrastive/encoder.py
+  embeddings drifts from the reference window. Drift silently degrades every
+  downstream detector consuming the embeddings.
+
+severity_triggers:
+  centroid_shift_threshold: 0.25     # in reference std-devs
+  covariance_drift_threshold: 0.30   # relative Frobenius norm
+  alert_types:
+    - embedding_drift
+
+steps:
+  - id: investigate
+    action: investigate_upstream
+    description: >
+      First rule out data problems: schema/feature-pipeline changes, ingestion
+      gaps, a new venue or asset pair, or a bad encoder deploy. If found, fix the
+      data and do NOT retrain.
+  - id: check_downstream
+    action: compare_downstream_metrics
+    description: >
+      Run evaluation/backtest.py on the latest labelled window. If downstream
+      precision/recall is within tolerance, acknowledge and raise the reference
+      window (re-baseline) — drift is benign.
+  - id: fine_tune
+    action: fine_tune_heads
+    when: "covariance_drift > threshold and centroid_shift <= 2 * threshold"
+    description: >
+      Moderate drift with degraded downstream metrics: re-run
+      detection/contrastive/finetune.py on recent labels, keep the encoder frozen.
+  - id: re_pretrain
+    action: re_pretrain_encoder
+    when: "centroid_shift > 2 * threshold or fine-tune did not recover metrics"
+    description: >
+      Severe/regime-level drift: re-run detection/contrastive/pretrain.py on a
+      recent unlabelled window, then fine-tune and re-baseline the monitor.

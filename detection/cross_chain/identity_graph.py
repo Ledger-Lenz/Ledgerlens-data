@@ -6,6 +6,7 @@ between them (from bridges, behavioral matching, shared deposits, etc.).
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from sqlalchemy import Float, Integer, String, UniqueConstraint, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
+from detection.cross_chain.graph_partition import PartitionedResolver
 from detection.persistence import Base, get_session_factory
 
 logger = logging.getLogger(__name__)
@@ -59,8 +61,36 @@ def normalize_address(address: str) -> str:
 class IdentityGraph:
     """Graph manager for cross-chain identity links in SQLite."""
 
-    def __init__(self, session_factory: sessionmaker[Session] | None = None):
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session] | None = None,
+        include_solana_pdas: bool | None = None,
+    ):
         self._session_factory = session_factory or get_session_factory()
+        # None defers to config.SOLANA_INCLUDE_PDA_EDGES at edge-insert time (#881).
+        self._include_solana_pdas = include_solana_pdas
+
+    def _is_excluded_solana_address(self, address: str, metadata: dict[str, Any] | None) -> bool:
+        """True if ``address`` is a Solana PDA/program account that must not become a
+        user-identity edge (see ``solana_resolver.classify_solana_address``)."""
+        from detection.cross_chain.solana_resolver import (
+            NON_USER_ADDRESS_KINDS,
+            classify_solana_address,
+        )
+
+        include = self._include_solana_pdas
+        if include is None:
+            from config import config
+
+            include = bool(getattr(config, "SOLANA_INCLUDE_PDA_EDGES", False))
+        # Stellar G-addresses are 56 chars, so the 32-44 char Solana range
+        # never collides with them even though Solana keys may start with "G".
+        if include or address.startswith("0x") or not 32 <= len(address) <= 44:
+            return False
+        owner = (metadata or {}).get("owner_program_ids", {}).get(address)
+        return classify_solana_address(address, owner_program_id=owner).kind in (
+            NON_USER_ADDRESS_KINDS
+        )
 
     def add_node(self, address: str, chain: str, risk_score: float = 0.0) -> CrossChainNode:
         """Insert or update a cross-chain wallet node."""
@@ -83,10 +113,20 @@ class IdentityGraph:
         link_type: str,
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
-    ) -> CrossChainEdge:
-        """Insert or update a link between two wallet addresses."""
+    ) -> CrossChainEdge | None:
+        """Insert or update a link between two wallet addresses.
+
+        Returns None (and writes nothing) when either endpoint is a Solana
+        program-derived / program-owned address and PDA edges are disabled.
+        ``metadata["owner_program_ids"]`` may map an address to its on-chain
+        owner program to catch on-curve program-owned accounts.
+        """
         source = normalize_address(source)
         target = normalize_address(target)
+        for addr in (source, target):
+            if self._is_excluded_solana_address(addr, metadata):
+                logger.info("Skipping %s edge: %s is a Solana program address", link_type, addr)
+                return None
         meta_str = json.dumps(metadata) if metadata else None
         # Ensure we always add/fetch nodes first so foreign keys or existence constraints are satisfied
         # Note: we don't have strict foreign key constraints in SQLite schema but good practice to register them
@@ -99,7 +139,7 @@ class IdentityGraph:
                     chain = "stellar"
                     if addr.startswith("0x") and len(addr) == 42:
                         chain = "ethereum"
-                    elif not addr.startswith("G") and len(addr) >= 32 and len(addr) <= 44:
+                    elif 32 <= len(addr) <= 44:
                         chain = "solana"
 
                     new_node = CrossChainNode(address=addr, chain=chain, risk_score=0.0)
@@ -127,67 +167,100 @@ class IdentityGraph:
             return existing
 
     def get_connected_component(self, start_address: str) -> dict[str, list[dict[str, Any]]]:
-        """BFS traversal to find all transitively linked addresses, grouped by chain."""
+        """Find all transitively linked addresses, grouped by chain.
+
+        Each returned node carries ``link_confidence``: the strongest path from
+        ``start_address`` to it, i.e. the maximum over paths of the product of
+        edge confidences (best-first search). A zk/guardian-attested bridge
+        edge therefore propagates more weight than a heuristic one (#884).
+        """
         start_address = normalize_address(start_address)
-        visited = set()
-        queue = [start_address]
-        nodes_info = {}
+        best: dict[str, float] = {start_address: 1.0}
+        heap: list[tuple[float, str]] = [(-1.0, start_address)]
+        done: set[str] = set()
+        nodes_info: dict[str, dict[str, Any]] = {}
 
-        # Get initial node info
         with self._session_factory() as session:
-            start_node = session.get(CrossChainNode, start_address)
-            if not start_node:
+            if session.get(CrossChainNode, start_address) is None:
                 return {"eth": [], "sol": [], "stellar": []}
-            nodes_info[start_address] = {
-                "address": start_node.address,
-                "chain": start_node.chain,
-                "risk_score": start_node.risk_score,
-            }
 
-        while queue:
-            current = queue.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
-
-            with self._session_factory() as session:
+            while heap:
+                neg_conf, current = heapq.heappop(heap)
+                if current in done:
+                    continue
+                done.add(current)
+                node = session.get(CrossChainNode, current)
+                if node is None:
+                    continue
+                nodes_info[current] = {
+                    "address": node.address,
+                    "chain": node.chain,
+                    "risk_score": node.risk_score,
+                    "link_confidence": -neg_conf,
+                }
                 edges = session.scalars(
                     select(CrossChainEdge).where(
                         (CrossChainEdge.source_address == current)
                         | (CrossChainEdge.target_address == current)
                     )
                 ).all()
-
                 for edge in edges:
                     neighbor = (
                         edge.target_address
                         if edge.source_address == current
                         else edge.source_address
                     )
-                    if neighbor not in visited and neighbor not in queue:
-                        neighbor_node = session.get(CrossChainNode, neighbor)
-                        if neighbor_node:
-                            nodes_info[neighbor] = {
-                                "address": neighbor_node.address,
-                                "chain": neighbor_node.chain,
-                                "risk_score": neighbor_node.risk_score,
-                            }
-                            queue.append(neighbor)
+                    conf = -neg_conf * max(0.0, min(1.0, edge.confidence))
+                    if neighbor not in done and conf > best.get(neighbor, -1.0):
+                        best[neighbor] = conf
+                        heapq.heappush(heap, (-conf, neighbor))
 
-        # Group by chain (standardizing keys to 'eth', 'sol', 'stellar')
-        result: dict[str, list[dict[str, Any]]] = {"eth": [], "sol": [], "stellar": []}
-        for addr, info in nodes_info.items():
-            if addr == start_address:
-                continue
-            chain_key = info["chain"].lower()
-            if chain_key in ("ethereum", "eth", "evm"):
-                result["eth"].append(info)
-            elif chain_key in ("solana", "sol"):
-                result["sol"].append(info)
-            elif chain_key in ("stellar",):
-                result["stellar"].append(info)
-            else:
-                result[chain_key] = result.get(chain_key, [])
-                result[chain_key].append(info)
+        return _group_by_chain(nodes_info, exclude=start_address)
 
-        return result
+    def load_edges(self) -> list[tuple[str, str, float]]:
+        """Return every edge as ``(source, target, confidence)`` in one query."""
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(
+                    CrossChainEdge.source_address,
+                    CrossChainEdge.target_address,
+                    CrossChainEdge.confidence,
+                )
+            ).all()
+        return [(r[0], r[1], float(r[2])) for r in rows]
+
+    def load_nodes(self) -> dict[str, dict[str, Any]]:
+        """Return every node as ``{address: {"address", "chain", "risk_score"}}``."""
+        with self._session_factory() as session:
+            rows = session.execute(
+                select(CrossChainNode.address, CrossChainNode.chain, CrossChainNode.risk_score)
+            ).all()
+        return {r[0]: {"address": r[0], "chain": r[1], "risk_score": float(r[2])} for r in rows}
+
+    def build_partitioned_resolver(
+        self, num_shards: int = 16, strategy: str = "anchor"
+    ) -> PartitionedResolver:
+        """Load all edges once into a :class:`PartitionedResolver` (#883)."""
+        resolver = PartitionedResolver(num_shards=num_shards, strategy=strategy)
+        resolver.add_edges((u, v) for u, v, _ in self.load_edges())
+        return resolver
+
+
+def _group_by_chain(
+    nodes_info: dict[str, dict[str, Any]], exclude: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Group node dicts under standardized 'eth' / 'sol' / 'stellar' keys."""
+    result: dict[str, list[dict[str, Any]]] = {"eth": [], "sol": [], "stellar": []}
+    for addr, info in nodes_info.items():
+        if addr == exclude:
+            continue
+        chain_key = info["chain"].lower()
+        if chain_key in ("ethereum", "eth", "evm"):
+            result["eth"].append(info)
+        elif chain_key in ("solana", "sol"):
+            result["sol"].append(info)
+        elif chain_key in ("stellar",):
+            result["stellar"].append(info)
+        else:
+            result.setdefault(chain_key, []).append(info)
+    return result

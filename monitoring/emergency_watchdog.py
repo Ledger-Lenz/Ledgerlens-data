@@ -11,11 +11,38 @@ Two human keyholders must independently call ``approve_emergency_pause`` for
 the pause to take effect, preventing the automated system from being used as a
 DoS vector by a compromised pipeline.
 
+Self-test / canary
+------------------
+A silently-dead watchdog is worse than no watchdog because it creates false
+confidence.  To detect that, the watchdog emits a periodic *heartbeat* to an
+external, independently-monitored dead-man's-switch endpoint (outside the
+primary monitoring stack, so a failure of that stack cannot mask a dead
+watchdog).  If the heartbeat is missed, the external service fires an alert.
+
+Configure via the ``heartbeat_url`` constructor argument (or the
+``WATCHDOG_HEARTBEAT_URL`` environment variable).  The heartbeat is emitted
+from :meth:`check` on a fixed interval (``heartbeat_interval_seconds``,
+default 30 s) and is best-effort: a failed heartbeat is logged but never
+raises, so it cannot take down the watchdog itself.
+
+Escalation runbook for a missed watchdog heartbeat
+--------------------------------------------------
+1. External dead-man's-switch fires (heartbeat missed for > 2 intervals).
+2. On-call acknowledges within 5 minutes and checks whether the watchdog
+   process is running (``systemctl status ledgerlens-emergency-watchdog``).
+3. If the process is down, restart it and inspect logs for the crash cause.
+4. If the process is up but not heartbeating, treat the watchdog as blind:
+   manually review the score distribution and, if anomalous, initiate the
+   emergency pause by hand.
+5. Escalate to the security lead if the watchdog cannot be restored within
+   15 minutes; the pause proposal path must not be left unmonitored.
+
 Usage::
 
     watchdog = EmergencyWatchdog(
         pause_contract_id="C...",
         signing_key="S...",   # one emergency keyholder secret
+        heartbeat_url="https://deadman.example.com/heartbeat/ledgerlens-watchdog",
     )
     watchdog.record_score(wallet_hash, score)   # call from scoring loop
     watchdog.check()                             # call periodically (e.g. every 5 s)
@@ -23,7 +50,9 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import time
+import urllib.request
 from collections import deque
 from collections.abc import Callable
 
@@ -34,6 +63,11 @@ logger = get_logger(__name__)
 _WINDOW_SECONDS = 60
 ANOMALY_SCORE_THRESHOLD = 95
 ANOMALY_RATE_THRESHOLD = 0.90
+
+# Default interval between external heartbeat emissions, in seconds.
+HEARTBEAT_INTERVAL_SECONDS = 30
+# Environment variable used to configure the external dead-man's-switch URL.
+HEARTBEAT_URL_ENV = "WATCHDOG_HEARTBEAT_URL"
 
 
 class EmergencyWatchdog:
@@ -60,6 +94,13 @@ class EmergencyWatchdog:
         Pause is proposed when the anomalous fraction exceeds this rate.
     latency_budget_ms:
         End-to-end latency threshold in milliseconds. If the rate of events exceeding this budget surpasses `anomaly_rate_threshold`, a pause is proposed.
+    heartbeat_url:
+        External, independently-monitored dead-man's-switch endpoint.  When
+        set (or when ``WATCHDOG_HEARTBEAT_URL`` is present in the
+        environment), the watchdog emits a periodic heartbeat so a missed
+        heartbeat can be alerted on externally.
+    heartbeat_interval_seconds:
+        Fixed interval between heartbeat emissions (default 30 s).
     """
 
     def __init__(
@@ -72,6 +113,8 @@ class EmergencyWatchdog:
         anomaly_score_threshold: int = ANOMALY_SCORE_THRESHOLD,
         anomaly_rate_threshold: float = ANOMALY_RATE_THRESHOLD,
         latency_budget_ms: int = 2000,
+        heartbeat_url: str | None = None,
+        heartbeat_interval_seconds: int = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.pause_contract_id = pause_contract_id
         self._signing_key = signing_key
@@ -84,6 +127,10 @@ class EmergencyWatchdog:
         # Deque of (timestamp, score, e2e_latency_ms) tuples
         self._window: deque[tuple[float, int, float | None]] = deque()
         self._pause_proposed = False
+        # Self-test / canary state
+        self._heartbeat_url = heartbeat_url or os.environ.get(HEARTBEAT_URL_ENV) or None
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._last_heartbeat = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -98,8 +145,13 @@ class EmergencyWatchdog:
     def check(self) -> bool:
         """Evaluate the rolling window and propose a pause if anomalous.
 
+        Also emits the external heartbeat on its fixed interval so a dead
+        watchdog is detected by the dead-man's-switch.
+
         Returns True if a pause was proposed during this call.
         """
+        self._maybe_heartbeat()
+
         if self._pause_proposed:
             return False
 
@@ -160,6 +212,30 @@ class EmergencyWatchdog:
         cutoff = time.monotonic() - self._window_seconds
         while self._window and self._window[0][0] < cutoff:
             self._window.popleft()
+
+    def _maybe_heartbeat(self) -> None:
+        """Emit the external heartbeat if the fixed interval has elapsed.
+
+        Best-effort: failures are logged and swallowed so the canary can
+        never crash the watchdog it is meant to protect.
+        """
+        if not self._heartbeat_url:
+            return
+        now = time.monotonic()
+        if now - self._last_heartbeat < self._heartbeat_interval_seconds:
+            return
+        self._last_heartbeat = now
+        try:
+            req = urllib.request.Request(
+                self._heartbeat_url,
+                data=b"watchdog-alive",
+                method="POST",
+                headers={"Content-Type": "text/plain"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except Exception:
+            logger.exception("EmergencyWatchdog: failed to emit external heartbeat")
 
     def _propose_pause(self, reason: str) -> None:
         try:

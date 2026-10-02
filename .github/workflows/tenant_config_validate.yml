@@ -1,0 +1,84 @@
+name: Tenant Config Validation
+
+# Issue #954 — CI workflow that validates tenants.yaml on PRs that modify it.
+# Runs Pydantic schema validation and (when a snapshot exists) drift detection.
+
+on:
+  pull_request:
+    paths:
+      - "config/tenants.yaml"
+      - "config/tenants_schema.py"
+      - "config/tenant_config.py"
+  push:
+    branches:
+      - main
+    paths:
+      - "config/tenants.yaml"
+      - "config/tenants_schema.py"
+  workflow_dispatch:
+
+jobs:
+  validate-tenant-config:
+    name: Validate tenants.yaml schema
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate tenants.yaml against Pydantic schema
+        run: |
+          python - <<'EOF'
+          from config.tenants_schema import validate_tenants_yaml
+
+          print("Validating config/tenants.yaml...")
+          schema = validate_tenants_yaml("config/tenants.yaml")
+          tenant_ids = sorted(schema.tenants.keys())
+          print(f"  Validated {len(tenant_ids)} tenant(s): {tenant_ids}")
+          print("Schema validation: PASSED")
+          EOF
+
+      - name: Check for drift against deployed snapshot (if snapshot exists)
+        run: |
+          python - <<'EOF'
+          import os
+          from config.tenant_config import load_tenants_config, TenantConfigDriftDetector
+
+          snapshot_path = "config/tenants.yaml.deployed"
+          if not os.path.exists(snapshot_path):
+              print(f"No deployed snapshot found at {snapshot_path!r}.")
+              print("Skipping drift detection (first deployment or snapshot not committed).")
+              print("Run TenantConfigDriftDetector().save_snapshot() after deploying to establish baseline.")
+          else:
+              print(f"Comparing config/tenants.yaml against deployed snapshot {snapshot_path!r}...")
+              load_tenants_config("config/tenants.yaml")
+              detector = TenantConfigDriftDetector(snapshot_path=snapshot_path)
+              diffs = detector.detect_drift()
+              if diffs:
+                  print(f"DRIFT DETECTED ({len(diffs)} change(s)):")
+                  for d in diffs:
+                      print(f"  {d}")
+                  print()
+                  print("If this change is intentional, update the snapshot after merging:")
+                  print("  python -c \"from config.tenant_config import *; load_tenants_config(); TenantConfigDriftDetector().save_snapshot()\"")
+                  print("  git add config/tenants.yaml.deployed && git commit -m 'chore: update tenant config snapshot'")
+                  exit(1)
+              else:
+                  print("Drift detection: PASSED (no unexpected changes)")
+          EOF
+
+      - name: Run tenant config tests
+        run: |
+          python -m pytest tests/test_tenant_config.py -v \
+            --tb=short \
+            --timeout=60 \
+            -m "not integration and not slow"

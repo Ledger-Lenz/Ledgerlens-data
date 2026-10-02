@@ -28,6 +28,14 @@ _ENCODER_HIDDEN = 64
 _DECODER_HIDDEN = 64
 _LATENT_DIM = 32
 
+# Minimum recommended context size for reliable predictions (Issue #867)
+# Below this threshold, predictions should be treated as highly uncertain
+NP_MIN_RELIABLE_CONTEXT = 10
+
+# Temperature scaling parameter for uncertainty calibration (Issue #867)
+# Set via calibrate_temperature() after training
+_DEFAULT_TEMPERATURE = 1.0
+
 
 # ---------------------------------------------------------------------------
 # Pure-numpy MLP helpers (no PyTorch dependency at import time)
@@ -79,6 +87,9 @@ class NeuralProcess:
         decoder_in = _LATENT_DIM + feature_dim
         self._dec1 = _LinearLayer(decoder_in, _DECODER_HIDDEN, rng)
         self._dec2 = _LinearLayer(_DECODER_HIDDEN, 1, rng)
+
+        # Temperature scaling for uncertainty calibration (Issue #867)
+        self.temperature = _DEFAULT_TEMPERATURE
 
     # ------------------------------------------------------------------
     # Encoder
@@ -142,7 +153,9 @@ class NeuralProcess:
         x = np.concatenate([rep, query_features.astype(np.float32)], axis=1)
         h = self._dec1.forward(x, activate=True)
         logits = self._dec2.forward(h, activate=False)[:, 0]
-        return _sigmoid(logits)
+        # Apply temperature scaling for calibrated uncertainty (Issue #867)
+        calibrated_logits = logits / self.temperature
+        return _sigmoid(calibrated_logits)
 
     # ------------------------------------------------------------------
     # High-level inference
@@ -181,6 +194,97 @@ class NeuralProcess:
         """Return a single risk score in ``[0, 100]`` for one query trade."""
         probs = self.predict(context_features, context_labels, query_feature_row[None])
         return float(probs[0]) * 100.0
+
+    def predict_with_uncertainty(
+        self,
+        context_features: np.ndarray,
+        context_labels: Sequence[float],
+        query_features: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return predictions with calibrated uncertainty estimates.
+
+        Parameters
+        ----------
+        context_features:
+            Shape ``(n_context, feature_dim)``.
+        context_labels:
+            Binary labels for context trades.
+        query_features:
+            Shape ``(n_queries, feature_dim)``.
+
+        Returns
+        -------
+        predictions: np.ndarray of shape ``(n_queries,)`` — wash-trade probabilities
+        uncertainties: np.ndarray of shape ``(n_queries,)`` — uncertainty scores in [0, 1]
+        """
+        probs = self.predict(context_features, context_labels, query_features)
+        
+        # Uncertainty increases when context size is small
+        n_context = len(context_features)
+        context_penalty = max(0.0, 1.0 - n_context / NP_MIN_RELIABLE_CONTEXT)
+        
+        # Epistemic uncertainty: predictions near 0.5 are more uncertain
+        prediction_uncertainty = 1.0 - 2.0 * np.abs(probs - 0.5)
+        
+        # Combined uncertainty
+        uncertainties = np.clip(prediction_uncertainty + context_penalty, 0.0, 1.0)
+        
+        return probs, uncertainties
+
+    def calibrate_temperature(
+        self,
+        val_context_features: list[np.ndarray],
+        val_context_labels: list[Sequence[float]],
+        val_query_features: list[np.ndarray],
+        val_query_labels: list[Sequence[float]],
+    ) -> float:
+        """Calibrate temperature scaling parameter using validation data.
+
+        Parameters
+        ----------
+        val_context_features:
+            List of context feature arrays for each validation episode.
+        val_context_labels:
+            List of context label sequences for each validation episode.
+        val_query_features:
+            List of query feature arrays for each validation episode.
+        val_query_labels:
+            List of query label sequences for each validation episode.
+
+        Returns
+        -------
+        float
+            Optimal temperature parameter (stored in self.temperature).
+        """
+        from scipy.optimize import minimize_scalar
+
+        def negative_log_likelihood(temp: float) -> float:
+            """Compute negative log-likelihood with given temperature."""
+            if temp <= 0:
+                return 1e10
+            
+            old_temp = self.temperature
+            self.temperature = temp
+            
+            nll = 0.0
+            for ctx_feat, ctx_lab, qry_feat, qry_lab in zip(
+                val_context_features,
+                val_context_labels,
+                val_query_features,
+                val_query_labels,
+                strict=False,
+            ):
+                probs = self.predict(ctx_feat, ctx_lab, qry_feat)
+                probs = np.clip(probs, 1e-9, 1 - 1e-9)
+                for prob, label in zip(probs, qry_lab, strict=False):
+                    nll -= label * np.log(prob) + (1 - label) * np.log(1 - prob)
+            
+            self.temperature = old_temp
+            return nll
+
+        result = minimize_scalar(negative_log_likelihood, bounds=(0.1, 10.0), method="bounded")
+        self.temperature = float(result.x)
+        return self.temperature
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import config
 from streaming.cursor_store import BaseCursorStore, get_cursor_store
@@ -78,6 +78,61 @@ _INTERESTING_EFFECT_TYPES = frozenset(
     }
 )
 
+# Fields this consumer knows about (Horizon effect record + our own envelope).
+# Anything else is an *additive* upstream schema change: tolerated and ignored,
+# but surfaced via a WARNING log + metric so operators notice the drift
+# (Issue #903, see data/schema_evolution.md).
+KNOWN_EFFECT_FIELDS = frozenset(
+    {
+        "id", "paging_token", "account", "account_muxed", "account_muxed_id", "type",
+        "type_i", "created_at", "_links", "funder", "starting_balance", "home_domain",
+        "asset_type", "asset_code", "asset_issuer", "limit", "trustor", "authorize_flag",
+        "weight", "public_key", "key", "signer", "name", "value", "inflation_destination",
+        "low_threshold", "med_threshold", "high_threshold", "auth_required_flag",
+        "auth_revocable_flag", "auth_immutable_flag", "auth_clawback_enabled_flag",
+        "sponsor", "former_sponsor", "new_sponsor", "liquidity_pool_id",
+        # Envelope names used when events round-trip through Kafka.
+        "account_id", "effect_type", "effect_id", "funding_account", "raw",
+    }
+)  # fmt: skip
+
+_unknown_fields_seen: set[str] = set()
+_unknown_fields_lock = threading.Lock()
+
+try:  # pragma: no cover - metrics optional
+    from prometheus_client import Counter
+
+    _UNKNOWN_FIELD_TOTAL = Counter(
+        "ledgerlens_account_metadata_unknown_fields_total",
+        "Account metadata events carrying fields unknown to this consumer",
+        ["field"],
+    )
+except ImportError:  # pragma: no cover
+    _UNKNOWN_FIELD_TOTAL = None
+
+
+def _alert_unknown_fields(record: dict) -> set[str]:
+    """Alert (never fail) on fields not in ``KNOWN_EFFECT_FIELDS``.
+
+    Logs a WARNING the first time each unknown field is seen per process and
+    increments a per-field Prometheus counter on every occurrence.
+    """
+    unknown = set(record) - KNOWN_EFFECT_FIELDS
+    for field in unknown:
+        if _UNKNOWN_FIELD_TOTAL is not None:
+            _UNKNOWN_FIELD_TOTAL.labels(field=field).inc()
+        with _unknown_fields_lock:
+            first = field not in _unknown_fields_seen
+            _unknown_fields_seen.add(field)
+        if first:
+            logger.warning(
+                "Account metadata event has unknown field %r — ignoring it "
+                "(possible upstream additive schema change; see data/schema_evolution.md)",
+                field,
+            )
+    return unknown
+
+
 # Stellar account ID format: G + 55 base-32 characters (uppercase A-Z and 2-7).
 _STELLAR_ACCOUNT_RE = re.compile(r"^G[A-Z2-7]{55}$")
 
@@ -95,7 +150,13 @@ class AccountMetadataUpdate(BaseModel):
 
     Only ``account_id`` and ``effect_type`` are required; all others are
     optional because different effect types carry different payloads.
+
+    ``extra="ignore"`` makes deserialization tolerant of additive upstream
+    schema changes: unknown fields are dropped (and preserved in ``raw``)
+    rather than failing validation (Issue #903).
     """
+
+    model_config = ConfigDict(extra="ignore")
 
     account_id: str = Field(description="The Stellar account ID (G…) affected by the effect")
     effect_type: str = Field(description="Horizon effect type string, e.g. 'trustline_created'")
@@ -142,6 +203,10 @@ def validate_metadata_event(record: dict) -> AccountMetadataUpdate | None:
     Returns ``None`` and logs a warning if validation fails so that callers
     can safely discard malformed events without raising exceptions.
     """
+    try:
+        _alert_unknown_fields(record)
+    except Exception:  # alerting must never interrupt stream processing
+        logger.debug("unknown-field alert failed", exc_info=True)
     try:
         # Horizon uses "account" as the field name for the affected wallet.
         account_id = record.get("account") or record.get("account_id", "")

@@ -8,6 +8,25 @@ tenants:
       - stdout
     asset_pair_whitelist:
       - USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+    # Per-tenant rate limit overrides (issue #922).
+    # These are enforced by the tenant-scoped limiter in api/app.py, in
+    # addition to any global rate limit. Omit this block to inherit the
+    # global defaults (rate_limit_defaults below).
+    rate_limit:
+      # Sustained request rate allowed for this tenant, in requests/second.
+      rate_per_second: 50
+      # Maximum burst size (token bucket capacity).
+      burst: 100
+    # Per-tenant request-cost quota/budget (issue #925).
+    # Expensive endpoints (forensic report generation, backtests) carry a
+    # per-request cost estimate; accumulated cost is enforced against this
+    # budget by the accounting layer in api/app.py. Omit this block to
+    # inherit the global defaults (quota_defaults below).
+    quota:
+      # Total cost units a tenant may consume per rolling window.
+      budget: 1000
+      # Length of the rolling accounting window, in seconds.
+      window_seconds: 3600
   exchange_b:
     risk_threshold: 75
     threshold_strategy: statistical
@@ -19,3 +38,43 @@ tenants:
       - webhook
     asset_pair_whitelist:
       - USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN
+    # Per-tenant rate limit overrides (issue #922).
+    rate_limit:
+      rate_per_second: 25
+      burst: 50
+    # Per-tenant request-cost quota/budget (issue #925).
+    quota:
+      budget: 500
+      window_seconds: 3600
+
+# Default per-tenant rate limits applied when a tenant does not define its
+# own `rate_limit` block. The tenant-scoped limiter in api/app.py keys its
+# token buckets on the authenticated tenant identity, so each tenant gets
+# an isolated bucket and one tenant's traffic cannot consume another's
+# capacity. See api/app.py for the enforcement and metrics wiring.
+rate_limit_defaults:
+  rate_per_second: 20
+  burst: 40
+
+# Default per-tenant request-cost quota applied when a tenant does not define
+# its own `quota` block (issue #925). The accounting layer in api/app.py keys
+# accumulated cost on the authenticated tenant identity, so one tenant
+# exhausting its budget cannot affect another tenant's requests. When the
+# budget is exceeded the API returns a 429 with retry-after guidance derived
+# from `window_seconds` rather than queuing indefinitely.
+quota_defaults:
+  budget: 500
+  window_seconds: 3600
+
+# Per-request cost estimates for expensive endpoints (issue #925).
+# Cost is expressed in abstract units; the accounting layer in api/app.py
+# charges the matching endpoint cost against the caller's tenant quota.
+# Methodology: cost approximates relative downstream compute (report
+# generation and backtests dominate), so a tenant's budget bounds the
+# expensive work it can trigger per window. Cheap read endpoints are not
+# listed and are treated as zero-cost.
+endpoint_costs:
+  # Forensic report generation (reporting/export_service.py).
+  forensic_report: 50
+  # Backtest execution.
+  backtest: 25

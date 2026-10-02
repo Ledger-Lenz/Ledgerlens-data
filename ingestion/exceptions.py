@@ -186,6 +186,12 @@ class SchemaValidationError(RecordValidationError):
     error_code = "ingestion_schema_invalid"
 
 
+class SchemaCompatibilityError(SchemaValidationError):
+    """A schema change violates the configured registry compatibility mode."""
+
+    error_code = "ingestion_schema_incompatible"
+
+
 class SourceUnavailableError(IngestionError):
     """An upstream data source was unavailable or exhausted its retry budget."""
 

@@ -125,3 +125,97 @@ class TokenBucketLimiter:
             if deadline is not None and time.monotonic() >= deadline:
                 return False
             time.sleep(self._poll_interval)
+
+
+_REMAINING_HEADERS = ("x-ratelimit-remaining", "ratelimit-remaining")
+_RESET_HEADERS = ("x-ratelimit-reset", "ratelimit-reset")
+
+
+def _header_float(headers: dict, names: tuple[str, ...]) -> float | None:
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+    for name in names:
+        if name in lowered:
+            try:
+                return float(lowered[name])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+class AdaptiveRateLimiter:
+    """Per-source pacing driven by upstream rate-limit headers.
+
+    Each source has a static ``max_rps`` ceiling. When a response carries
+    ``X-RateLimit-Remaining`` / ``X-RateLimit-Reset`` (or the IETF
+    ``RateLimit-*`` equivalents), the effective rate becomes
+    ``remaining / seconds_until_reset``, clamped to ``(0, max_rps]`` so a
+    generous header can never push pacing above the configured safety cap.
+    A 429/503 with ``Retry-After`` pauses the source until that deadline.
+    Sources that never send headers keep pacing at the static ``max_rps``.
+
+    ``Reset`` values larger than ``epoch_threshold`` are treated as Unix
+    timestamps, smaller ones as delta-seconds.
+    """
+
+    def __init__(
+        self,
+        max_rps: dict[str, float] | None = None,
+        default_max_rps: float | None = None,
+        clock=time.time,
+        sleep=time.sleep,
+        epoch_threshold: float = 1e9,
+    ):
+        self._ceilings = dict(max_rps or {})
+        self._default = float(
+            default_max_rps if default_max_rps is not None else config.HORIZON_MAX_RPS
+        )
+        self._clock = clock
+        self._sleep = sleep
+        self._epoch_threshold = epoch_threshold
+        self._rates: dict[str, float] = {}
+        self._next_allowed: dict[str, float] = {}
+
+    def ceiling(self, source: str) -> float:
+        return float(self._ceilings.get(source, self._default))
+
+    def effective_rate(self, source: str) -> float:
+        return self._rates.get(source, self.ceiling(source))
+
+    def update_from_response(self, source: str, status_code: int, headers: dict) -> float:
+        """Adjust ``source`` pacing from a response; returns the new effective rate."""
+        now = self._clock()
+        ceiling = self.ceiling(source)
+        retry_after = _header_float(headers, ("retry-after",))
+        if status_code in (429, 503) and retry_after is not None:
+            self._next_allowed[source] = max(self._next_allowed.get(source, 0.0), now + retry_after)
+
+        remaining = _header_float(headers, _REMAINING_HEADERS)
+        reset = _header_float(headers, _RESET_HEADERS)
+        if remaining is None:
+            return self.effective_rate(source)  # header-less source: static fallback
+        window = 1.0
+        if reset is not None:
+            window = reset - now if reset > self._epoch_threshold else reset
+            window = max(window, 1e-3)
+        if remaining <= 0:
+            self._next_allowed[source] = max(self._next_allowed.get(source, 0.0), now + window)
+            rate = ceiling
+        else:
+            rate = min(remaining / window, ceiling)
+        self._rates[source] = rate
+        return rate
+
+    def delay_for(self, source: str) -> float:
+        """Seconds to wait before the next request to ``source`` may be sent."""
+        return max(0.0, self._next_allowed.get(source, 0.0) - self._clock())
+
+    def acquire(self, source: str) -> float:
+        """Blocks until ``source`` may be called; returns the seconds slept."""
+        delay = self.delay_for(source)
+        if delay > 0:
+            self._sleep(delay)
+        now = self._clock()
+        self._next_allowed[source] = max(now, self._next_allowed.get(source, 0.0)) + (
+            1.0 / self.effective_rate(source)
+        )
+        return delay

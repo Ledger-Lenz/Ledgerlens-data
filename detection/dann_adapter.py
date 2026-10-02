@@ -60,6 +60,81 @@ def _load_and_tag(synthetic_path: str, real_path: str) -> pd.DataFrame:
     return pd.concat([syn, real], ignore_index=True)
 
 
+# ---------------------------------------------------------------------------
+# Gradient-reversal schedule tuning (Issue #858) — implementation plan
+# ---------------------------------------------------------------------------
+#
+# Current state: this adapter already anneals lambda with
+#     lambda = lambda_max * (2 / (1 + exp(-gamma * p)) - 1)
+# (below), but gamma is hard-coded to 10 and p advances only once per
+# *epoch*. The truly static lambda is in dann_encoder.py: `_dann_loss`
+# always passes `domain_lambda=1.0`, so `train_dann_encoder` (used by the DP
+# training path) gets full-strength reversal from step 0.
+#
+# Planned design:
+#
+# 1. One shared schedule in dann_encoder.py, so both training paths use
+#    the same code:
+#
+#       @dataclass(frozen=True, slots=True)
+#       class GRLSchedule:
+#           kind: Literal["static", "annealed"] = "annealed"
+#           gamma: float = 10.0        # Ganin et al. (2016) default
+#           lambda_max: float = 1.0
+#           def __call__(self, progress: float) -> float  # progress p in [0, 1]
+#
+#    - "static" returns lambda_max (keeps today's dann_encoder behaviour
+#      reproducible for the A/B comparison).
+#    - "annealed" returns the formula above. `progress` is computed per
+#      optimiser *step* (step / total_steps), as in the paper, rather than
+#      per epoch, which smooths the early ramp on small datasets.
+#    - Validation: gamma > 0, lambda_max >= 0, otherwise ValueError.
+#    `_lambda_schedule` below becomes a thin wrapper around
+#    GRLSchedule(gamma=10.0) so existing callers and tests are unchanged.
+#
+# 2. `_dann_loss` becomes `make_dann_loss(schedule, total_steps)`, a closure
+#    that tracks its own step counter, because
+#    detection.privacy.dp_training.train_with_dp / train_without_dp call
+#    `loss_fn(model, batch)` with no epoch information. This avoids changing
+#    the DP training loop signatures (and so the Opacus accounting).
+#
+# 3. Per-epoch diagnostics hook, in both train_dann_adapter and
+#    train_dann_encoder:
+#       on_epoch_end: Callable[[DANNEpochMetrics], None] | None = None
+#       DANNEpochMetrics(epoch, lambda_, task_loss, domain_loss,
+#                        task_accuracy, domain_accuracy)
+#    Domain accuracy is computed on the held-out split. A value near 0.5
+#    means the features are domain-invariant; near 1.0 means the adversary
+#    is winning. A warning is logged when task accuracy drops by more than
+#    5 points while domain accuracy is still above 0.9 (a sign of
+#    divergence). The collected per-epoch list is added to
+#    DANNTrainingReport as `history: list[DANNEpochMetrics]` (default empty,
+#    so the dataclass stays backward compatible).
+#
+# 4. Experiment tracking: a default hook writes the curves through
+#    mlops.experiment_tracking.JsonlExperimentTracker (see the plan there);
+#    the params include grl_schedule, grl_gamma and grl_lambda_max.
+#
+# 5. Config / CLI (see the plan in training/train.py):
+#       DANN_GRL_SCHEDULE   "annealed" | "static"   default "annealed"
+#       DANN_GRL_GAMMA      float                   default 10.0
+#       DANN_GRL_LAMBDA_MAX float                   default 1.0
+#    plus `--grl-schedule` / `--grl-gamma` flags on this module's CLI,
+#    next to the existing `--lambda-max`.
+#
+# 6. Tests (tests/test_dann_grl_schedule.py):
+#    - schedule(0) == 0, schedule(1) ~= lambda_max * tanh(gamma / 2),
+#      monotonic in p, and larger gamma ramps faster.
+#    - static schedule is constant; invalid gamma raises.
+#    - `_lambda_schedule` output is unchanged against the current formula
+#      (regression guard).
+#    - the hook is called once per epoch with finite metrics, and
+#      `history` has length == epochs.
+#    - A/B (marked `slow`): on a synthetic domain-shift split (target
+#      domain = source features shifted and rescaled), annealed task AUC on
+#      the held-out target domain >= static AUC - 0.01, averaged over 3
+#      seeds. This is the acceptance criterion's "no regression in task
+#      accuracy".
 def _lambda_schedule(epoch: int, total_epochs: int, lambda_max: float) -> float:
     """Smooth 0→lambda_max schedule following the GRL paper (Ganin et al., 2016)."""
     p = epoch / max(total_epochs - 1, 1)

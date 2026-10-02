@@ -3,10 +3,24 @@
 Converts the numeric scores and feature attributions in a forensic report
 into a short, human-readable paragraph for non-technical compliance
 officers and regulators, via Jinja2 templates.
+
+Hallucination guardrails
+------------------------
+Narratives are rendered from Jinja2 templates that interpolate values
+directly out of the structured ``report_dict`` -- there is no free-form
+generative model in this path, so every factual claim is templated from
+structured evidence by construction. To keep that invariant true as
+future templates change, :func:`build_narrative` runs a post-generation
+validation step (:func:`validate_narrative`) that extracts every factual
+claim (amounts, addresses, timestamps, counts, percentages) from the
+rendered text and cross-checks it against the structured evidence record.
+Any claim not directly supported by the evidence is flagged and the
+narrative is rejected (``NarrativeGroundingError``) rather than emitted.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +38,90 @@ _env = Environment(
     trim_blocks=True,
     lstrip_blocks=True,
 )
+
+
+class NarrativeGroundingError(ValueError):
+    """Raised when a rendered narrative contains an ungrounded factual claim."""
+
+    def __init__(self, ungrounded: list[str]) -> None:
+        self.ungrounded = ungrounded
+        super().__init__(
+            "narrative contains factual claims not supported by the "
+            f"structured evidence: {ungrounded}"
+        )
+
+
+# Factual-claim patterns: numeric amounts, percentages, addresses, and
+# ISO-8601 timestamps. These are the claim types that must be traceable to
+# the structured evidence record.
+_AMOUNT_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?\b")
+_PERCENT_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?\s?%")
+_ADDRESS_RE = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+_TIMESTAMP_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?\b"
+)
+
+
+def _iter_evidence_values(evidence: Any):
+    """Yield every scalar leaf value found in the structured evidence."""
+    if isinstance(evidence, dict):
+        for value in evidence.values():
+            yield from _iter_evidence_values(value)
+    elif isinstance(evidence, (list, tuple, set)):
+        for value in evidence:
+            yield from _iter_evidence_values(value)
+    else:
+        yield evidence
+
+
+def _grounded_tokens(evidence: dict[str, Any]) -> set[str]:
+    """Build the set of normalized string tokens supported by the evidence.
+
+    Each scalar leaf is normalized (lowercased, thousands separators
+    stripped) and added both as a whole token and, for numeric values, in
+    common renderings (int/float forms) so templated values match.
+    """
+    tokens: set[str] = set()
+    for value in _iter_evidence_values(evidence):
+        if value is None or isinstance(value, bool):
+            continue
+        text = str(value).strip().lower()
+        if not text:
+            continue
+        tokens.add(text)
+        tokens.add(text.replace(",", ""))
+        if isinstance(value, (int, float)):
+            tokens.add(str(value))
+            tokens.add(f"{value:g}")
+            tokens.add(f"{value:,.0f}")
+    return tokens
+
+
+def _extract_claims(text: str) -> list[str]:
+    """Extract factual claims (amounts, percentages, addresses, timestamps)."""
+    claims: list[str] = []
+    for pattern in (_TIMESTAMP_RE, _ADDRESS_RE, _PERCENT_RE, _AMOUNT_RE):
+        claims.extend(match.group(0) for match in pattern.finditer(text))
+    return claims
+
+
+def validate_narrative(
+    narrative: str, evidence: dict[str, Any]
+) -> list[str]:
+    """Cross-check every factual claim in ``narrative`` against ``evidence``.
+
+    Returns the list of ungrounded claims (empty when the narrative is
+    fully grounded). A claim is grounded when its normalized form appears
+    among the scalar values of the structured evidence record.
+    """
+    grounded = _grounded_tokens(evidence)
+    ungrounded: list[str] = []
+    for claim in _extract_claims(narrative):
+        normalized = claim.strip().lower().replace(",", "")
+        if normalized in grounded or claim.strip().lower() in grounded:
+            continue
+        ungrounded.append(claim)
+    return ungrounded
 
 
 def _top_features(report: dict[str, Any], markdown: bool, n: int = 3) -> list[dict[str, Any]]:
@@ -87,6 +185,12 @@ def build_narrative(report_dict: dict[str, Any]) -> str:
     regulatory report page constraints; any excess is truncated at a word
     boundary.
 
+    Hallucination guardrail: after rendering, the narrative is validated
+    against `report_dict` via :func:`validate_narrative`. Any factual claim
+    (amount, address, timestamp, count, percentage) not directly supported
+    by the structured evidence raises :class:`NarrativeGroundingError`
+    instead of being emitted.
+
     Args:
         report_dict: forensic report as a dict (e.g.
             `ForensicReport.to_dict()`), optionally including
@@ -95,6 +199,10 @@ def build_narrative(report_dict: dict[str, Any]) -> str:
 
     Returns:
         The rendered narrative, <= 300 words.
+
+    Raises:
+        NarrativeGroundingError: if the narrative contains a factual claim
+            not supported by the structured evidence record.
     """
     fmt = report_dict.get("narrative_format", config.REPORT_NARRATIVE_FORMAT)
     markdown = fmt == "markdown"
@@ -137,4 +245,8 @@ def build_narrative(report_dict: dict[str, Any]) -> str:
     words = text.split()
     if len(words) > _MAX_WORDS:
         text = " ".join(words[:_MAX_WORDS])
+
+    ungrounded = validate_narrative(text, report_dict)
+    if ungrounded:
+        raise NarrativeGroundingError(ungrounded)
     return text

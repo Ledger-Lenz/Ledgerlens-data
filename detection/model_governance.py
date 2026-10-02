@@ -94,6 +94,11 @@ class NoRollbackTargetError(PromotionError):
     """Raised when there is no prior known-good version to roll back to."""
 
 
+class QuarantinedModelError(PromotionError):
+    """Raised when a candidate is blocked because a backdoor scan flagged it
+    (Issue #871) — see `quarantine_candidate` and `_existing_quarantine_reason`."""
+
+
 @dataclass(frozen=True)
 class PromotionDecision:
     approved: bool
@@ -441,18 +446,23 @@ def promote_candidate(
     audit_log: Any = None,
     session_factory: Any = None,
     registry: Any = None,
+    backdoor_report: dict | None = None,
 ) -> ModelVersionRecordLike:
     """The single gated path from a trained candidate directory to production.
 
     Order of operations (any failure raises before touching *model_dir*):
 
     1. ``authorize_actor(actor, credential)``.
-    2. ``evaluate_regression_gate(old_metrics, new_metrics)``.
-    3. ``sign_and_verify_candidate`` — sign + Ed25519 + transparency-log
+    2. Auto-quarantine gate (Issue #871): refuse if *this* call's
+       ``backdoor_report`` recommends quarantine, or if `candidate_dir` was
+       already quarantined by an earlier call to `quarantine_candidate` —
+       see `_existing_quarantine_reason`.
+    3. ``evaluate_regression_gate(old_metrics, new_metrics)``.
+    4. ``sign_and_verify_candidate`` — sign + Ed25519 + transparency-log
        verification, byte-identical to the ``RiskScorer`` load path.
-    4. ``verify_candidate_compatibility``.
+    5. ``verify_candidate_compatibility``.
 
-    Only once all four pass: archive the current production directory, copy
+    Only once all five pass: archive the current production directory, copy
     the candidate's files into ``model_dir``, register+validate+promote the
     candidate in ``ModelArtifactRegistry`` (superseding any prior promoted
     version), and insert a ``ModelVersionRecord`` row with
@@ -495,6 +505,23 @@ def promote_candidate(
     except UnauthorizedPromotionError as exc:
         _deny(exc)
         raise
+
+    if backdoor_report is not None and backdoor_report.get("quarantine_recommended"):
+        quarantine_candidate(
+            candidate_dir=candidate_dir,
+            reason=backdoor_report.get("reason", "Backdoor scan flagged this candidate."),
+            report=backdoor_report,
+            actor=actor,
+            session_factory=sf,
+        )
+
+    quarantine_reason = _existing_quarantine_reason(candidate_dir, sf)
+    if quarantine_reason is not None:
+        exc = QuarantinedModelError(
+            f"Candidate {candidate_dir} is quarantined pending review: {quarantine_reason}"
+        )
+        _deny(exc, detail=quarantine_reason)
+        raise exc
 
     try:
         decision = evaluate_regression_gate(old_metrics, new_metrics, model_names=model_names)
@@ -661,6 +688,73 @@ def record_shadow_outcome(
         if status == "rolled_back":
             record.rolled_back_at = datetime.now(UTC)
         session.commit()
+
+
+# ---------------------------------------------------------------------------
+# G2. Auto-quarantine (Issue #871) — a candidate flagged by the backdoor
+# detector (`detection.adversarial.backdoor_detector.scan_and_quarantine`)
+# is recorded here immediately, independent of whether anyone has attempted
+# to promote it. `promote_candidate` below re-checks this for the *same*
+# candidate_dir on every call, so quarantine cannot be bypassed by simply
+# omitting `backdoor_report` on a later promotion attempt.
+# ---------------------------------------------------------------------------
+
+
+def quarantine_candidate(
+    *,
+    candidate_dir: str,
+    reason: str,
+    report: dict | None = None,
+    actor: str = "system",
+    session_factory: Any = None,
+) -> ModelVersionRecordLike:
+    """Record *candidate_dir* as quarantined pending human review.
+
+    Inserts a new ``ModelVersionRecord`` with ``status="quarantined"`` — it
+    never mutates an existing row, so the quarantine event itself is an
+    immutable audit entry alongside the shadow/production history for the
+    same artifact path. The full structured backdoor report is stored (as
+    JSON) in ``training_metadata``; ``quarantine_reason`` holds the short
+    human-readable summary.
+    """
+    from detection.persistence import ModelVersionRecord, get_engine, get_session_factory
+
+    sf = session_factory or get_session_factory(get_engine(config.RISK_SCORE_DB_URL))
+    version_id = str(uuid.uuid4())
+    with sf() as session:
+        record = ModelVersionRecord(
+            version_id=version_id,
+            model_artifact_path=candidate_dir,
+            status="quarantined",
+            quarantined_at=datetime.now(UTC),
+            quarantine_reason=reason,
+            training_metadata=_json_or_none({"backdoor_report": report} if report else {}),
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+    logger.warning(
+        "Candidate %s quarantined pending review (actor=%s): %s", candidate_dir, actor, reason
+    )
+    return record
+
+
+def _existing_quarantine_reason(candidate_dir: str, session_factory: Any) -> str | None:
+    """Most recent quarantine reason recorded for *candidate_dir*, or `None`
+    if it has never been quarantined."""
+    from detection.persistence import ModelVersionRecord
+
+    with session_factory() as session:
+        record = (
+            session.query(ModelVersionRecord)
+            .filter(
+                ModelVersionRecord.model_artifact_path == candidate_dir,
+                ModelVersionRecord.status == "quarantined",
+            )
+            .order_by(ModelVersionRecord.quarantined_at.desc())
+            .first()
+        )
+        return record.quarantine_reason if record is not None else None
 
 
 # ---------------------------------------------------------------------------

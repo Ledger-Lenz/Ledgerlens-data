@@ -1,0 +1,60 @@
+name: Migration Snapshot Tests (Issue #963)
+
+# Runs forward/backward migration tests against a representative-scale
+# synthetic dataset snapshot.  Catches:
+#   - Migrations that corrupt or delete data
+#   - Migrations that are too slow for production use
+#   - Migrations applied out of prerequisite order
+#
+# Triggered on every push/PR that touches migrations or the snapshot test.
+on:
+  push:
+    paths:
+      - "migrations/**"
+      - "tests/test_migration_snapshot.py"
+      - ".github/workflows/migration-snapshot.yml"
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "tests/test_migration_snapshot.py"
+      - ".github/workflows/migration-snapshot.yml"
+  workflow_dispatch:
+
+jobs:
+  migration-snapshot:
+    name: Forward / backward migration against representative snapshot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run migration snapshot tests
+        # -v: verbose output so failing migration names are visible in CI logs
+        # -x: stop on first failure so timing is not skewed by re-runs
+        run: |
+          pytest tests/test_migration_snapshot.py \
+            -v \
+            -x \
+            --tb=short \
+            --timeout=120
+        env:
+          # Use an isolated in-memory SQLite DB — no external services required
+          DATABASE_URL: "sqlite:///:memory:"
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-snapshot-results
+          path: |
+            junit_results.xml
+            .pytest_cache/

@@ -279,6 +279,66 @@ class QueryResult(TypedDict):
     match_score: float  # Relevance score [0.0, 1.0]
 
 
+# ============================================================================
+# Registration-time conformance checks
+# ============================================================================
+
+
+class ImporterConformanceError(ValueError):
+    """Raised when an importer does not implement a capability it declares."""
+
+
+def _public_methods(importer_class: type) -> dict[str, Callable]:
+    return {
+        n: getattr(importer_class, n)
+        for n in dir(importer_class)
+        if not n.startswith("_") and callable(getattr(importer_class, n))
+    }
+
+
+def _has_method(prefixes: tuple[str, ...]) -> Callable[[type], str | None]:
+    def check(importer_class: type) -> str | None:
+        if any(n.startswith(prefixes) for n in _public_methods(importer_class)):
+            return None
+        return f"no public method starting with {prefixes}"
+
+    return check
+
+
+def _has_dataframe_output(importer_class: type) -> str | None:
+    for n, fn in _public_methods(importer_class).items():
+        if "dataframe" in n or "DataFrame" in str(getattr(fn, "__annotations__", {}).get("return")):
+            return None
+    return "no method returning a pandas DataFrame"
+
+
+# Minimal contract per capability. Capabilities without an entry (e.g. RETRY,
+# VALIDATION) describe runtime behaviour that can't be checked statically.
+CAPABILITY_CONTRACTS: dict[ImporterCapability, Callable[[type], str | None]] = {
+    ImporterCapability.STREAMING: _has_method(("stream",)),
+    ImporterCapability.BULK: _has_method(
+        ("load", "get", "fetch", "list", "compute", "reconstruct")
+    ),
+    ImporterCapability.DATAFRAME_OUTPUT: _has_dataframe_output,
+    ImporterCapability.POOL_DISCOVERY: _has_method(("list_active_pools", "discover")),
+    ImporterCapability.MULTI_HOP_ANALYSIS: _has_method(("reconstruct",)),
+}
+
+
+def check_conformance(importer_class: type, metadata: ImporterMetadata) -> None:
+    """Raise ``ImporterConformanceError`` if a declared capability is unimplemented."""
+    failures = []
+    for capability, contract in CAPABILITY_CONTRACTS.items():
+        if metadata.has_capability(capability):
+            problem = contract(importer_class)
+            if problem:
+                failures.append(f"{capability.name}: {problem}")
+    if failures:
+        raise ImporterConformanceError(
+            f"Importer {metadata.name!r} fails conformance: " + "; ".join(failures)
+        )
+
+
 @runtime_checkable
 class Importer(Protocol):
     """Protocol that all registered importers should implement.
@@ -316,6 +376,8 @@ class ImporterRegistry:
         self,
         importer_class: type,
         metadata: ImporterMetadata,
+        *,
+        strict: bool = False,
     ) -> None:
         """Register an importer with its metadata.
 
@@ -330,7 +392,11 @@ class ImporterRegistry:
         ------
         ValueError
             If an importer with the same name is already registered
+        ImporterConformanceError
+            If ``strict`` and a declared capability isn't implemented
         """
+        if strict:
+            check_conformance(importer_class, metadata)
         if metadata.name in self._importers:
             raise ValueError(
                 f"Importer {metadata.name!r} is already registered. "
@@ -362,6 +428,16 @@ class ImporterRegistry:
             metadata.capabilities,
             ", ".join(str(dt) for dt in metadata.data_types),
         )
+
+    def verify_conformance(self) -> list[str]:
+        """Run conformance checks on every registered importer; return failures."""
+        failures = []
+        for name, metadata in self._importers.items():
+            try:
+                check_conformance(self._importer_classes[name], metadata)
+            except ImporterConformanceError as exc:
+                failures.append(str(exc))
+        return failures
 
     def unregister(self, name: str) -> None:
         """Remove an importer from the registry (mainly for testing)."""
@@ -752,6 +828,7 @@ def register_importer(
     capabilities: ImporterCapability = ImporterCapability.NONE,
     data_types: Iterable[DataType] | None = None,
     sources: Iterable[DataSource] | None = None,
+    strict: bool = False,
     **kwargs: Any,
 ) -> Callable[[type], type]:
     """Decorator to register an importer with the global registry.
@@ -768,6 +845,9 @@ def register_importer(
         Data types this importer provides
     sources : Iterable[DataSource], optional
         Data sources this importer uses
+    strict : bool, default False
+        Reject registration if a declared capability isn't implemented
+        (see ``CAPABILITY_CONTRACTS``).
     **kwargs
         Additional metadata fields (performance, version, etc.)
 
@@ -806,7 +886,7 @@ def register_importer(
 
         # Register with global registry
         registry = get_registry()
-        registry.register(cls, metadata)
+        registry.register(cls, metadata, strict=strict)
 
         return cls
 

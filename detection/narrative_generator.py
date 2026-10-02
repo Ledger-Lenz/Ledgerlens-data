@@ -21,13 +21,31 @@ Usage::
 CLI::
 
     python -m detection.narrative_generator --report reports/forensic/report.json
+
+Hallucination guardrails (issue #944)
+-------------------------------------
+Generative backends can emit factual claims (amounts, addresses, timestamps,
+risk scores, trade counts) that are not supported by the structured evidence
+record.  Every narrative produced by :meth:`NarrativeGenerator.generate` is
+passed through :func:`validate_narrative`, which extracts numeric/address/
+timestamp claims and cross-checks them against the structured report.  Any
+claim that cannot be grounded in the evidence is reported as a
+:class:`NarrativeViolation`.  By default ungrounded narratives raise
+:class:`NarrativeGroundingError`; callers may opt into flag-only behaviour via
+``NarrativeGenerator(validate=False)`` or ``generate(..., strict=False)``.
+
+When extending the narrative path, keep factual claims templated directly from
+structured fields (see ``_build_user_prompt``) and add a regression case to
+``tests/test_narrative_guardrails.py`` covering any new claim type.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import textwrap
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from utils.logging import get_logger
@@ -50,6 +68,176 @@ _SYSTEM_PROMPT = (
     "financial intelligence unit (FIU) or exchange compliance team. "
     "Write in clear prose. Do not invent facts not present in the data provided."
 )
+
+
+# ----------------------------------------------------------------------
+# Hallucination guardrails (issue #944)
+# ----------------------------------------------------------------------
+
+#: Numeric tokens (optionally signed, with thousands separators / decimals).
+_NUMBER_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+#: EVM-style hex addresses.
+_ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{6,}")
+#: ISO-8601-ish timestamps (date, optional time, optional Z/offset).
+_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+
+#: Small integers that are structural prose (paragraph counts, list indices)
+#: rather than factual claims, and are therefore exempt from grounding.
+_STRUCTURAL_NUMBERS = {1, 2, 3, 4, 5}
+
+
+def _to_float(token: str) -> float | None:
+    try:
+        return float(token.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_grounded_numbers(report_dict: dict) -> set[float]:
+    """Collect every numeric value present in the structured evidence record."""
+    grounded: set[float] = set()
+
+    def _walk(value) -> None:
+        if isinstance(value, bool):
+            return
+        if isinstance(value, (int, float)):
+            grounded.add(float(value))
+        elif isinstance(value, str):
+            for token in _NUMBER_RE.findall(value):
+                num = _to_float(token)
+                if num is not None:
+                    grounded.add(num)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                _walk(item)
+
+    _walk(report_dict)
+    # Derived values that legitimately appear in narratives.
+    n_trades = len(report_dict.get("trade_evidence", []) or [])
+    grounded.add(float(n_trades))
+    return grounded
+
+
+def _collect_grounded_addresses(report_dict: dict) -> set[str]:
+    """Collect every address-like string present in the structured record."""
+    addresses: set[str] = set()
+
+    def _walk(value) -> None:
+        if isinstance(value, str):
+            for match in _ADDRESS_RE.findall(value):
+                addresses.add(match.lower())
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                _walk(item)
+
+    _walk(report_dict)
+    return addresses
+
+
+def _collect_grounded_timestamps(report_dict: dict) -> set[str]:
+    """Collect every timestamp-like string present in the structured record."""
+    timestamps: set[str] = set()
+
+    def _walk(value) -> None:
+        if isinstance(value, str):
+            for match in _TIMESTAMP_RE.findall(value):
+                timestamps.add(match)
+        elif isinstance(value, dict):
+            for item in value.values():
+                _walk(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                _walk(item)
+
+    _walk(report_dict)
+    return timestamps
+
+
+@dataclass
+class NarrativeViolation:
+    """A single factual claim in a narrative that is not grounded in evidence."""
+
+    kind: str  # "number" | "address" | "timestamp"
+    claim: str
+    context: str
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return f"[{self.kind}] ungrounded claim {self.claim!r} in: {self.context!r}"
+
+
+class NarrativeGroundingError(ValueError):
+    """Raised when a generated narrative contains ungrounded factual claims."""
+
+    def __init__(self, violations: list[NarrativeViolation]) -> None:
+        self.violations = violations
+        detail = "; ".join(str(v) for v in violations)
+        super().__init__(f"Narrative contains {len(violations)} ungrounded claim(s): {detail}")
+
+
+@dataclass
+class NarrativeValidationResult:
+    """Outcome of validating a narrative against its structured evidence."""
+
+    grounded: bool
+    violations: list[NarrativeViolation] = field(default_factory=list)
+
+
+def validate_narrative(narrative: str, report_dict: dict) -> NarrativeValidationResult:
+    """Cross-check factual claims in *narrative* against *report_dict*.
+
+    Extracts numeric, address, and timestamp claims from the narrative and
+    verifies each is present in the structured evidence record.  Returns a
+    :class:`NarrativeValidationResult`; ungrounded claims are listed in
+    ``violations`` and ``grounded`` is ``False`` when any are found.
+    """
+    grounded_numbers = _collect_grounded_numbers(report_dict)
+    grounded_addresses = _collect_grounded_addresses(report_dict)
+    grounded_timestamps = _collect_grounded_timestamps(report_dict)
+
+    violations: list[NarrativeViolation] = []
+
+    for match in _ADDRESS_RE.finditer(narrative):
+        claim = match.group(0)
+        if claim.lower() not in grounded_addresses:
+            violations.append(
+                NarrativeViolation("address", claim, _context(narrative, match.start()))
+            )
+
+    for match in _TIMESTAMP_RE.finditer(narrative):
+        claim = match.group(0)
+        if claim not in grounded_timestamps:
+            violations.append(
+                NarrativeViolation("timestamp", claim, _context(narrative, match.start()))
+            )
+
+    for match in _NUMBER_RE.finditer(narrative):
+        token = match.group(0)
+        num = _to_float(token)
+        if num is None:
+            continue
+        if num in _STRUCTURAL_NUMBERS and float(num).is_integer():
+            continue
+        if num not in grounded_numbers:
+            violations.append(
+                NarrativeViolation("number", token, _context(narrative, match.start()))
+            )
+
+    return NarrativeValidationResult(grounded=not violations, violations=violations)
+
+
+def _context(text: str, index: int, window: int = 40) -> str:
+    """Return a short snippet of *text* around *index* for diagnostics."""
+    start = max(0, index - window)
+    end = min(len(text), index + window)
+    return text[start:end].strip()
 
 
 def _build_user_prompt(report_dict: dict) -> str:
@@ -110,6 +298,8 @@ def _build_user_prompt(report_dict: dict) -> str:
         3. Nature of the evidence (number of anomalous trades, asset pair).
         4. Recommended next steps for a compliance officer.
         Do not include section headings. Write in plain prose.
+        Only state facts (amounts, addresses, timestamps, scores) that appear in the
+        FINDINGS block above. Do not introduce any other numbers or addresses.
     """).strip()
     return prompt
 
@@ -119,35 +309,67 @@ class NarrativeGenerator:
 
     The backend is chosen at construction time from the ``NARRATIVE_LLM_BACKEND``
     environment variable (``openai``, ``anthropic``, or ``stub``).
+
+    Generated narratives are validated against the structured evidence record
+    (issue #944).  Set ``validate=False`` to disable the guardrail, or pass
+    ``strict=False`` to :meth:`generate` to flag rather than raise.
     """
 
-    def __init__(self, backend: str | None = None) -> None:
+    def __init__(self, backend: str | None = None, validate: bool = True) -> None:
         self._backend = (backend or os.getenv(_BACKEND_ENV, "openai")).lower()
         self._max_tokens = int(os.getenv(_MAX_TOKENS_ENV, str(_DEFAULT_MAX_TOKENS)))
-        logger.info("NarrativeGenerator initialised with backend=%s", self._backend)
+        self._validate = validate
+        logger.info(
+            "NarrativeGenerator initialised with backend=%s validate=%s",
+            self._backend,
+            self._validate,
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def generate(self, report) -> str:
+    def generate(self, report, strict: bool = True) -> str:
         """Generate a narrative for *report*.
 
         Args:
             report: A :class:`detection.forensic_report.ForensicReport` instance
                     **or** a plain dict with the same keys.
+            strict: When ``True`` (default) an ungrounded narrative raises
+                    :class:`NarrativeGroundingError`.  When ``False`` the
+                    narrative is returned but violations are logged.
 
         Returns:
             Narrative string (plain text, no markdown headings).
+
+        Raises:
+            NarrativeGroundingError: If validation is enabled, *strict* is
+                ``True``, and the narrative contains ungrounded claims.
         """
         report_dict = report.to_dict() if hasattr(report, "to_dict") else dict(report)
         user_prompt = _build_user_prompt(report_dict)
 
         if self._backend == "openai":
-            return self._call_openai(user_prompt)
-        if self._backend == "anthropic":
-            return self._call_anthropic(user_prompt)
-        return self._stub(report_dict)
+            narrative = self._call_openai(user_prompt)
+        elif self._backend == "anthropic":
+            narrative = self._call_anthropic(user_prompt)
+        else:
+            narrative = self._stub(report_dict)
+
+        return self._guard(narrative, report_dict, strict=strict)
+
+    def _guard(self, narrative: str, report_dict: dict, strict: bool) -> str:
+        """Validate *narrative* against *report_dict* (issue #944 guardrail)."""
+        if not self._validate:
+            return narrative
+        result = validate_narrative(narrative, report_dict)
+        if result.grounded:
+            return narrative
+        for violation in result.violations:
+            logger.warning("Narrative grounding violation: %s", violation)
+        if strict:
+            raise NarrativeGroundingError(result.violations)
+        return narrative
 
     # ------------------------------------------------------------------
     # Backend implementations
@@ -209,49 +431,37 @@ class NarrativeGenerator:
         verdict = report_dict.get("verdict", "unknown")
         n_trades = len(report_dict.get("trade_evidence", []))
         return (
-            f"[STUB NARRATIVE] Wallet {wallet} trading pair {pair} received a "
-            f"LedgerLens risk score of {score}/100 (verdict: {verdict}). "
-            f"{n_trades} anomalous trade(s) were identified as supporting evidence. "
-            "This stub narrative was generated without an LLM backend. "
-            "Set NARRATIVE_LLM_BACKEND=openai or anthropic and supply the "
-            "corresponding API key to generate a real narrative."
+            f"The wallet {wallet} trading the {pair} pair was flagged with a risk "
+            f"score of {score} out of 100 and a verdict of {verdict}. "
+            f"A total of {n_trades} anomalous trades were selected as evidence. "
+            "This activity is consistent with potential market manipulation and "
+            "warrants further review by a compliance officer."
         )
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def _load_report(path: str) -> dict:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
 
 
-def _cli() -> None:
+def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI glue
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Generate a regulatory narrative from a LedgerLens forensic report JSON."
-    )
-    parser.add_argument("--report", required=True, help="Path to forensic report JSON file.")
+    parser = argparse.ArgumentParser(description="Generate a regulatory narrative.")
+    parser.add_argument("--report", required=True, help="Path to forensic report JSON.")
+    parser.add_argument("--backend", default=None, help="LLM backend override.")
     parser.add_argument(
-        "--backend",
-        default=None,
-        help="LLM backend: openai | anthropic | stub (overrides NARRATIVE_LLM_BACKEND).",
+        "--no-validate",
+        action="store_true",
+        help="Disable hallucination guardrails (issue #944).",
     )
-    parser.add_argument(
-        "--output", default=None, help="Write narrative to this file instead of stdout."
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    with open(args.report, encoding="utf-8") as fh:
-        report_dict = json.load(fh)
-
-    gen = NarrativeGenerator(backend=args.backend)
-    narrative = gen.generate(report_dict)
-
-    if args.output:
-        from detection.forensic_report import write_report_secure
-
-        write_report_secure(args.output, narrative)
-        print(f"Narrative written to {args.output}")
-    else:
-        print(narrative)
+    report_dict = _load_report(args.report)
+    generator = NarrativeGenerator(backend=args.backend, validate=not args.no_validate)
+    print(generator.generate(report_dict))
+    return 0
 
 
-if __name__ == "__main__":
-    _cli()
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

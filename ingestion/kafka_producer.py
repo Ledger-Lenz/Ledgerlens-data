@@ -26,6 +26,10 @@ Kafka producer that publishes Horizon SSE trades as Avro to per-pair topics.
 
 Failure handling
 ----------------
+* The schema is registered with the schema registry when the producer is
+  constructed (subject ``{topic_prefix}-value``). A schema that violates
+  ``SCHEMA_COMPATIBILITY_MODE`` raises ``SchemaCompatibilityError`` there, so
+  nothing is ever published with it.
 * Serialisation failures (poison-pill input) are routed to the dead-letter
   queue ``ledgerlens.trades.dlq`` with the raw payload and a ``reason`` — they
   are **never** retried automatically and require human review.
@@ -44,7 +48,14 @@ import time
 from confluent_kafka import KafkaException, Producer
 
 from config import config
-from ingestion.avro_codec import load_schema, serialize, trade_to_record
+from ingestion.avro_codec import (
+    SchemaRegistryBackend,
+    get_default_registry,
+    load_schema,
+    read_schema,
+    serialize,
+    trade_to_record,
+)
 from ingestion.data_models import Trade
 from ingestion.exceptions import InvalidInputError
 from monitoring.ingestion_metrics import emit_ingestion_failure, emit_ingestion_success
@@ -154,9 +165,14 @@ class HorizonKafkaProducer:
         schema_path: str | None = None,
         producer: Producer | None = None,
         transactional: bool = False,
+        schema_registry: SchemaRegistryBackend | None = None,
     ) -> None:
         self._topic_prefix = topic_prefix or config.KAFKA_TOPIC_PREFIX
         self._dlq_topic = dlq_topic or config.KAFKA_DLQ_TOPIC
+        # Register before anything is produced: a schema that breaks the
+        # configured compatibility mode raises SchemaCompatibilityError here.
+        registry = schema_registry or get_default_registry()
+        registry.register(read_schema(schema_path), subject=f"{self._topic_prefix}-value")
         self._schema = load_schema(schema_path)
         self._transactional = transactional
 

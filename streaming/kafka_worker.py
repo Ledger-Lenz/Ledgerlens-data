@@ -17,6 +17,7 @@ Usage:
         group_id="ledgerlens-workers",
         bootstrap_servers=["localhost:9092"],
     )
+    worker.install_signal_handlers()  # SIGTERM → drain in-flight, commit, exit
     worker.run()  # Blocks until shutdown
 
 Kafka consumer + scoring worker -- the scale-out half of the streaming backend.
@@ -56,6 +57,9 @@ running rather than crashing.
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
 import time
 from collections import defaultdict
 
@@ -80,6 +84,13 @@ from streaming.streaming_scorer import StreamingScorer
 from utils.logging import correlation_id_from_headers, get_logger, log_context
 
 logger = get_logger(__name__)
+
+# Graceful shutdown (#892): max seconds to wait for the in-flight message to
+# finish after SIGTERM. On expiry the process exits with DRAIN_TIMEOUT_EXIT_CODE
+# WITHOUT committing the in-flight offset — it is redelivered on restart and the
+# staged-but-uncommitted dedup key prevents double-processing.
+KAFKA_DRAIN_TIMEOUT_SECONDS: float = float(os.getenv("KAFKA_DRAIN_TIMEOUT_SECONDS", "30"))
+DRAIN_TIMEOUT_EXIT_CODE = 75
 
 # Module-level metrics — registered once and shared across worker instances.
 KAFKA_MESSAGES_CONSUMED = Counter(
@@ -288,8 +299,14 @@ class KafkaWorker:
         metrics_port: int | None = None,
         enable_backpressure: bool = True,
         dedup_cache: DeduplicationCache | None = None,
+        drain_timeout: float | None = None,
     ) -> None:
         self._scorer = scorer
+        self._drain_timeout = (
+            drain_timeout if drain_timeout is not None else KAFKA_DRAIN_TIMEOUT_SECONDS
+        )
+        self._shutdown_requested = threading.Event()
+        self._drain_timer: threading.Timer | None = None
         self._dispatcher = dispatcher
         self._buffer = buffer if buffer is not None else FeatureBuffer()
         self._watchdog = watchdog
@@ -345,12 +362,10 @@ class KafkaWorker:
         self._running = True
         logger.info("KafkaWorker started — consuming trade topics")
 
-        import threading
-
         from streaming.health_check import heartbeat
 
         try:
-            while self._running:
+            while self._running and not self._shutdown_requested.is_set():
                 heartbeat(threading.current_thread().name)
                 msg = self._consumer.poll(1.0)
                 if msg is None:
@@ -376,11 +391,44 @@ class KafkaWorker:
         finally:
             self.close()
 
+    def install_signal_handlers(self) -> None:
+        """Route SIGTERM/SIGINT to :meth:`request_shutdown` (main thread only)."""
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda signum, _frame: self.request_shutdown(signum))
+
+    def request_shutdown(self, signum: int | None = None) -> None:
+        """Stop polling; let the in-flight message finish and commit, then exit.
+
+        Offsets are committed synchronously per message inside
+        :meth:`process_message`, so once the current message returns there is
+        no partial state. A drain timer enforces ``drain_timeout``.
+        """
+        if self._shutdown_requested.is_set():
+            return
+        logger.info("Graceful shutdown requested (signal=%s) — draining in-flight work", signum)
+        self._shutdown_requested.set()
+        self._running = False
+        if self._drain_timeout > 0:
+            self._drain_timer = threading.Timer(self._drain_timeout, self._on_drain_timeout)
+            self._drain_timer.daemon = True
+            self._drain_timer.start()
+
+    def _on_drain_timeout(self) -> None:
+        """Fallback: drain exceeded — exit without committing the in-flight offset."""
+        logger.error(
+            "Drain timeout (%.1fs) exceeded — exiting without committing in-flight offset; "
+            "message will be redelivered and deduplicated",
+            self._drain_timeout,
+        )
+        os._exit(DRAIN_TIMEOUT_EXIT_CODE)
+
     def stop(self) -> None:
         self._running = False
         self._health_monitor.mark_stopped("KafkaWorker stopped")
 
     def close(self) -> None:
+        if self._drain_timer is not None:
+            self._drain_timer.cancel()
         self._health_monitor.mark_stopped("KafkaWorker closed")
         if self._backpressure is not None:
             self._backpressure.flush()
