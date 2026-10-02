@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Confidence-scored, evidence-linked cross-chain identity edges (issue #879):
+  evidence from bridge memos, amount fingerprints and timing correlations is
+  combined via a reliability-weighted noisy-OR (`detection/cross_chain/confidence.py`);
+  per-edge evidence is retrievable with `get_link_evidence()`, and links below
+  `CROSS_CHAIN_MIN_CONFIDENCE` (default 0.65) are excluded from risk propagation.
+- Mechanism-aware bridge detection (issue #880): lock-and-mint and
+  liquidity-pool bridges are classified and scored separately via a
+  registered-handler pattern (`detection/cross_chain/bridge_mechanisms.py`),
+  with a labelled benchmark in `benchmarks/cross_chain.py`.
 - Resumable, chunked historical backfill (`ingestion.historical_loader.backfill_trades`,
   issue #915): trade history is processed in fixed-size chunks with a durable
   per-chunk checkpoint (resume cursor, counts, failures), so an interrupted

@@ -382,6 +382,9 @@ class Config:
     ZERO_SHOT_MIN_LABELLED_EXAMPLES: int = int(os.getenv("ZERO_SHOT_MIN_LABELLED_EXAMPLES", "20"))
     BENFORD_CI_ENABLED: bool = os.getenv("BENFORD_CI_ENABLED", "false").lower() == "true"
     BRIDGE_ROUNDTRIP_WINDOW_HOURS: int = int(os.getenv("BRIDGE_ROUNDTRIP_WINDOW_HOURS", "72"))
+    # Minimum combined confidence for a cross-chain identity link to carry risk
+    # (Issue #879); see docs/cross_chain_identity.md for the rationale.
+    CROSS_CHAIN_MIN_CONFIDENCE: float = float(os.getenv("CROSS_CHAIN_MIN_CONFIDENCE", "0.65"))
 
     # Differential privacy for SHAP explanations (model inversion defence)
     DP_EPSILON: float = float(os.getenv("DP_EPSILON", "1.0"))

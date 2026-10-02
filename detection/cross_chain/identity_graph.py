@@ -2,6 +2,11 @@
 
 Stores wallets on different chains (Stellar, Ethereum, Solana) and the links
 between them (from bridges, behavioral matching, shared deposits, etc.).
+
+Each edge row is one piece of evidence (one ``link_type``) for an address
+pair; the detector's payload is kept in ``metadata_json`` so it can be
+retrieved for forensic reports.  The confidence of a pair is the noisy-OR
+combination of all its evidence rows (see ``confidence.py``, Issue #879).
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from typing import Any
 from sqlalchemy import Float, Integer, String, UniqueConstraint, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, sessionmaker
 
+from detection.cross_chain.confidence import Evidence, combine_confidence
 from detection.cross_chain.graph_partition import PartitionedResolver
 from detection.persistence import Base, get_session_factory
 
@@ -166,13 +172,61 @@ class IdentityGraph:
             session.refresh(existing)
             return existing
 
-    def get_connected_component(self, start_address: str) -> dict[str, list[dict[str, Any]]]:
+    def add_links(self, links: list[dict[str, Any]], link_type: str) -> int:
+        """Store detector output (BridgeDetector / BehavioralMatcher links) as evidence.
+
+        Each link needs ``stellar_address``, ``linked_address`` and
+        ``confidence``; everything else (tx ids, memo, mechanism, correlation
+        stats, ...) is kept as the edge's forensic evidence payload.
+        """
+        stored = 0
+        for link in links:
+            metadata = dict(link.get("metadata") or {})
+            for key, value in link.items():
+                if key not in ("stellar_address", "linked_address", "confidence", "metadata"):
+                    metadata.setdefault(key, value)
+            self.add_edge(
+                link["stellar_address"],
+                link["linked_address"],
+                link_type,
+                confidence=float(link.get("confidence", 1.0)),
+                metadata=metadata,
+            )
+            stored += 1
+        return stored
+
+    def get_edge_evidence(self, address_a: str, address_b: str) -> list[Evidence]:
+        """Return every piece of evidence linking two addresses (either direction)."""
+        a = normalize_address(address_a)
+        b = normalize_address(address_b)
+        with self._session_factory() as session:
+            edges = session.scalars(
+                select(CrossChainEdge).where(
+                    ((CrossChainEdge.source_address == a) & (CrossChainEdge.target_address == b))
+                    | ((CrossChainEdge.source_address == b) & (CrossChainEdge.target_address == a))
+                )
+            ).all()
+            return [_edge_to_evidence(edge) for edge in edges]
+
+    def get_link_confidence(self, address_a: str, address_b: str) -> float:
+        """Combined confidence that two addresses belong to the same entity."""
+        return combine_confidence(self.get_edge_evidence(address_a, address_b))
+
+    def get_connected_component(
+        self, start_address: str, min_confidence: float = 0.0
+    ) -> dict[str, list[dict[str, Any]]]:
         """Find all transitively linked addresses, grouped by chain.
 
-        Each returned node carries ``link_confidence``: the strongest path from
-        ``start_address`` to it, i.e. the maximum over paths of the product of
-        edge confidences (best-first search). A zk/guardian-attested bridge
-        edge therefore propagates more weight than a heuristic one (#884).
+        Edges between an address pair are combined into one confidence from all
+        of their evidence (``combine_confidence``). Pairs below
+        ``min_confidence`` are not traversed, so low-confidence links neither
+        appear in the result nor bridge to further addresses.
+
+        Each returned node carries ``link_confidence`` (also exposed as
+        ``confidence``): the strongest path from ``start_address`` to it, i.e.
+        the maximum over paths of the product of link confidences (best-first
+        search). A zk/guardian-attested bridge edge therefore propagates more
+        weight than a heuristic one (#884).
         """
         start_address = normalize_address(start_address)
         best: dict[str, float] = {start_address: 1.0}
@@ -197,6 +251,7 @@ class IdentityGraph:
                     "chain": node.chain,
                     "risk_score": node.risk_score,
                     "link_confidence": -neg_conf,
+                    "confidence": -neg_conf,
                 }
                 edges = session.scalars(
                     select(CrossChainEdge).where(
@@ -204,13 +259,21 @@ class IdentityGraph:
                         | (CrossChainEdge.target_address == current)
                     )
                 ).all()
+
+                evidence_by_neighbor: dict[str, list[Evidence]] = {}
                 for edge in edges:
                     neighbor = (
                         edge.target_address
                         if edge.source_address == current
                         else edge.source_address
                     )
-                    conf = -neg_conf * max(0.0, min(1.0, edge.confidence))
+                    evidence_by_neighbor.setdefault(neighbor, []).append(_edge_to_evidence(edge))
+
+                for neighbor, evidence in evidence_by_neighbor.items():
+                    edge_conf = max(0.0, min(1.0, combine_confidence(evidence)))
+                    if edge_conf < min_confidence:
+                        continue
+                    conf = -neg_conf * edge_conf
                     if neighbor not in done and conf > best.get(neighbor, -1.0):
                         best[neighbor] = conf
                         heapq.heappush(heap, (-conf, neighbor))
@@ -264,3 +327,10 @@ def _group_by_chain(
         else:
             result.setdefault(chain_key, []).append(info)
     return result
+
+
+def _edge_to_evidence(edge: CrossChainEdge) -> Evidence:
+    metadata = json.loads(edge.metadata_json) if edge.metadata_json else {}
+    metadata.setdefault("source_address", edge.source_address)
+    metadata.setdefault("target_address", edge.target_address)
+    return Evidence(evidence_type=edge.link_type, strength=edge.confidence, metadata=metadata)

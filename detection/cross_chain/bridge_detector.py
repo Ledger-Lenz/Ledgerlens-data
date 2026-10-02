@@ -8,6 +8,10 @@ Also implements detect_bridge_wash_trade() for round-trip anchor analysis
 the same anchor within BRIDGE_ROUNDTRIP_WINDOW_HOURS, computing a ratio that
 flags wash traders exploiting cross-chain opacity.
 
+Bridge transactions carrying on-chain ``events`` are classified by bridge
+mechanism (lock-and-mint vs liquidity-pool) and scored with
+mechanism-specific heuristics from ``bridge_mechanisms`` (Issue #880).
+
 Where the bridge publishes a verifiable proof of the transfer (Issue #884),
 detect_bridge_links() verifies it via ``integrations.bridge_attestation`` and
 upgrades the link to a high-confidence ``attestation`` level; otherwise the
@@ -24,6 +28,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from detection.cross_chain.bridge_mechanisms import analyze_bridge_transaction
 from integrations.bridge_attestation import (
     ATTESTATION_CONFIDENCE,
     ATTESTATION_HEURISTIC,
@@ -217,20 +222,33 @@ class BridgeDetector:
 
             if stellar_addr:
                 attestation, confidence, details = self._attest(tx, linked_addr, chain)
-                links.append(
-                    {
-                        "stellar_address": stellar_addr,
-                        "linked_address": linked_addr,
-                        "chain": chain,
-                        "tx_id": tx_id,
-                        "memo": str(memo),
-                        "confidence": confidence,
-                        "attestation": attestation,
-                        "attestation_details": details,
-                    }
-                )
+                link = {
+                    "stellar_address": stellar_addr,
+                    "linked_address": linked_addr,
+                    "chain": chain,
+                    "tx_id": tx_id,
+                    "memo": str(memo),
+                    "confidence": confidence,
+                    "attestation": attestation,
+                    "attestation_details": details,
+                }
+                if tx.get("events"):
+                    analysis = analyze_bridge_transaction(tx)
+                    link["mechanism"] = analysis["mechanism"]
+                    link["mechanism_confidence"] = analysis["confidence"]
+                    link["mechanism_features"] = analysis["features"]
+                links.append(link)
 
         return links
+
+    def classify_transactions(self, transactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Classify each transaction by bridge mechanism and score it.
+
+        Returns one ``analyze_bridge_transaction`` result per transaction:
+        ``mechanism``, ``classification_score``, ``features``, ``confidence``
+        and ``is_bridge``.
+        """
+        return [analyze_bridge_transaction(tx) for tx in transactions]
 
 
 # ---------------------------------------------------------------------------

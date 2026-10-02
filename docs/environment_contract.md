@@ -126,6 +126,7 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `ZERO_SHOT_MIN_LABELLED_EXAMPLES` | `ZERO_SHOT_MIN_LABELLED_EXAMPLES` | `int` | No | `'20'` | — |
 | `BENFORD_CI_ENABLED` | `BENFORD_CI_ENABLED` | `bool` | No | `'false'` | — |
 | `BRIDGE_ROUNDTRIP_WINDOW_HOURS` | `BRIDGE_ROUNDTRIP_WINDOW_HOURS` | `int` | No | `'72'` | — |
+| `CROSS_CHAIN_MIN_CONFIDENCE` | `CROSS_CHAIN_MIN_CONFIDENCE` | `float` | No | `'0.65'` | Minimum combined confidence for a cross-chain identity link to carry risk (Issue #879); see docs/cross_chain_identity.md for the rationale. |
 | `DP_EPSILON` | `DP_EPSILON` | `float` | No | `'1.0'` | Differential privacy for SHAP explanations (model inversion defence) |
 | `DP_DELTA` | `DP_DELTA` | `float` | No | `'1e-5'` | — |
 | `DP_RENYI_QUERY_THRESHOLD` | `DP_RENYI_QUERY_THRESHOLD` | `int` | No | `'100'` | — |
