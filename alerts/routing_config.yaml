@@ -18,6 +18,21 @@ rules:
         target: "${AUDIT_WEBHOOK_URL}"
         severity_label: critical
 
+  # Pipeline latency SLO-burn alerts (issue #921), raised by
+  # monitoring.latency_budget.LatencyBudgetTracker. These are operational,
+  # not wash-trade detections, so they go exclusively to the on-call ops
+  # rotation rather than the detection channels below.
+  - name: latency-slo-burn-oncall
+    detectors: ["latency_slo_burn"]
+    stop_on_match: true
+    destinations:
+      - channel: pagerduty
+        target: "ledgerlens-pipeline-oncall"
+        severity_label: high
+      - channel: slack
+        target: "#ledgerlens-ops"
+        severity_label: high
+
   - name: consensus-escalated-slack
     detectors: ["consensus_escalator"]
     destinations:

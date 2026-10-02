@@ -246,3 +246,106 @@ class TestRollbackPartialWrites:
         deleted = rollback_partial_writes(mock_store, ["W1", "W2", "W3"], "USDC/XLM")
         # W1 and W3 succeeded, W2 errored → 2 deleted
         assert deleted == 2
+
+
+# ---------------------------------------------------------------------------
+# Post-recovery consistency verification (Issue #920)
+# ---------------------------------------------------------------------------
+
+
+def _simulate_recovery(rm, run_id, pair_id, source_rows, recovered_rows):
+    """Run an ingest stage that 'recovers' *recovered_rows* and verify it
+    against the source-of-truth *source_rows*."""
+    from pipeline.recovery import StageSnapshot
+
+    with rm.stage(run_id, pair_id, "ingest") as ctx:
+        if not ctx.skip:
+            ctx.set_result({"row_count": len(recovered_rows)})
+    return rm.complete_recovery(
+        run_id,
+        pair_id,
+        expected={"ingest": StageSnapshot.from_records(source_rows)},
+        actual={"ingest": StageSnapshot.from_records(recovered_rows)},
+        recovered_range=("2026-09-01T00:00:00Z", "2026-09-01T06:00:00Z"),
+    )
+
+
+_ROWS = [{"trade_id": i, "amount": str(i * 10)} for i in range(5)]
+
+
+def test_clean_recovery_passes_and_resumes_automatically(rm, run_id, pair_id):
+    report = _simulate_recovery(rm, run_id, pair_id, _ROWS, list(reversed(_ROWS)))
+
+    assert report.passed
+    assert report.recovered_stages == ["ingest"]
+    assert rm.can_auto_resume(run_id, pair_id)
+    rendered = report.render()
+    assert "Result:           PASS" in rendered
+    assert "ALLOWED" in rendered
+
+    # Normal processing continues without raising.
+    with rm.stage(run_id, pair_id, "features") as ctx:
+        ctx.set_result({"wallet_count": 3})
+
+
+def test_injected_count_inconsistency_blocks_auto_resumption(rm, run_id, pair_id):
+    from pipeline.recovery import RecoveryBlockedError
+
+    report = _simulate_recovery(rm, run_id, pair_id, _ROWS, _ROWS[:-1])
+
+    assert not report.passed
+    assert report.failed_stages() == ["ingest"]
+    assert not rm.can_auto_resume(run_id, pair_id)
+    assert "record count mismatch" in report.render()
+    assert "BLOCKED" in report.render()
+
+    with pytest.raises(RecoveryBlockedError):
+        with rm.stage(run_id, pair_id, "features"):
+            pass
+
+
+def test_injected_checksum_inconsistency_is_detected(rm, run_id, pair_id):
+    tampered = [dict(r) for r in _ROWS]
+    tampered[2]["amount"] = "999"
+    report = _simulate_recovery(rm, run_id, pair_id, _ROWS, tampered)
+
+    assert not report.passed
+    assert any("checksum mismatch" in i for i in report.checks[0].issues)
+
+
+def test_missing_stage_after_recovery_fails(rm, run_id, pair_id):
+    from pipeline.recovery import StageSnapshot, verify_recovery
+
+    report = verify_recovery(
+        run_id,
+        pair_id,
+        expected={"ingest": StageSnapshot(5), "features": StageSnapshot(3)},
+        actual={"ingest": StageSnapshot(5)},
+    )
+    assert report.failed_stages() == ["features"]
+
+
+def test_manual_approval_unblocks_resumption(rm, run_id, pair_id):
+    _simulate_recovery(rm, run_id, pair_id, _ROWS, _ROWS[:-1])
+    rm.approve_resume(run_id, pair_id, reviewer="oncall@ledgerlens")
+
+    assert rm.can_auto_resume(run_id, pair_id)
+    report = rm.recovery_report(run_id, pair_id)
+    assert report.to_dict()["approved_by"] == "oncall@ledgerlens"
+    assert report.to_dict()["result"] == "FAIL"
+    with rm.stage(run_id, pair_id, "features"):
+        pass
+
+
+def test_block_is_scoped_to_run_and_pair(rm, run_id, pair_id):
+    _simulate_recovery(rm, run_id, pair_id, _ROWS, _ROWS[:-1])
+    assert rm.can_auto_resume(run_id, "OTHER:pair")
+    with rm.stage(run_id, "OTHER:pair", "ingest"):
+        pass
+
+
+def test_checksum_is_order_independent():
+    from pipeline.recovery import compute_checksum
+
+    assert compute_checksum(_ROWS) == compute_checksum(list(reversed(_ROWS)))
+    assert compute_checksum(_ROWS) != compute_checksum(_ROWS[:-1])

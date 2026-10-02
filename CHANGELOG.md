@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Cycle detection and configurable traversal bounds for payment-path tracing
+  (`ingestion/payment_path_analyzer.py`, issue #916). The new
+  `trace_payment_paths` walks the wallet payment graph iteratively. It records
+  cycles instead of following them, and enforces `max_depth` /
+  `max_branching` / `max_paths`. Hitting a bound truncates the trace cleanly
+  and logs the affected wallet and the skipped transaction IDs.
+- Post-recovery consistency verification (`pipeline/recovery.py`, issue
+  #920). `RecoveryManager.complete_recovery` compares expected vs actual
+  per-stage record counts and order-independent checksums across the
+  recovered range. It produces a human-readable `RecoveryReport` and blocks
+  auto-resumption (`RecoveryBlockedError`) on failure until
+  `approve_resume` is called. See `docs/recovery_verification.md`.
+- Per-stage latency budgets with SLO-burn alerting
+  (`monitoring/latency_budget.py`, issue #921). Stage budgets sum to the 10s
+  end-to-end detection-latency target, and every stage reports into
+  `ledgerlens_stage_latency_seconds{stage}`. Per-stage burn-rate alerts are
+  routed through `alerts/router.py`. Also adds the Grafana dashboard
+  `latency_budget.json` and Prometheus multi-window burn-rate rules. See
+  `docs/latency_slos.md`.
 - TTL eviction and size monitoring for the pipeline idempotency-key store
   (`pipeline/idempotency.py`, issue #919): `CheckpointStore.evict_expired()`
   removes keys older than `IDEMPOTENCY_TTL_HOURS` when the store opens and

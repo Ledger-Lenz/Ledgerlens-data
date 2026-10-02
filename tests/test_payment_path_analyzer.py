@@ -461,3 +461,101 @@ class TestComputePaymentPathFeatures:
 
         features = compute_payment_path_features(wallet, flows)
         assert isinstance(features["path_payment_round_trip_frequency"], float)
+
+
+# ---------------------------------------------------------------------------
+# Bounded payment-graph traversal (issue #916)
+# ---------------------------------------------------------------------------
+
+
+def _payment(src: str, dst: str, tx: str) -> dict:
+    return {"source_account": src, "destination_account": dst, "transaction_id": tx}
+
+
+def test_trace_linear_chain_is_unchanged_by_bounds():
+    """Regression: a well-formed path yields the same output under any bounds."""
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    payments = [_payment("A", "B", "t1"), _payment("B", "C", "t2"), _payment("C", "D", "t3")]
+    default = trace_payment_paths("A", payments)
+    generous = trace_payment_paths("A", payments, max_depth=100, max_branching=100)
+
+    assert default.paths == generous.paths == [["A", "B", "C", "D"]]
+    assert default.payment_ids == [["t1", "t2", "t3"]]
+    assert not default.truncated
+    assert not default.has_cycle
+
+
+def test_trace_branching_graph_enumerates_all_paths_in_order():
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    payments = [_payment("A", "B", "t1"), _payment("A", "C", "t2"), _payment("B", "D", "t3")]
+    result = trace_payment_paths("A", payments)
+    assert result.paths == [["A", "B", "D"], ["A", "C"]]
+    assert not result.truncated
+
+
+def test_trace_detects_simple_cycle_and_terminates():
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    payments = [_payment("A", "B", "t1"), _payment("B", "C", "t2"), _payment("C", "A", "t3")]
+    result = trace_payment_paths("A", payments)
+    assert result.cycles == [["A", "B", "C", "A"]]
+    assert result.payment_ids == [["t1", "t2", "t3"]]
+    assert not result.truncated
+
+
+def test_trace_self_loop_is_a_cycle():
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    result = trace_payment_paths("A", [_payment("A", "A", "t1")])
+    assert result.cycles == [["A", "A"]]
+
+
+def test_trace_adversarial_complete_graph_is_bounded(caplog):
+    """A fully connected cyclic graph has factorially many simple paths; the
+    trace must stop at its bounds quickly and log the truncation."""
+    import logging
+    import time
+
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    n = 40
+    wallets = [f"W{i}" for i in range(n)]
+    payments = [_payment(a, b, f"tx-{a}-{b}") for a in wallets for b in wallets if a != b]
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING):
+        result = trace_payment_paths("W0", payments, max_depth=8, max_branching=10, max_paths=2_000)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5.0
+    assert result.truncated
+    assert len(result.paths) <= 2_000
+    assert all(len(p) <= 8 + 1 for p in result.paths)
+    assert {"max_branching", "max_paths"} <= result.truncation_reasons
+    assert result.truncated_payment_ids
+    assert "wallet=W0" in caplog.text
+    assert "max_branching" in caplog.text
+
+
+def test_trace_deep_chain_truncated_at_max_depth(caplog):
+    import logging
+
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    payments = [_payment(f"W{i}", f"W{i + 1}", f"t{i}") for i in range(10_000)]
+    with caplog.at_level(logging.WARNING):
+        result = trace_payment_paths("W0", payments, max_depth=5)
+    assert result.paths == [[f"W{i}" for i in range(6)]]
+    assert result.truncation_reasons == {"max_depth"}
+    assert result.truncated_payment_ids == ["t5"]
+    assert "t5" in caplog.text
+
+
+def test_trace_rejects_invalid_bounds():
+    from ingestion.exceptions import InvalidInputError
+    from ingestion.payment_path_analyzer import trace_payment_paths
+
+    with pytest.raises(InvalidInputError):
+        trace_payment_paths("A", [], max_depth=0)
