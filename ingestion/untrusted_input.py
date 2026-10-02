@@ -25,10 +25,11 @@ record: validation is all-or-nothing per record.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from stellar_sdk import Asset as SdkAsset
 from stellar_sdk.exceptions import AssetCodeInvalidError
@@ -192,3 +193,98 @@ def validate_account_activity(activity: AccountActivity, *, source: str) -> Acco
         _check_account_id(activity.funding_account, "funding_account", source=source)
     _check_ledger_close_time(activity.account_created_at, "account_created_at", source=source)
     return activity
+
+
+# --- Schema-first raw payload validation (Issue #908) ------------------------
+#
+# Size and nesting depth are checked on the raw bytes *before* ``json.loads``
+# runs, so an oversized or deeply-nested payload never reaches the
+# deserializer (which is recursive and would otherwise burn memory/CPU or
+# raise RecursionError). Only after parsing succeeds is the structure checked
+# against the expected top-level schema. Loaders must call
+# ``parse_untrusted_json`` instead of ``json.loads`` on external responses.
+
+MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
+MAX_JSON_DEPTH = 32
+MAX_CONTAINER_ITEMS = 10_000
+
+
+def _check_json_depth(raw: str, max_depth: int, *, source: str) -> None:
+    """Scans raw JSON text for bracket depth without deserializing it."""
+    depth = 0
+    in_string = escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > max_depth:
+                _reject("payload", f"nesting depth exceeds {max_depth}", source=source)
+        elif ch in "]}":
+            depth -= 1
+
+
+def _check_container_sizes(value: Any, max_items: int, *, source: str) -> None:
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if len(item) > max_items:
+                _reject("payload", f"object has more than {max_items} keys", source=source)
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            if len(item) > max_items:
+                _reject("payload", f"array has more than {max_items} items", source=source)
+            stack.extend(item)
+        elif isinstance(item, str) and len(item) > MAX_PAYLOAD_BYTES:
+            _reject("payload", "string value too large", source=source)
+
+
+def parse_untrusted_json(
+    raw: bytes | str,
+    *,
+    source: str,
+    expected_type: type = dict,
+    required_keys: tuple[str, ...] = (),
+    max_bytes: int = MAX_PAYLOAD_BYTES,
+    max_depth: int = MAX_JSON_DEPTH,
+    max_items: int = MAX_CONTAINER_ITEMS,
+) -> Any:
+    """Validates then deserializes an untrusted JSON payload.
+
+    Order: type -> byte size -> UTF-8 decode -> depth scan -> ``json.loads``
+    -> container sizes -> top-level schema. Any failure raises
+    ``UntrustedInputError``; no other exception type escapes.
+    """
+    if not isinstance(raw, (bytes, bytearray, str)):
+        _reject("payload", f"expected bytes or str, got {type(raw).__name__}", source=source)
+    size = len(raw) if isinstance(raw, (bytes, bytearray)) else len(raw.encode("utf-8", "replace"))
+    if size > max_bytes:
+        _reject("payload", f"size {size} exceeds {max_bytes} bytes", source=source)
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            _reject("payload", "not valid UTF-8", source=source)
+    _check_json_depth(raw, max_depth, source=source)
+    try:
+        value = json.loads(raw, parse_constant=lambda c: _reject("payload", f"{c} not allowed", source=source))
+    except UntrustedInputError:
+        raise
+    except (ValueError, RecursionError) as exc:
+        _reject("payload", f"malformed JSON: {type(exc).__name__}", source=source)
+    _check_container_sizes(value, max_items, source=source)
+    if not isinstance(value, expected_type):
+        _reject("payload", f"expected {expected_type.__name__}", source=source)
+    if isinstance(value, dict):
+        missing = [k for k in required_keys if k not in value]
+        if missing:
+            _reject("payload", f"missing required keys {missing}", source=source)
+    return value

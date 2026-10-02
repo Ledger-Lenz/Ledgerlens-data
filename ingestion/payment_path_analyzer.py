@@ -8,17 +8,35 @@ multi-hop flows and attributes them to the originating wallets.
 Attributes:
     MAX_PATH_LENGTH: Maximum allowed hops in a payment path (Stellar's limit).
     ROUND_TRIP_WINDOW_HOURS: Time window for detecting round-trip path flows.
+    DEFAULT_TRACE_MAX_DEPTH: Default maximum wallet hops followed by
+        ``trace_payment_paths`` before a branch is truncated.
+    DEFAULT_TRACE_MAX_BRANCHING: Default maximum outgoing payments followed
+        from any single wallet during a trace.
+    DEFAULT_TRACE_MAX_PATHS: Default ceiling on the total number of paths a
+        single trace may emit.
 """
 
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import NotRequired, TypedDict
 
 import pandas as pd
 
 from ingestion.exceptions import InvalidInputError, RecordValidationError
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 MAX_PATH_LENGTH = 6  # Stellar's maximum path hops
 ROUND_TRIP_WINDOW_HOURS = 24
+
+# Traversal bounds for trace_payment_paths (issue #916). These guard against
+# cyclic or pathologically deep/wide payment graphs -- whether crafted by an
+# adversary or produced by a data quality issue -- exhausting CPU or memory.
+DEFAULT_TRACE_MAX_DEPTH = 12
+DEFAULT_TRACE_MAX_BRANCHING = 32
+DEFAULT_TRACE_MAX_PATHS = 10_000
 
 
 class ReconstructedPathFlow(TypedDict):
@@ -267,3 +285,163 @@ def merge_path_flows(
             merged[key] = flow
 
     return list(merged.values())
+
+
+@dataclass
+class PathTraceResult:
+    """Outcome of a bounded payment-graph traversal (issue #916).
+
+    Attributes:
+        start_wallet: Wallet the trace originated from.
+        paths: Every maximal wallet path found, as lists of wallet IDs
+            beginning with ``start_wallet``.
+        payment_ids: Transaction IDs of the payments along each path, index-
+            aligned with ``paths``.
+        cycles: Wallet paths that closed a cycle (the final wallet already
+            appeared earlier on the same path).
+        truncated: True if any traversal bound was hit.
+        truncation_reasons: Distinct bounds that were hit (``"max_depth"``,
+            ``"max_branching"``, ``"max_paths"``).
+        truncated_payment_ids: Transaction IDs of payments that were not
+            followed because of truncation, for follow-up investigation.
+    """
+
+    start_wallet: str
+    paths: list[list[str]] = field(default_factory=list)
+    payment_ids: list[list[str]] = field(default_factory=list)
+    cycles: list[list[str]] = field(default_factory=list)
+    truncated: bool = False
+    truncation_reasons: set[str] = field(default_factory=set)
+    truncated_payment_ids: list[str] = field(default_factory=list)
+
+    @property
+    def has_cycle(self) -> bool:
+        return bool(self.cycles)
+
+
+def trace_payment_paths(
+    start_wallet: str,
+    payments: list[dict],
+    max_depth: int = DEFAULT_TRACE_MAX_DEPTH,
+    max_branching: int = DEFAULT_TRACE_MAX_BRANCHING,
+    max_paths: int = DEFAULT_TRACE_MAX_PATHS,
+) -> PathTraceResult:
+    """Trace multi-hop payment flows outward from ``start_wallet``.
+
+    Builds a directed wallet graph from ``payments`` (each dict must carry
+    ``source_account``, ``destination_account`` and ``transaction_id``) and
+    walks every simple path from ``start_wallet``. The walk is iterative
+    (explicit stack, no recursion) and guarded against adversarial graphs:
+
+    * **Cycle detection** -- a payment into a wallet already on the current
+      path is recorded in ``cycles`` and not followed further.
+    * **max_depth** -- paths stop growing after ``max_depth`` hops.
+    * **max_branching** -- at most ``max_branching`` outgoing payments are
+      followed from any wallet.
+    * **max_paths** -- the trace stops once ``max_paths`` paths are emitted.
+
+    Hitting a bound never raises: the result is marked ``truncated`` and a
+    warning naming the start wallet, the bound(s) hit, and a sample of the
+    unfollowed transaction IDs is logged so the payment can be followed up.
+
+    Args:
+        start_wallet: Wallet to trace from.
+        payments: Payment/path-payment operation dicts.
+        max_depth: Maximum hops per path (must be >= 1).
+        max_branching: Maximum outgoing payments followed per wallet (>= 1).
+        max_paths: Maximum number of paths emitted (>= 1).
+
+    Returns:
+        A :class:`PathTraceResult`.
+
+    Raises:
+        InvalidInputError: If any bound is less than 1.
+    """
+    for name, value in (
+        ("max_depth", max_depth),
+        ("max_branching", max_branching),
+        ("max_paths", max_paths),
+    ):
+        if value < 1:
+            raise InvalidInputError(
+                f"{name} must be >= 1, got {value}",
+                source="payment_path_analyzer.trace_payment_paths",
+                reason=f"invalid traversal bound {name}={value!r}",
+            )
+
+    graph: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for op in payments:
+        src = op.get("source_account")
+        dst = op.get("destination_account")
+        tx = op.get("transaction_id")
+        if src and dst and tx:
+            graph[src].append((dst, str(tx)))
+
+    result = PathTraceResult(start_wallet=start_wallet)
+
+    def _truncate(reason: str, skipped: list[tuple[str, str]]) -> None:
+        result.truncated = True
+        result.truncation_reasons.add(reason)
+        result.truncated_payment_ids.extend(tx for _, tx in skipped)
+
+    # Stack entries: (wallet path, payment-id path). Pushed in reverse so the
+    # walk visits payments in input order, keeping output deterministic.
+    stack: list[tuple[list[str], list[str]]] = [([start_wallet], [])]
+    while stack:
+        if len(result.paths) >= max_paths:
+            _truncate("max_paths", [])
+            break
+
+        wallets, tx_ids = stack.pop()
+        current = wallets[-1]
+        edges = graph.get(current, [])
+
+        if not edges:
+            if tx_ids:
+                result.paths.append(wallets)
+                result.payment_ids.append(tx_ids)
+            continue
+
+        if len(tx_ids) >= max_depth:
+            result.paths.append(wallets)
+            result.payment_ids.append(tx_ids)
+            _truncate("max_depth", edges)
+            continue
+
+        if len(edges) > max_branching:
+            _truncate("max_branching", edges[max_branching:])
+            edges = edges[:max_branching]
+
+        on_path = set(wallets)
+        children: list[tuple[list[str], list[str]]] = []
+        for dst, tx in edges:
+            if dst in on_path:
+                result.cycles.append([*wallets, dst])
+                result.paths.append([*wallets, dst])
+                result.payment_ids.append([*tx_ids, tx])
+                continue
+            children.append(([*wallets, dst], [*tx_ids, tx]))
+        stack.extend(reversed(children))
+
+    if len(result.paths) > max_paths:
+        del result.paths[max_paths:]
+        del result.payment_ids[max_paths:]
+        result.truncated = True
+        result.truncation_reasons.add("max_paths")
+
+    if result.truncated:
+        logger.warning(
+            "trace_payment_paths: truncated trace from wallet=%s reasons=%s "
+            "paths=%d cycles=%d unfollowed_payments=%d sample_tx_ids=%s "
+            "(max_depth=%d max_branching=%d max_paths=%d)",
+            start_wallet,
+            sorted(result.truncation_reasons),
+            len(result.paths),
+            len(result.cycles),
+            len(result.truncated_payment_ids),
+            result.truncated_payment_ids[:10],
+            max_depth,
+            max_branching,
+            max_paths,
+        )
+    return result

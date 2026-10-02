@@ -125,6 +125,91 @@ def select_optimal_window(
     return max_window
 
 
+# ---------------------------------------------------------------------------
+# Adaptive change-point segmentation (Issue #855) — implementation plan
+# ---------------------------------------------------------------------------
+#
+# Problem: `select_optimal_window()` above picks a fixed trailing window
+# (1h/4h/24h/168h/720h). On bursty accounts that window straddles a regime
+# change: pre- and post-change trades are pooled, which dilutes the
+# chi-square / MAD statistics computed in benford_engine.py and the
+# z-scores in benford_drift_detector.py.
+#
+# Planned design:
+#
+# 1. `detect_change_points(amounts, timestamps, *, min_segment, max_segment,
+#    penalty=None) -> list[pd.Timestamp]`
+#    PELT (Killick et al., 2012), implemented in this module with numpy.
+#    `ruptures` is not a dependency and PELT is about 40 lines, so no new
+#    package is needed.
+#    - Signal: the leading digit of each trade amount (via
+#      benford_engine.leading_digits), in timestamp order.
+#    - Segment cost: multinomial negative log-likelihood of the 9 digit
+#      counts in the segment, i.e. -sum_d n_d * log(n_d / n). Prefix sums of
+#      one-hot digit counts make each cost O(9), so the full scan is O(n)
+#      on average with PELT pruning.
+#    - Penalty: BIC, `8 * log(n)` (8 free parameters per multinomial
+#      segment) unless overridden. This keeps the no-change false-alarm
+#      rate low without per-asset tuning.
+#    - Only the most recent `BENFORD_SEGMENT_MAX_TRADES` (default 20_000)
+#      trades are scanned, which bounds latency on very active pairs.
+#
+# 2. `select_adaptive_window(pair_id, trades, *, reference_time=None,
+#    min_segment=None, max_segment=None) -> AdaptiveWindow`
+#    - Runs `detect_change_points`, takes the most recent segment (the
+#      current regime) ending at `reference_time`, and uses its span in hours
+#      as the window, clamped to [BENFORD_SEGMENT_MIN_HOURS,
+#      BENFORD_SEGMENT_MAX_HOURS].
+#    - Fallback to the existing fixed behaviour (`select_optimal_window`)
+#      when: total history < 2 * min_segment trades, the latest segment has
+#      fewer than BENFORD_MIN_SAMPLE_SIZE trades, or no change point is found
+#      (then the latest "segment" is the whole history and the fixed window
+#      is the better-tested choice).
+#    - Returns a slotted dataclass:
+#        AdaptiveWindow(window_hours: int, method: "pelt" | "fixed_fallback",
+#                       segment_start: pd.Timestamp | None,
+#                       boundaries: list[pd.Timestamp], n_trades: int)
+#
+# 3. Config (config.py + .env.example, so `make check-env-example` passes;
+#    validated in config/settings_validator.py):
+#      BENFORD_ADAPTIVE_SEGMENTATION   bool, default false (opt-in rollout)
+#      BENFORD_SEGMENT_MIN_TRADES      int,  default = BENFORD_MIN_SAMPLE_SIZE
+#      BENFORD_SEGMENT_MAX_TRADES      int,  default 20000
+#      BENFORD_SEGMENT_MIN_HOURS       int,  default 1
+#      BENFORD_SEGMENT_MAX_HOURS       int,  default 720
+#    The validator rejects min > max and min_trades < 10 (same floor as
+#    BENFORD_MIN_SAMPLE_SIZE).
+#
+# 4. Tests (tests/test_benford_segmentation.py), seeded synthetic data:
+#    - short history (< 2 * min_segment trades): method == "fixed_fallback"
+#      and window == select_optimal_window(...) for the same counts.
+#    - regime change mid-window: 600 Benford-conforming amounts followed by
+#      600 amounts whose leading digit is always 5. Exactly one boundary is
+#      found within +/- min_segment of the true change, and the returned
+#      window covers only post-change trades.
+#    - no-change baseline: 2,000 Benford-conforming amounts give no
+#      boundaries across 20 seeds (checks the BIC false-alarm rate).
+#    - min/max segment length are respected; results are deterministic.
+#
+# 5. Benchmark (benchmarks/benford_segmentation.py, CLI via
+#    `python -m benchmarks.benford_segmentation`):
+#    data/known_manipulation_events.csv lists wallet, pair and
+#    campaign_start/campaign_end, but no trades. The benchmark therefore
+#    builds per-wallet trade streams from a clean Benford background and
+#    injects round-number / fixed-size trades inside each labelled campaign
+#    window, plus an equal number of clean control wallets. Adaptive and
+#    fixed windows each produce a MAD score per wallet, then precision,
+#    recall and F1 at the existing MAD threshold go through
+#    benchmarks.runner.run_benchmarks, and the JSON report is written to
+#    reports/. When real trade history for those wallets is available
+#    (e.g. a Parquet export), a `--trades` flag replaces the synthetic
+#    background.
+#
+# Output compatibility is covered in benford_engine.py (see the plan above
+# compute_benford_metrics_for_windows) and boundary persistence in
+# benford_drift_detector.py (see the plan on BenfordDriftModel).
+
+
 def estimate_trades_per_hour(asset_trades: pd.DataFrame) -> float:
     """Rolling median of trades per clock hour over the last 30 days."""
     if asset_trades.empty:

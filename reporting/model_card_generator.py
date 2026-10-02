@@ -22,9 +22,14 @@ import jsonschema
 
 _SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "schemas", "model_metadata.json")
 
+# A subgroup is flagged for reviewer attention when its F1 falls more than this
+# fraction below the aggregate F1 (e.g. 0.10 == 10% relative shortfall).
+_SUBGROUP_FLAG_THRESHOLD = 0.10
 
-class MetadataValidationError(ValueError):
-    """Raised when metadata fails JSON Schema validation."""
+# Minimum subgroup size required before a breakdown is surfaced. This mirrors the
+# k-anonymity floor used by the privacy work so that small subgroups cannot be
+# used to re-identify individual accounts.
+_MIN_SUBGROUP_SIZE = 30
 
 
 def _load_schema() -> dict:
@@ -40,6 +45,97 @@ def _validate_metadata(metadata: dict) -> None:
         raise MetadataValidationError(
             f"Invalid model metadata — missing or invalid field: {exc.json_path} — {exc.message}"
         ) from exc
+
+
+def _aggregate_f1(perf: dict) -> float | None:
+    """Return the mean F1 across all reported asset pairs, or ``None``."""
+    f1s = [
+        m["f1"]
+        for m in perf.values()
+        if isinstance(m, dict) and isinstance(m.get("f1"), (int, float))
+    ]
+    if not f1s:
+        return None
+    return sum(f1s) / len(f1s)
+
+
+def _subgroup_breakdowns(metadata: dict) -> list[tuple[str, dict]]:
+    """Return ``(dimension, breakdown)`` pairs for privacy-compliant subgroups.
+
+    Only dimensions that are meaningful for this domain and that do not expose
+    individual accounts are included: asset pair, account-age bucket, and
+    account type. Subgroups smaller than ``_MIN_SUBGROUP_SIZE`` are dropped to
+    avoid re-identification risk.
+    """
+    raw = metadata.get("subgroup_performance", {})
+    breakdowns: list[tuple[str, dict]] = []
+    for dimension, groups in raw.items():
+        if not isinstance(groups, dict):
+            continue
+        kept = {
+            label: metrics
+            for label, metrics in groups.items()
+            if isinstance(metrics, dict)
+            and metrics.get("sample_size", 0) >= _MIN_SUBGROUP_SIZE
+        }
+        if kept:
+            breakdowns.append((dimension, kept))
+    return breakdowns
+
+
+def _render_subgroup_section(metadata: dict) -> list[str]:
+    """Render the fairness / subgroup performance section."""
+    perf = metadata.get("performance_metrics", {})
+    aggregate_f1 = _aggregate_f1(perf)
+    breakdowns = _subgroup_breakdowns(metadata)
+
+    lines = ["", "## Subgroup Performance (Fairness)", ""]
+
+    if not breakdowns:
+        lines.append("_No privacy-compliant subgroup breakdowns available._")
+        return lines
+
+    if aggregate_f1 is not None:
+        lines.append(f"Aggregate F1 (mean across asset pairs): **{aggregate_f1:.4f}**")
+        lines.append("")
+
+    flagged: list[str] = []
+    for dimension, groups in breakdowns:
+        lines += [f"### By {dimension}", ""]
+        lines += [
+            "| Subgroup | Sample Size | Precision | Recall | F1 | Flag |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for label, metrics in groups.items():
+            precision = metrics.get("precision", "N/A")
+            recall = metrics.get("recall", "N/A")
+            f1 = metrics.get("f1", "N/A")
+            sample_size = metrics.get("sample_size", "N/A")
+            flag = ""
+            if (
+                aggregate_f1 is not None
+                and isinstance(f1, (int, float))
+                and aggregate_f1 > 0
+                and (aggregate_f1 - f1) / aggregate_f1 > _SUBGROUP_FLAG_THRESHOLD
+            ):
+                flag = "⚠️ below aggregate"
+                flagged.append(f"{dimension} / {label}")
+            lines.append(
+                f"| {label} | {sample_size} | {precision} | {recall} | {f1} | {flag} |"
+            )
+        lines.append("")
+
+    if flagged:
+        lines.append(
+            "**Reviewer attention required** — the following subgroups perform "
+            f"more than {_SUBGROUP_FLAG_THRESHOLD:.0%} below the aggregate F1: "
+            + ", ".join(flagged)
+            + "."
+        )
+    else:
+        lines.append("_No subgroups fall significantly below the aggregate F1._")
+
+    return lines
 
 
 def _render_markdown(metadata: dict) -> str:
@@ -94,6 +190,8 @@ def _render_markdown(metadata: dict) -> str:
             lines.append(f"| {pair} | {precision} | {recall} | {f1} |")
     else:
         lines.append("_Not available._")
+
+    lines += _render_subgroup_section(metadata)
 
     shap_path = metadata.get("shap_importance_chart_path")
     if shap_path:

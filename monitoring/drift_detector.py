@@ -11,6 +11,11 @@ have that behavior silently changed), and a separate periodic health check
 (``check_drift_monitor_health`` / the ``--heartbeat-check`` CLI below) alerts
 distinctly when the heartbeat goes stale, which happens both when the caller
 stops invoking ``detect()`` at all and when every recent call has failed.
+
+Issue #932 unifies infra-level feature drift (this module) with model-level
+output drift (``detection/drift_monitor.py``) into a single triage view via
+:func:`correlate_drift_signals`, which annotates whether flagged output
+drift is explained by upstream feature drift in the same window.
 """
 
 import logging
@@ -114,6 +119,93 @@ class DriftReport:
         return {"drift_detected": self.drift_detected, "mmd_per_feature": self.mmd_per_feature}
 
 
+# Triage decision tree (issue #932). Maps the combination of feature-drift and
+# output-drift signals to an operator action. Documented in the monitoring
+# runbook; kept here so the annotation and the runbook cannot drift apart.
+TRIAGE_DECISION_TREE: dict[str, dict[str, str]] = {
+    "both_drifted": {
+        "condition": "feature drift AND output drift flagged in the same window",
+        "interpretation": "Output drift is explained by upstream feature drift.",
+        "action": "Investigate the drifted input features; the model itself is likely fine.",
+    },
+    "only_output_drifted": {
+        "condition": "output drift flagged, no tracked input feature drifted",
+        "interpretation": "Output drift is unexplained by upstream features.",
+        "action": "Escalate to model owners: possible model/code regression or label shift.",
+    },
+    "only_input_drifted": {
+        "condition": "feature drift flagged, output drift not flagged",
+        "interpretation": "Inputs shifted but model outputs are still stable.",
+        "action": "Monitor; no immediate action unless output drift follows.",
+    },
+    "no_drift": {
+        "condition": "neither feature nor output drift flagged",
+        "interpretation": "Both signals stable.",
+        "action": "No action.",
+    },
+}
+
+
+def correlate_drift_signals(
+    feature_drift: DriftReport | None,
+    output_drift: DriftReport | None,
+) -> dict:
+    """Unify feature-drift and model-output-drift into a single triage view.
+
+    When output drift is flagged, checks whether any tracked input feature
+    also drifted in the same window and annotates the result accordingly.
+
+    Args:
+        feature_drift: infra-level report from :class:`CovarianceShiftDetector`
+            (``None`` if not available for this window).
+        output_drift: model-level report from ``detection/drift_monitor.py``
+            (``None`` if not available for this window).
+
+    Returns:
+        A dict with both signals, the ``correlation`` annotation
+        (``"explained"`` / ``"unexplained"`` / ``"not_applicable"``), the
+        ``case`` key into :data:`TRIAGE_DECISION_TREE`, and the recommended
+        ``action``.
+    """
+    feature_flagged = bool(feature_drift and feature_drift.drift_detected)
+    output_flagged = bool(output_drift and output_drift.drift_detected)
+
+    drifted_features = (
+        sorted(
+            (name for name, score in feature_drift.mmd_per_feature.items() if score > 0),
+            key=lambda n: feature_drift.mmd_per_feature[n],
+            reverse=True,
+        )
+        if feature_drift
+        else []
+    )
+
+    if output_flagged and feature_flagged:
+        case = "both_drifted"
+        correlation = "explained"
+    elif output_flagged:
+        case = "only_output_drifted"
+        correlation = "unexplained"
+    elif feature_flagged:
+        case = "only_input_drifted"
+        correlation = "not_applicable"
+    else:
+        case = "no_drift"
+        correlation = "not_applicable"
+
+    return {
+        "feature_drift": feature_drift.to_dict() if feature_drift else None,
+        "output_drift": output_drift.to_dict() if output_drift else None,
+        "feature_drift_detected": feature_flagged,
+        "output_drift_detected": output_flagged,
+        "drifted_features": drifted_features,
+        "correlation": correlation,
+        "case": case,
+        "interpretation": TRIAGE_DECISION_TREE[case]["interpretation"],
+        "action": TRIAGE_DECISION_TREE[case]["action"],
+    }
+
+
 def _rbf_kernel(X: np.ndarray, Y: np.ndarray, bandwidth: float) -> np.ndarray:
     diff = X[:, None, :] - Y[None, :, :]
     return np.exp(-np.sum(diff**2, axis=-1) / (2 * bandwidth**2))
@@ -195,6 +287,117 @@ class CovarianceShiftDetector:
         else:
             self.health.record_success()
             return DriftReport(mmd_per_feature=mmd_scores, drift_detected=drift_detected)
+
+
+# ---------------------------------------------------------------------------
+# Embedding-space drift for detection/contrastive/encoder.py outputs (#891)
+# ---------------------------------------------------------------------------
+
+EMBEDDING_CENTROID_SHIFT_THRESHOLD: float = 0.25
+EMBEDDING_COVARIANCE_DRIFT_THRESHOLD: float = 0.30
+
+try:
+    from prometheus_client import Gauge as _Gauge
+
+    _emb_centroid_gauge: _Gauge | None = _Gauge(
+        "ledgerlens_embedding_centroid_shift",
+        "Rolling-window centroid shift of contrastive encoder embeddings (normalised)",
+    )
+    _emb_cov_gauge: _Gauge | None = _Gauge(
+        "ledgerlens_embedding_covariance_drift",
+        "Rolling-window covariance drift of contrastive encoder embeddings (relative Frobenius)",
+    )
+except Exception:  # pragma: no cover
+    _emb_centroid_gauge = None
+    _emb_cov_gauge = None
+
+
+@dataclass
+class EmbeddingDriftReport:
+    centroid_shift: float
+    covariance_drift: float
+    drift_detected: bool
+    n_samples: int
+
+    def to_dict(self) -> dict:
+        return {
+            "centroid_shift": self.centroid_shift,
+            "covariance_drift": self.covariance_drift,
+            "drift_detected": self.drift_detected,
+            "n_samples": self.n_samples,
+        }
+
+
+class EmbeddingDriftMonitor:
+    """Rolling embedding-space drift monitor for contrastive encoder outputs.
+
+    Metrics (both scale-free, compared against a frozen reference window):
+
+    * ``centroid_shift`` — ``||mu_cur - mu_ref|| / sqrt(trace(cov_ref))``: mean
+      displacement measured in reference standard deviations.
+    * ``covariance_drift`` — ``||cov_cur - cov_ref||_F / ||cov_ref||_F``.
+
+    ``observe()`` appends embeddings to a rolling window of ``window_size``
+    rows; once full, metrics are exported to Prometheus (Grafana panel:
+    ``ledgerlens_embedding_*``) and an ``embedding_drift`` alert is routed via
+    ``alerts.router.AlertRouter`` when either metric exceeds its threshold.
+    Response: see ``data/playbooks/embedding_drift.yaml``.
+    """
+
+    def __init__(
+        self,
+        reference: np.ndarray,
+        window_size: int = 1000,
+        centroid_threshold: float = EMBEDDING_CENTROID_SHIFT_THRESHOLD,
+        covariance_threshold: float = EMBEDDING_COVARIANCE_DRIFT_THRESHOLD,
+        router=None,
+        on_alert=None,
+    ) -> None:
+        ref = np.asarray(reference, dtype=np.float64)
+        self._mu_ref = ref.mean(axis=0)
+        self._cov_ref = np.cov(ref, rowvar=False)
+        self._scale = float(np.sqrt(max(np.trace(self._cov_ref), 1e-12)))
+        self._cov_norm = float(max(np.linalg.norm(self._cov_ref), 1e-12))
+        self.window_size = window_size
+        self.centroid_threshold = centroid_threshold
+        self.covariance_threshold = covariance_threshold
+        self._router = router
+        self._on_alert = on_alert
+        self._window: np.ndarray = np.empty((0, ref.shape[1]))
+        self.history: list[EmbeddingDriftReport] = []
+
+    def compute(self, current: np.ndarray) -> EmbeddingDriftReport:
+        cur = np.asarray(current, dtype=np.float64)
+        centroid = float(np.linalg.norm(cur.mean(axis=0) - self._mu_ref) / self._scale)
+        cov = float(np.linalg.norm(np.cov(cur, rowvar=False) - self._cov_ref) / self._cov_norm)
+        return EmbeddingDriftReport(
+            centroid_shift=centroid,
+            covariance_drift=cov,
+            drift_detected=centroid > self.centroid_threshold
+            or cov > self.covariance_threshold,
+            n_samples=len(cur),
+        )
+
+    def observe(self, embeddings: np.ndarray) -> EmbeddingDriftReport | None:
+        """Add a batch to the rolling window; evaluate once the window is full."""
+        self._window = np.vstack([self._window, np.asarray(embeddings)])[-self.window_size :]
+        if len(self._window) < self.window_size:
+            return None
+        report = self.compute(self._window)
+        self.history.append(report)
+        if _emb_centroid_gauge is not None:
+            _emb_centroid_gauge.set(report.centroid_shift)
+            _emb_cov_gauge.set(report.covariance_drift)
+        if report.drift_detected:
+            self._alert(report)
+        return report
+
+    def _alert(self, report: EmbeddingDriftReport) -> None:
+        logger.warning("Embedding drift detected: %s", report.to_dict())
+        alert = {"detectors": ["embedding_drift"], "alert_type": "embedding_drift", **report.to_dict()}
+        destinations = self._router.route(alert) if self._router is not None else []
+        if self._on_alert is not None:
+            self._on_alert(alert, destinations)
 
 
 def check_drift_monitor_health(

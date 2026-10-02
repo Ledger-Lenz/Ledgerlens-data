@@ -169,4 +169,68 @@ CONTRACTS: dict[str, CliContract] = {
 }
 
 
-__all__ = ["CliArgument", "CliContract", "CONTRACTS"]
+# ---------------------------------------------------------------------------
+# Operational CLI (cli/main.py) — structured-output contracts (Issue #959)
+#
+# These contracts describe the *subcommands* of the ``ledgerlens-ops`` CLI
+# (``python -m cli.main``).  They are checked by a dedicated section in
+# ``scripts/check_cli_contracts.py`` that parses ``cli/main.py`` rather than
+# a ``scripts/`` file.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CliSubcommandContract:
+    """Contract for one subcommand of a non-scripts CLI module."""
+
+    module: str            # dotted module path, e.g. "cli.main"
+    subcommand: str        # subcommand name, e.g. "healthcheck"
+    description: str
+    arguments: tuple[CliArgument, ...]
+    json_schema_version: str = "1.0"
+    json_schema_fields: tuple[str, ...] = ()
+
+    def argument_names(self) -> set[str]:
+        return {a.name for a in self.arguments}
+
+
+CLI_SUBCOMMAND_CONTRACTS: dict[str, CliSubcommandContract] = {
+    "cli.main:healthcheck": CliSubcommandContract(
+        module="cli.main",
+        subcommand="healthcheck",
+        description="Run diagnostic health checks on environment variables and streaming config.",
+        arguments=(
+            CliArgument("--json", description="Emit machine-readable JSON output"),
+        ),
+        json_schema_version="1.0",
+        json_schema_fields=(
+            "schema_version",
+            "overall_status",
+            "checks.environment.status",
+            "checks.environment.details",
+            "checks.environment.missing",
+            "checks.streaming.status",
+            "checks.streaming.backend",
+        ),
+    ),
+    "cli.main:validate-artifacts": CliSubcommandContract(
+        module="cli.main",
+        subcommand="validate-artifacts",
+        description="Validate local model and schema artifacts.",
+        arguments=(
+            CliArgument("--dir", description="Path to artifacts folder"),
+            CliArgument("--json", description="Emit machine-readable JSON output"),
+        ),
+        json_schema_version="1.0",
+        json_schema_fields=(
+            "schema_version",
+            "status",
+            "artifacts_dir",
+            "version",
+            "schema_hash",
+            "error",
+        ),
+    ),
+}
+
+
+__all__ = ["CliArgument", "CliContract", "CONTRACTS", "CliSubcommandContract", "CLI_SUBCOMMAND_CONTRACTS"]

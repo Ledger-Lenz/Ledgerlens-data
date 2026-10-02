@@ -45,6 +45,11 @@ logger = logging.getLogger("ledgerlens.negative_miner")
 # ---------------------------------------------------------------------------
 
 CONTRASTIVE_CURRICULUM_EPOCHS: int = int(os.getenv("CONTRASTIVE_CURRICULUM_EPOCHS", "5"))
+# Fraction of the hard-negative budget drawn from known-legitimate HFT wallets
+# (near-duplicate look-alikes of wash trading). 0 disables domain mining (#890).
+CONTRASTIVE_HFT_NEGATIVE_FRACTION: float = float(
+    os.getenv("CONTRASTIVE_HFT_NEGATIVE_FRACTION", "0.5")
+)
 EVENT_HMAC_SECRET: str = os.getenv("EVENT_HMAC_SECRET", "ledgerlens-event-hmac-default")
 
 # FAISS HNSW build parameters
@@ -217,7 +222,13 @@ class HardNegativeMiner:
         embedding_dim: int,
         curriculum_epochs: int = CONTRASTIVE_CURRICULUM_EPOCHS,
         rng_seed: int = 42,
+        hft_negative_fraction: float = CONTRASTIVE_HFT_NEGATIVE_FRACTION,
     ) -> None:
+        if not 0.0 <= hft_negative_fraction <= 1.0:
+            raise ValueError("hft_negative_fraction must be in [0, 1]")
+        self.hft_negative_fraction = hft_negative_fraction
+        self._hft_positions: np.ndarray = np.empty(0, dtype=np.int64)
+        self._hft_ann: _ANN | None = None
         self.embedding_dim = embedding_dim
         self.curriculum_epochs = curriculum_epochs
         self._rng = np.random.default_rng(rng_seed)
@@ -247,6 +258,32 @@ class HardNegativeMiner:
         logger.debug(
             "Built clean-wallet ANN index: %d vectors, dim=%d", self._n_clean, self.embedding_dim
         )
+
+    def set_hft_negatives(self, hft_positions: np.ndarray, clean_embeddings: np.ndarray) -> None:
+        """Register known-legitimate HFT wallets as domain hard negatives.
+
+        Parameters
+        ----------
+        hft_positions:
+            Row indices into the ``clean_embeddings`` array passed to
+            :meth:`build_clean_index` for wallets labelled legitimate HFT /
+            market makers. These look most like wash trading (high frequency,
+            round-trip flow, tight spreads) and are what the encoder must learn
+            to separate from wash-trade anchors.
+        clean_embeddings:
+            The same array given to :meth:`build_clean_index`.
+
+        Cost: one extra ANN build over ``len(hft_positions)`` vectors per
+        refresh and one extra k-NN query per batch — typically <5 % of
+        pre-training wall-clock as the HFT subset is small.
+        """
+        positions = np.asarray(hft_positions, dtype=np.int64)
+        self._hft_positions = positions
+        if len(positions) == 0:
+            self._hft_ann = None
+            return
+        self._hft_ann = _ANN(self.embedding_dim)
+        self._hft_ann.build(np.asarray(clean_embeddings, dtype=np.float32)[positions])
 
     def set_ring_registry(self, registry: RingRegistry) -> None:
         """Attach a RingRegistry for positive-pair construction."""
@@ -304,6 +341,15 @@ class HardNegativeMiner:
 
         result = np.empty((batch, n_negatives), dtype=np.int64)
 
+        # --- domain hard negatives: nearest legitimate-HFT wallets (#890) ---
+        n_hft = 0
+        if n_hard > 0 and self._hft_ann is not None and self._hft_ann.is_built:
+            n_hft = min(int(round(self.hft_negative_fraction * n_hard)), len(self._hft_positions))
+            if n_hft > 0:
+                _, hft_nn = self._hft_ann.query(anchor_embeddings, k=n_hft)
+                result[:, :n_hft] = self._hft_positions[hft_nn[:, :n_hft]]
+            n_hard -= n_hft
+
         # --- hard negatives via ANN ---
         if n_hard > 0:
             k = min(n_hard + 1, self._n_clean)  # +1 to allow dedup
@@ -314,11 +360,11 @@ class HardNegativeMiner:
             if hard_part.shape[1] < n_hard:
                 pad = self._random_negatives(batch, n_hard - hard_part.shape[1])
                 hard_part = np.concatenate([hard_part, pad], axis=1)
-            result[:, :n_hard] = hard_part
+            result[:, n_hft : n_hft + n_hard] = hard_part
 
         # --- easy negatives (random) ---
         if n_easy > 0:
-            result[:, n_hard:] = self._random_negatives(batch, n_easy)
+            result[:, n_hft + n_hard :] = self._random_negatives(batch, n_easy)
 
         return result
 

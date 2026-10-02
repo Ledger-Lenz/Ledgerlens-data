@@ -50,6 +50,34 @@ class RiskScore(TypedDict, total=False):
     model_name: str
     feature_contributions: dict[str, float]
 
+    # ------------------------------------------------------------------
+    # Planned for Issue #856 (uncertainty-aware score fusion)
+    # ------------------------------------------------------------------
+    # New optional fields. They are additive, and because the TypedDict is
+    # total=False, nothing that reads RiskScore today breaks:
+    #
+    #   fused_score_lower: float   # lower bound of fused interval, 0-100
+    #   fused_score_upper: float   # upper bound of fused interval, 0-100
+    #   fusion_strategy: str       # "fixed_weight" | "inverse_variance" | "stacked"
+    #
+    # Migration note for consuming repos (ledgerlens-core, ledgerlens-api,
+    # ledgerlens-contract, ledgerlens-dashboard):
+    #   - No action needed to keep working: `score`, `score_lower` and
+    #     `score_upper` keep their current meaning. `score_lower`/`score_upper`
+    #     stay the union of per-model conformal intervals.
+    #   - To use the new interval, read `fused_score_lower` /
+    #     `fused_score_upper` with `.get()` and fall back to
+    #     `score_lower` / `score_upper` when absent (older producers, or the
+    #     strategy is "fixed_weight" with no calibrators loaded).
+    #   - `fusion_strategy` tells consumers how `score` was produced. When it
+    #     is "inverse_variance" or "stacked", `score` can differ from the
+    #     previous BFT trimmed-mean value for the same wallet. Dashboards
+    #     comparing scores over time should group by this field.
+    #   - ledgerlens-contract (on-chain) needs no change: only the integer
+    #     `score` is written on-chain.
+    #   - ledgerlens-core's shared type should add the three keys as
+    #     optional to mirror this TypedDict.
+
 
 @runtime_checkable
 class Scorer(Protocol):

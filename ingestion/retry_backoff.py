@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+try:
+    from prometheus_client import Counter, Histogram
+
+    ledgerlens_retry_attempts_total: Counter | None = Counter(
+        "ledgerlens_retry_attempts_total", "Total retried (failed) attempts"
+    )
+    ledgerlens_retry_backoff_seconds: Histogram | None = Histogram(
+        "ledgerlens_retry_backoff_seconds", "Backoff delay slept before a retry"
+    )
+    ledgerlens_circuit_breaker_transitions_total: Counter | None = Counter(
+        "ledgerlens_circuit_breaker_transitions_total",
+        "Circuit breaker state transitions",
+        ["breaker", "to_state"],
+    )
+except (ImportError, ValueError):  # pragma: no cover - missing lib or duplicate registration
+    ledgerlens_retry_attempts_total = None
+    ledgerlens_retry_backoff_seconds = None
+    ledgerlens_circuit_breaker_transitions_total = None
+
 
 class RetryConfigurationError(ValueError):
     """Raised when a `RetryPolicy` is constructed with invalid parameters."""
@@ -175,12 +194,90 @@ class RetryPolicy:
         return rng.uniform(0, raw)  # "full"
 
 
+class CircuitOpenError(RuntimeError):
+    """Raised when a call is short-circuited because the breaker is open."""
+
+
+class CircuitBreaker:
+    """Closed/open/half-open circuit breaker guarding a downstream dependency.
+
+    After ``failure_threshold`` consecutive failures the breaker opens and
+    every call fails fast with `CircuitOpenError` for ``cooldown_seconds``.
+    The first call after the cooldown is a half-open probe: success closes
+    the breaker, failure re-opens it for another cooldown.
+    """
+
+    CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        cooldown_seconds: float = 30.0,
+        name: str = "default",
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if failure_threshold < 1:
+            raise RetryConfigurationError("failure_threshold must be >= 1")
+        if cooldown_seconds <= 0:
+            raise RetryConfigurationError("cooldown_seconds must be > 0")
+        self.failure_threshold = failure_threshold
+        self.cooldown_seconds = cooldown_seconds
+        self.name = name
+        self._clock = clock
+        self._state = self.CLOSED
+        self._failures = 0
+        self._opened_at = 0.0
+        self.transitions: list[tuple[str, str]] = []
+
+    @property
+    def state(self) -> str:
+        if self._state == self.OPEN and self._clock() - self._opened_at >= self.cooldown_seconds:
+            self._transition(self.HALF_OPEN)
+        return self._state
+
+    def _transition(self, to_state: str) -> None:
+        if to_state == self._state:
+            return
+        self.transitions.append((self._state, to_state))
+        logger.warning("circuit breaker %s: %s -> %s", self.name, self._state, to_state)
+        self._state = to_state
+        if ledgerlens_circuit_breaker_transitions_total is not None:
+            ledgerlens_circuit_breaker_transitions_total.labels(
+                breaker=self.name, to_state=to_state
+            ).inc()
+
+    def before_call(self) -> None:
+        if self.state == self.OPEN:
+            raise CircuitOpenError(f"circuit breaker {self.name!r} is open")
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._transition(self.CLOSED)
+
+    def record_failure(self) -> None:
+        self._failures += 1
+        if self._state == self.HALF_OPEN or self._failures >= self.failure_threshold:
+            self._opened_at = self._clock()
+            self._transition(self.OPEN)
+
+    def call(self, fn: Callable[[], T]) -> T:
+        self.before_call()
+        try:
+            result = fn()
+        except Exception:
+            self.record_failure()
+            raise
+        self.record_success()
+        return result
+
+
 def call_with_retry(
     fn: Callable[[], T],
     policy: RetryPolicy | None = None,
     sleep: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
     on_attempt: Callable[[AttemptRecord], None] | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> T:
     """Executes `fn` under `policy`, retrying on `policy.retryable_exceptions`.
 
@@ -192,6 +289,8 @@ def call_with_retry(
         rng: Injectable `random.Random` instance, for deterministic tests.
         on_attempt: Optional callback invoked with each `AttemptRecord`,
             useful for metrics/logging integration beyond the default logger.
+        breaker: Optional `CircuitBreaker`; once open, the call fails fast
+            with `CircuitOpenError` instead of hammering a downed dependency.
 
     Returns:
         The return value of the first successful call.
@@ -207,10 +306,16 @@ def call_with_retry(
     for attempt_number in range(1, policy.max_attempts + 1):
         delay = policy.delay_for_attempt(attempt_number, rng=rng)
         if delay > 0:
+            if ledgerlens_retry_backoff_seconds is not None:
+                ledgerlens_retry_backoff_seconds.observe(delay)
             sleep(delay)
         try:
-            result = fn()
+            result = breaker.call(fn) if breaker is not None else fn()
         except policy.retryable_exceptions as exc:
+            if isinstance(exc, CircuitOpenError):
+                raise
+            if ledgerlens_retry_attempts_total is not None:
+                ledgerlens_retry_attempts_total.inc()
             record = AttemptRecord(
                 attempt_number=attempt_number, delay_before_seconds=delay, exception=exc
             )
@@ -237,6 +342,7 @@ def retry_with_backoff(
     policy: RetryPolicy | None = None,
     sleep: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
+    breaker: CircuitBreaker | None = None,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator form of `call_with_retry` for wrapping ingestion job functions."""
 
@@ -244,7 +350,7 @@ def retry_with_backoff(
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> T:
             return call_with_retry(
-                lambda: func(*args, **kwargs), policy=policy, sleep=sleep, rng=rng
+                lambda: func(*args, **kwargs), policy=policy, sleep=sleep, rng=rng, breaker=breaker
             )
 
         return wrapper

@@ -179,13 +179,14 @@ def propagate_risk_scores(
     # Update base scores with cross-chain linked risk scores
     updated_base_scores = base_scores.copy()
     try:
-        from detection.cross_chain.resolver import resolve_risk_scores
+        from detection.cross_chain.resolver import resolve_weighted_risk_scores_bulk
 
-        for node in combined.nodes():
-            ext_scores = resolve_risk_scores(node, db_url=db_url)
-            if ext_scores:
-                max_ext = max(ext_scores.values())
-                updated_base_scores[node] = max(updated_base_scores.get(node, 0.0), max_ext)
+        # Linked risk is scaled by link confidence, so risk imported over a
+        # proof-verified bridge link outweighs a heuristic one (#884).
+        linked = resolve_weighted_risk_scores_bulk(combined.nodes(), db_url=db_url)
+        for node, ext_scores in linked.items():
+            max_ext = max(ext_scores.values())
+            updated_base_scores[node] = max(updated_base_scores.get(node, 0.0), max_ext)
     except Exception as e:
         logger.warning("Failed to propagate cross-chain risk scores: %s", e)
 
@@ -268,13 +269,14 @@ def propagation_attribution(
     # Update base scores with cross-chain linked risk scores
     updated_base_scores = base_scores.copy()
     try:
-        from detection.cross_chain.resolver import resolve_risk_scores
+        from detection.cross_chain.resolver import resolve_weighted_risk_scores_bulk
 
-        for node in combined.nodes():
-            ext_scores = resolve_risk_scores(node, db_url=db_url)
-            if ext_scores:
-                max_ext = max(ext_scores.values())
-                updated_base_scores[node] = max(updated_base_scores.get(node, 0.0), max_ext)
+        # Linked risk is scaled by link confidence, so risk imported over a
+        # proof-verified bridge link outweighs a heuristic one (#884).
+        linked = resolve_weighted_risk_scores_bulk(combined.nodes(), db_url=db_url)
+        for node, ext_scores in linked.items():
+            max_ext = max(ext_scores.values())
+            updated_base_scores[node] = max(updated_base_scores.get(node, 0.0), max_ext)
     except Exception as e:
         logger.warning("Failed to propagate cross-chain risk scores in attribution: %s", e)
 

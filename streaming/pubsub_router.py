@@ -4,13 +4,53 @@ Routes published messages to subscribers based on channel subscriptions.
 Thread-safe for concurrent operations.
 """
 
+import json
+import os
 import threading
+import time
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_DEAD_LETTER_PATH = os.getenv("PUBSUB_DEAD_LETTER_PATH", "data/pubsub_dead_letter.jsonl")
+DEFAULT_MAX_DELIVERY_ATTEMPTS = int(os.getenv("PUBSUB_MAX_DELIVERY_ATTEMPTS", "3"))
+
+
+class DeadLetterStore:
+    """Append-only JSONL store for poison messages.
+
+    Each entry carries the original message plus failure context: the last
+    error, retry count, first/last failure timestamps and target client.
+    """
+
+    def __init__(self, path: str = DEFAULT_DEAD_LETTER_PATH):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def append(self, entry: dict[str, Any]) -> None:
+        with self._lock:
+            d = os.path.dirname(self.path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+
+    def entries(self) -> list[dict[str, Any]]:
+        if not os.path.exists(self.path):
+            return []
+        with self._lock, open(self.path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def remove(self, entry_ids: set[str]) -> None:
+        """Drop entries (e.g. after a successful replay)."""
+        keep = [e for e in self.entries() if e.get("id") not in entry_ids]
+        with self._lock, open(self.path, "w", encoding="utf-8") as f:
+            for e in keep:
+                f.write(json.dumps(e, default=str) + "\n")
 
 
 class PubSubRouter:
@@ -22,7 +62,13 @@ class PubSubRouter:
     - all: admin channel for all messages
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        max_delivery_attempts: int = DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        dead_letter_store: DeadLetterStore | None = None,
+    ):
+        self.max_delivery_attempts = max(1, max_delivery_attempts)
+        self.dead_letter_store = dead_letter_store or DeadLetterStore()
         # client_id -> set of subscribed channels
         self._subscriptions: dict[str, set[str]] = defaultdict(set)
         # channel -> set of subscribed client_ids
@@ -158,3 +204,62 @@ class PubSubRouter:
                     channel: len(clients) for channel, clients in self._channel_subscribers.items()
                 },
             }
+
+    def deliver(
+        self,
+        client_id: str,
+        channel: str,
+        message: dict[str, Any],
+        handler: Callable[[str, dict[str, Any]], None],
+    ) -> bool:
+        """Deliver *message* to *client_id* via *handler* with bounded retries.
+
+        After ``max_delivery_attempts`` consecutive failures the message is
+        routed to the dead-letter store with failure context instead of being
+        retried indefinitely or silently dropped. Returns True on success.
+        """
+        first_failure: float | None = None
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_delivery_attempts + 1):
+            try:
+                handler(client_id, message)
+                return True
+            except Exception as exc:  # noqa: BLE001 — any downstream failure counts
+                last_error = exc
+                first_failure = first_failure or time.time()
+                logger.warning(
+                    "PubSub delivery to %s failed (attempt %d/%d): %s",
+                    client_id, attempt, self.max_delivery_attempts, exc,
+                )
+        entry = {
+            "id": f"{client_id}:{channel}:{time.time_ns()}",
+            "client_id": client_id,
+            "channel": channel,
+            "message": message,
+            "error": f"{type(last_error).__name__}: {last_error}",
+            "retry_count": self.max_delivery_attempts,
+            "first_failure_at": first_failure,
+            "dead_lettered_at": time.time(),
+        }
+        self.dead_letter_store.append(entry)
+        logger.error("PubSub message dead-lettered: %s", entry["id"])
+        return False
+
+    def replay_dead_letters(
+        self,
+        handler: Callable[[str, dict[str, Any]], None],
+        entry_ids: set[str] | None = None,
+    ) -> dict[str, int]:
+        """Re-deliver dead-lettered messages; successes are removed from the store.
+
+        Messages that still fail are re-dead-lettered with fresh context.
+        """
+        entries = [
+            e for e in self.dead_letter_store.entries() if entry_ids is None or e["id"] in entry_ids
+        ]
+        self.dead_letter_store.remove({e["id"] for e in entries})
+        ok = 0
+        for e in entries:
+            if self.deliver(e["client_id"], e["channel"], e["message"], handler):
+                ok += 1
+        return {"replayed": ok, "failed": len(entries) - ok}

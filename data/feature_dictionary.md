@@ -290,6 +290,23 @@ complementary.
 
 ---
 
+### 3.5 · `trade_velocity_zscore`
+
+| Attribute | Value |
+|-----------|-------|
+| **Formula** | (trades_per_hour_last_window − μ_trades_per_hour) / σ_trades_per_hour, where μ and σ are computed over the wallet's historical baseline |
+| **Range** | (−∞, ∞) — values above **2.0** indicate a statistically significant burst above the wallet's normal pace |
+| **Empirical p1–p99** | ≈ −1.5 – 4.2 (synthetic dataset) |
+| **High value** | Trading velocity is far above this wallet's historical norm — burst trading signal consistent with wash-trade bot activation |
+| **Low value** | Near 0 or negative — trading pace is at or below the historical baseline |
+| **Mutable** | ✅ |
+
+Computed from the rolling trade-count time series. Defaults to `0.0` when
+fewer than two historical windows are available. Used by the SHAP narrative
+layer in `reporting/feature_labels.py` as "trade velocity anomaly score".
+
+---
+
 ## 4 · Wallet Graph Features
 
 These features describe the wallet's position and behaviour within the on-chain
@@ -378,6 +395,39 @@ Only present when a funding graph is supplied. Absent for graph-less scoring flo
 | **High value** | Near 1.0 — ring is nearly fully connected (clique); highly organised wash-trade network |
 | **Low value** | 0.0 — not in a ring or sparsely connected ring |
 | **Mutable** | ❌ |
+
+---
+
+### 4.7 · `wallet_graph_ring_size`
+
+| Attribute | Value |
+|-----------|-------|
+| **Formula** | Alias for `ring_size` surfaced through the wallet-graph feature pipeline; number of wallets in the detected Louvain community |
+| **Range** | [0, n_wallets_in_graph] |
+| **Empirical p1–p99** | 0 – varies |
+| **High value** | Large coordinated ring — more severe manipulation signal |
+| **Low value** | 0 = not in a ring |
+| **Mutable** | ❌ |
+
+See `ring_size` (§ 4.5) for full documentation. This alias is used by the SHAP
+narrative layer in `reporting/feature_labels.py`.
+
+---
+
+### 4.8 · `funding_depth`
+
+| Attribute | Value |
+|-----------|-------|
+| **Formula** | Average number of hops between this wallet and the nearest shared funding source ancestor across its co-ring members |
+| **Range** | [0, `WALLET_GRAPH_MAX_DEPTH`] (default max depth = 4) |
+| **Empirical p1–p99** | 0.0 – 4.0 |
+| **High value** | Deep shared ancestry — wallets disguise common funding through many intermediate accounts |
+| **Low value** | Directly funded from a common source (shallow, obvious coordination) or no shared ancestor |
+| **Mutable** | ❌ (funding path is set at account creation) |
+
+Computed by `detection.wallet_graph.compute_wallet_graph_metrics` during the
+multi-hop ancestor traversal. Defaults to `0.0` when no funding graph is
+available (`--no-graph` flag).
 
 ---
 

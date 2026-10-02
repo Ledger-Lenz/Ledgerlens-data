@@ -1,0 +1,198 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens — End-to-End Latency Budget",
+  "tags": [
+    "ledgerlens",
+    "slo",
+    "latency"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Per-stage contribution to end-to-end latency (mean, stacked)",
+      "description": "Mean latency contributed by each stage. Stacked series sum to the total end-to-end latency (dashed line). Issue #921.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(ledgerlens_stage_latency_seconds_sum[5m])) / sum by (stage) (rate(ledgerlens_stage_latency_seconds_count[5m]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ledgerlens_stage_latency_seconds_sum[5m])) / clamp_min(max(rate(ledgerlens_stage_latency_seconds_count[5m])), 1e-9)",
+          "legendFormat": "end-to-end total",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "fillOpacity": 40
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "end-to-end total"
+            },
+            "properties": [
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "title": "Stage share of end-to-end latency",
+      "description": "Fraction of total latency per stage.",
+      "type": "piechart",
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(ledgerlens_stage_latency_seconds_sum[1h]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Per-stage p99 vs budget",
+      "description": "p99 stage latency; budget from ledgerlens_stage_latency_budget_seconds.",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (stage, le) (rate(ledgerlens_stage_latency_seconds_bucket[5m])))",
+          "legendFormat": "{{stage}} p99",
+          "refId": "A"
+        },
+        {
+          "expr": "ledgerlens_stage_latency_budget_seconds",
+          "legendFormat": "{{stage}} budget",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "SLO burn rate per stage (1h)",
+      "description": "Burn rate = fraction of events over the stage budget / (1 - 0.99). Alert fires at >= 2 (warning) and >= 14.4 (critical).",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(ledgerlens_stage_latency_budget_breaches_total[1h])) / sum by (stage) (rate(ledgerlens_stage_latency_seconds_count[1h])) / 0.01",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 2
+              },
+              {
+                "color": "red",
+                "value": 14.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

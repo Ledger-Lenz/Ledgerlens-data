@@ -1,135 +1,180 @@
-"""Interactive confirmation with blast-radius summary for destructive CLI commands.
+"""Issue #962 — Interactive confirmation with blast-radius summary for
+destructive CLI commands.
 
-Issue #962: Destructive CLI commands should present a clear summary of
-scope/blast-radius and require explicit confirmation before proceeding, with a
-documented non-interactive ``--yes`` override for scripted/CI use.
+Every destructive CLI command (restore, backfill, large-scale model promotion)
+must call :func:`confirm_destructive_action` before executing any writes.  The
+function:
 
-Design
-------
-- :func:`confirm_destructive` prints the blast-radius summary and prompts the
-  operator with "Proceed? [yes/N]: ".  The command is blocked until the
-  operator types the word ``yes`` (case-insensitive) or passes ``--yes``.
-- Anything other than ``yes`` aborts with :class:`ConfirmationAborted`.
-- The ``--yes`` override is intentionally verbose (full word, not ``-y``) to
-  reduce accidental non-interactive execution.  It should always be coupled
-  with ``--dry-run`` in runbooks for a first-pass sanity check.
+1. Collects and displays a *blast-radius summary* — record counts, affected
+   date ranges, affected tenants / wallets, etc. — so the operator knows
+   exactly what will change.
+2. Prompts for explicit ``yes`` / ``no`` confirmation.
+3. Accepts a ``--yes`` / ``non_interactive=True`` override for scripted/CI use
+   (documented with an explicit caution banner).
 
-WARNING — non-interactive override (``--yes``)
-----------------------------------------------
-Passing ``--yes`` bypasses the confirmation prompt entirely.  Use it **only**
-in automation (CI, scheduled jobs) where the blast-radius has been reviewed
-in advance and the operator has explicit authority to proceed.  **Never** add
-``--yes`` to a one-liner shared in chat or issue comments without first
-running the command with ``--dry-run``.
+Usage example::
+
+    from cli.confirmation import confirm_destructive_action, BlastRadiusSummary
+
+    summary = BlastRadiusSummary(
+        operation="Database restore",
+        affected_records={"risk_scores": 50_000, "model_versions": 120},
+        affected_date_range=("2024-01-01", "2024-12-31"),
+        affected_tenants=["prod"],
+        extra={"backup_timestamp": "2024-06-01T12:00:00Z"},
+    )
+    if not confirm_destructive_action(summary, non_interactive=opts.yes):
+        sys.exit(1)
 """
 
 from __future__ import annotations
 
+import os
 import sys
-from typing import Any
-
-_BLAST_RADIUS_HEADER = "⚠️  DESTRUCTIVE OPERATION — blast-radius summary:"
-_CONFIRM_PROMPT = "Type 'yes' to proceed, anything else to abort: "
-_ABORTED_MSG = "Aborted — no changes were made."
+from dataclasses import dataclass, field
+from typing import Optional
 
 
-class ConfirmationAborted(Exception):
-    """Raised when the operator declines the confirmation prompt."""
+# ---------------------------------------------------------------------------
+# Blast-radius data class
+# ---------------------------------------------------------------------------
 
 
-def print_blast_radius(summary: dict[str, Any], *, out=None) -> None:
-    """Print a structured blast-radius summary to *out* (default stdout).
+@dataclass
+class BlastRadiusSummary:
+    """A structured description of what a destructive command will affect.
 
-    Parameters
+    Attributes
     ----------
-    summary:
-        Mapping of label → value describing the scope of the operation, e.g.::
-
-            {
-                "affected_records": 150_000,
-                "affected_date_range": "2024-01-01 → 2024-06-30",
-                "target_database": "postgresql://prod-host/ledgerlens",
-                "operation": "restore from backup 2026-09-01",
-            }
+    operation:
+        Human-readable name of the operation (e.g. "Database restore").
+    affected_records:
+        Mapping of table/collection name → estimated row count.
+    affected_date_range:
+        Optional (start, end) ISO-8601 date strings for the affected data window.
+    affected_tenants:
+        Optional list of tenant / environment identifiers affected.
+    extra:
+        Any additional key/value metadata to surface in the summary.
     """
-    out = out or sys.stdout
-    print(_BLAST_RADIUS_HEADER, file=out)
-    for label, value in summary.items():
-        print(f"  {label}: {value}", file=out)
-    print("", file=out)
+
+    operation: str
+    affected_records: dict[str, int] = field(default_factory=dict)
+    affected_date_range: Optional[tuple[str, str]] = None
+    affected_tenants: list[str] = field(default_factory=list)
+    extra: dict[str, str] = field(default_factory=dict)
+
+    def format(self) -> str:
+        """Return a human-readable blast-radius summary string."""
+        lines: list[str] = [
+            "",
+            "=" * 60,
+            "⚠️  DESTRUCTIVE OPERATION — BLAST-RADIUS SUMMARY",
+            "=" * 60,
+            f"  Operation : {self.operation}",
+        ]
+
+        if self.affected_records:
+            lines.append("  Affected records:")
+            for table, count in sorted(self.affected_records.items()):
+                lines.append(f"    • {table}: {count:,} rows")
+
+        if self.affected_date_range:
+            start, end = self.affected_date_range
+            lines.append(f"  Date range: {start} → {end}")
+
+        if self.affected_tenants:
+            lines.append(f"  Tenants / environments: {', '.join(self.affected_tenants)}")
+
+        for key, value in sorted(self.extra.items()):
+            lines.append(f"  {key}: {value}")
+
+        lines += [
+            "=" * 60,
+            "",
+        ]
+        return "\n".join(lines)
 
 
-def confirm_destructive(
-    summary: dict[str, Any],
+# ---------------------------------------------------------------------------
+# Confirmation logic
+# ---------------------------------------------------------------------------
+
+#: Non-interactive override env variable.  Set to ``1`` in scripted / CI
+#: environments where no TTY is available.  Use with extreme caution.
+NON_INTERACTIVE_ENV_VAR = "LEDGERLENS_YES"
+
+
+def confirm_destructive_action(
+    summary: BlastRadiusSummary,
     *,
-    yes: bool = False,
-    out=None,
-    inp=None,
-) -> None:
-    """Print the blast-radius summary and require explicit confirmation.
+    non_interactive: bool = False,
+    prompt_stream=None,
+    input_stream=None,
+) -> bool:
+    """Display a blast-radius summary and ask the operator to confirm.
 
     Parameters
     ----------
     summary:
-        Blast-radius summary passed to :func:`print_blast_radius`.
-    yes:
-        When ``True`` the prompt is skipped (``--yes`` non-interactive override).
-        A warning is still printed to *out* so CI logs are auditable.
-    out:
-        Output stream (default: ``sys.stdout``).
-    inp:
-        Input stream for reading the answer (default: ``sys.stdin``).
-        Passing a custom stream enables testing without interactive I/O.
+        :class:`BlastRadiusSummary` describing what will change.
+    non_interactive:
+        If ``True`` the confirmation prompt is skipped and the function returns
+        ``True`` immediately.  Controlled by ``--yes`` CLI flag or the
+        :data:`NON_INTERACTIVE_ENV_VAR` environment variable.
 
-    Raises
-    ------
-    ConfirmationAborted
-        If the operator does not confirm (interactive mode only).
+        .. warning::
+            Using ``--yes`` / non-interactive mode bypasses the human
+            confirmation gate entirely.  Only use it in CI pipelines or
+            automation scripts where the blast radius has already been
+            reviewed and the operation is known to be safe.  **Never** use
+            it as a shortcut during ad-hoc production operations.
+
+    prompt_stream:
+        File-like object used for output (default: ``sys.stderr``).
+    input_stream:
+        File-like object used for input (default: ``sys.stdin``).
+
+    Returns
+    -------
+    bool
+        ``True`` if the operator confirmed (or ``non_interactive=True``),
+        ``False`` if they declined.
     """
-    out = out or sys.stdout
-    inp = inp or sys.stdin
+    out = prompt_stream if prompt_stream is not None else sys.stderr
+    inp = input_stream if input_stream is not None else sys.stdin
 
-    print_blast_radius(summary, out=out)
+    # Print the blast-radius summary regardless of interactive / non-interactive
+    out.write(summary.format())
+    out.flush()
 
-    if yes:
-        print(
-            "  [--yes] Non-interactive override active — skipping confirmation prompt.",
-            file=out,
+    # Check env-var override first
+    env_yes = os.environ.get(NON_INTERACTIVE_ENV_VAR, "").strip().lower() in ("1", "true", "yes")
+    if non_interactive or env_yes:
+        out.write(
+            "⚠️  --yes / non-interactive mode: skipping confirmation prompt.\n"
+            "   This bypasses the human safety gate. Proceeding automatically.\n\n"
         )
-        print(
-            "  ⚠️  WARNING: --yes bypasses the safety prompt. Ensure blast-radius was"
-            " reviewed before proceeding.",
-            file=out,
-        )
-        print("", file=out)
-        return
+        out.flush()
+        return True
 
     # Interactive prompt
     try:
-        print(_CONFIRM_PROMPT, end="", flush=True, file=out)
-        answer = inp.readline().strip()
+        out.write(
+            "Type 'yes' and press Enter to proceed, or anything else to cancel: "
+        )
+        out.flush()
+        answer = inp.readline().strip().lower()
     except (EOFError, KeyboardInterrupt):
-        print("\n" + _ABORTED_MSG, file=out)
-        raise ConfirmationAborted("Interrupted by user")
+        out.write("\nAborted.\n")
+        out.flush()
+        return False
 
-    if answer.lower() != "yes":
-        print(_ABORTED_MSG, file=out)
-        raise ConfirmationAborted(f"Operator declined (answered {answer!r})")
+    if answer == "yes":
+        out.write("✅ Confirmed. Proceeding.\n\n")
+        out.flush()
+        return True
 
-
-def add_yes_argument(parser) -> None:
-    """Add the standard ``--yes`` non-interactive override to an argparse parser.
-
-    This helper ensures every destructive command uses an identical flag name,
-    help text, and default.
-    """
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        default=False,
-        help=(
-            "Skip the interactive confirmation prompt (non-interactive override). "
-            "USE WITH CAUTION — this bypasses the blast-radius safety check. "
-            "Always run with --dry-run first before using --yes in production."
-        ),
-    )
+    out.write("❌ Cancelled. No changes were made.\n\n")
+    out.flush()
+    return False

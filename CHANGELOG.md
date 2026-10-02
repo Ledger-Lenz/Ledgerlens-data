@@ -8,6 +8,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Confidence-scored, evidence-linked cross-chain identity edges (issue #879):
+  evidence from bridge memos, amount fingerprints and timing correlations is
+  combined via a reliability-weighted noisy-OR (`detection/cross_chain/confidence.py`);
+  per-edge evidence is retrievable with `get_link_evidence()`, and links below
+  `CROSS_CHAIN_MIN_CONFIDENCE` (default 0.65) are excluded from risk propagation.
+- Mechanism-aware bridge detection (issue #880): lock-and-mint and
+  liquidity-pool bridges are classified and scored separately via a
+  registered-handler pattern (`detection/cross_chain/bridge_mechanisms.py`),
+  with a labelled benchmark in `benchmarks/cross_chain.py`.
+- Resumable, chunked historical backfill (`ingestion.historical_loader.backfill_trades`,
+  issue #915): trade history is processed in fixed-size chunks with a durable
+  per-chunk checkpoint (resume cursor, counts, failures), so an interrupted
+  backfill resumes from the last completed chunk with no gaps or duplicates.
+  Adds `parquet_chunk_sink` and a `backfill-status` operator command
+  (`python -m cli.main backfill-status --checkpoint-file ...`). Chunk-size
+  guidance is in `docs/ingestion.md`.
+- Cycle detection and configurable traversal bounds for payment-path tracing
+  (`ingestion/payment_path_analyzer.py`, issue #916). The new
+  `trace_payment_paths` walks the wallet payment graph iteratively. It records
+  cycles instead of following them, and enforces `max_depth` /
+  `max_branching` / `max_paths`. Hitting a bound truncates the trace cleanly
+  and logs the affected wallet and the skipped transaction IDs.
+- Post-recovery consistency verification (`pipeline/recovery.py`, issue
+  #920). `RecoveryManager.complete_recovery` compares expected vs actual
+  per-stage record counts and order-independent checksums across the
+  recovered range. It produces a human-readable `RecoveryReport` and blocks
+  auto-resumption (`RecoveryBlockedError`) on failure until
+  `approve_resume` is called. See `docs/recovery_verification.md`.
+- Per-stage latency budgets with SLO-burn alerting
+  (`monitoring/latency_budget.py`, issue #921). Stage budgets sum to the 10s
+  end-to-end detection-latency target, and every stage reports into
+  `ledgerlens_stage_latency_seconds{stage}`. Per-stage burn-rate alerts are
+  routed through `alerts/router.py`. Also adds the Grafana dashboard
+  `latency_budget.json` and Prometheus multi-window burn-rate rules. See
+  `docs/latency_slos.md`.
+- TTL eviction and size monitoring for the pipeline idempotency-key store
+  (`pipeline/idempotency.py`, issue #919): `CheckpointStore.evict_expired()`
+  removes keys older than `IDEMPOTENCY_TTL_HOURS` when the store opens and
+  hourly as stages start, keeping the store bounded. Store size and evictions
+  are exported as `ledgerlens_idempotency_store_entries` and
+  `ledgerlens_idempotency_store_evicted_total` and shown on the new
+  "Idempotency Key Store" Grafana dashboard. `IDEMPOTENCY_TTL_HOURS` is now read
+  from the environment via `config.py` (default `48`; reasoning in
+  `docs/idempotency.md`).
+- End-to-end exactly-once audit tooling (`pipeline/exactly_once_audit.py`,
+  `scripts/audit_exactly_once.py`, issue #918): traces sample records through
+  the ingestion, feature/scoring and alerting dedup boundaries and flags any
+  boundary that has degraded to at-least-once or at-most-once (unreachable
+  backend, non-durable staging, committed keys not recognised, TTL shorter
+  than the redelivery window). Runs daily against staging via
+  `.github/workflows/exactly-once-audit.yml`. Invariants and operational
+  impact are documented in `docs/exactly_once_audit.md`.
+- Staleness-aware asset metadata caching with trust-tier fallback
+  (`ingestion/asset_metadata_fetcher.py`, issue #917): `get_asset_metadata()`
+  returns an `AssetMetadataRecord` labelled with its trust tier (`primary`,
+  `cache`, `alternate`, `unavailable`), `fetched_at`, age and staleness. It
+  follows a documented primary -> cache -> alternate chain when the primary
+  source is unavailable. Forensic reports (`asset_metadata` field and a
+  Markdown provenance section) and `build_extended_feature_vector` surface the
+  tier and staleness. See `docs/asset_metadata_trust_tiers.md`.
+- Schema registry integration with compatibility-mode enforcement
+  (`ingestion/avro_codec.py`, issue #914): `HorizonKafkaProducer` now registers
+  its Avro schema before publishing, with a Confluent-compatible Schema
+  Registry (`SCHEMA_REGISTRY_URL`) or the in-process `SchemaRegistry`.
+  Registration enforces `SCHEMA_COMPATIBILITY_MODE` (`NONE`/`BACKWARD`/
+  `FORWARD`/`FULL`, default `BACKWARD`) and raises `SchemaCompatibilityError`
+  for a breaking change. See `docs/schema_registry_runbook.md`.
+- Stream-level ingestion anomaly detection (`ingestion/data_quality.py`, issue
+  #913): `StreamQualityMonitor` keeps rolling per-source baselines of batch
+  volume, key-field null rates and field means, and routes spikes and drops
+  through `alerts/router.py` with source, metric and magnitude context (new
+  `ingestion-stream-quality` rule in `alerts/routing_config.yaml`). Known,
+  expected changes can be acknowledged with suppression windows. Adds the
+  `ingestion_stream_quality.json` Grafana dashboard.
+- Perturbation-strength curriculum, robust-accuracy early stopping, and
+  per-epoch experiment tracking for the FGSM adversarial training loop
+  (`detection.adversarial.robustness.run_adversarial_training`, issue
+  #872). `CurriculumScheduler` (`detection/adversarial/augmentation.py`)
+  ramps the training epsilon weak-to-strong across epochs (`"linear"` or
+  `"step"`); the adversarial *validation* accuracy used for reporting is
+  always measured at the final target epsilon so per-epoch numbers stay
+  comparable across a curriculum run. Early stopping triggers on stalled
+  *robust* (adversarial) validation accuracy, never clean accuracy, per the
+  issue's explicit requirement. Both are opt-in (`ADV_TRAINING_CURRICULUM`,
+  `ADV_TRAINING_EARLY_STOP_PATIENCE`) and default to the exact pre-#872
+  fixed-epsilon, run-every-epoch behavior. Per-epoch clean/robust AUC is
+  logged to `mlops.experiment_tracking.JsonlExperimentTracker` when
+  `ADV_TRAINING_EXPERIMENT_LOG_PATH` is set. See
+  `docs/adversarial_curriculum.md` for recommended defaults and the
+  measured no-divergence-across-seeds result.
+- Backdoor trigger-feature localization and model-level auto-quarantine
+  (`detection/adversarial/backdoor_detector.py`, issue #871).
+  `localize_trigger_features` ranks feature columns by a Cohen's-d-style
+  effect size between the activation-clustering detector's flagged samples
+  and the rest (a simplified spectral-signature decomposition per Tran, Li
+  & Madry, 2018) so a flag is now actionable instead of a bare yes/no;
+  `ActivationClusteringDetector.structured_report` adds affected
+  sample/wallet identities and wash-trading-ring concentration when
+  available. `scan_and_quarantine` wires this into
+  `detection.model_governance`: a candidate whose flagged fraction exceeds
+  `BACKDOOR_SCAN_FLAGGED_FRACTION_THRESHOLD` (default 50%, set above the
+  measured 25-47% clean-model noise ceiling to keep false positives low) is
+  recorded as
+  `status="quarantined"` (`ModelVersionRecord`, migration `0008`) and
+  `promote_candidate` now raises `QuarantinedModelError` for that
+  `candidate_dir` on every subsequent attempt, whether or not
+  `backdoor_report` is passed again — there is no "un-quarantine" API by
+  design. Optional pipeline wiring via `BACKDOOR_SCAN_ENABLED`. See
+  `docs/adversarial_robustness.md#trigger-feature-localization--model-level-auto-quarantine--issue-871`
+  and `docs/security_threat_model.md` (new Model Training tampering row and
+  High-Risk Entry Point #7) for the measured clean-model false-positive
+  rate and the updated threat model.
 - Single, authenticated, cryptographically-gated model promotion/rollback path
   (`detection/model_governance.py`, issue #671): `RiskScorer` now hard-blocks
   on any model that fails Ed25519 signature or transparency-log verification

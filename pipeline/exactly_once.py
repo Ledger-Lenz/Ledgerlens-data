@@ -537,6 +537,11 @@ class ExactlyOnceStore:
         self._backend = backend
         self._ttl_seconds = ttl_seconds
 
+    @property
+    def ttl_seconds(self) -> float:
+        """How long a staged key suppresses redelivery before expiring."""
+        return self._ttl_seconds
+
     def check_and_stage(self, key: DedupKey) -> DedupDecision:
         return self._backend.check_and_stage(key, self._ttl_seconds)
 

@@ -1,10 +1,13 @@
 """Avro (de)serialisation helpers shared by the Kafka producer and worker.
 
 The wire format is a *schemaless* Avro binary encoding of the ``Trade`` record
-defined in ``data/trade_avro_schema.json``.  Both sides load the same schema so
-no external Schema Registry is required for the default deployment, while the
-encoding remains compatible with ``kafkacat -s avro`` when a registry is wired
-in.
+defined in ``data/trade_avro_schema.json``.  Producers register that schema with
+a schema registry before publishing (:func:`get_default_registry`): a
+Confluent-compatible registry when ``SCHEMA_REGISTRY_URL`` is set, otherwise an
+in-process :class:`SchemaRegistry`.  Either way the configured
+``SCHEMA_COMPATIBILITY_MODE`` is enforced at registration time, so a breaking
+schema change is rejected before any message is written.  See
+``docs/schema_registry_runbook.md``.
 
 Centralising the codec here keeps the producer (``ingestion/kafka_producer.py``)
 and the worker (``streaming/kafka_worker.py``) in lock-step on field names,
@@ -16,28 +19,36 @@ import json
 import struct
 import time
 from datetime import UTC, datetime
+from enum import StrEnum
 from functools import lru_cache
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import fastavro
+import requests
 
 from config import config
 from ingestion.data_models import Asset, Trade
 from ingestion.exceptions import (
+    IngestionTransportError,
     InvalidInputError,
+    SchemaCompatibilityError,
     SchemaDecodeError,
     SchemaValidationError,
     record_context,
 )
 
 
+def read_schema(schema_path: str | None = None) -> dict:
+    """Return the raw (unparsed) Avro schema JSON from *schema_path* or the configured default."""
+    path = schema_path or config.TRADE_AVRO_SCHEMA_PATH
+    with open(path, encoding="utf-8") as fh:
+        return cast(dict[Any, Any], json.load(fh))
+
+
 @lru_cache(maxsize=4)
 def load_schema(schema_path: str | None = None) -> dict:
     """Parse and cache the Avro schema from *schema_path* (or the configured default)."""
-    path = schema_path or config.TRADE_AVRO_SCHEMA_PATH
-    with open(path, encoding="utf-8") as fh:
-        raw = json.load(fh)
-    return cast(dict[Any, Any], fastavro.parse_schema(raw))
+    return cast(dict[Any, Any], fastavro.parse_schema(read_schema(schema_path)))
 
 
 def trade_to_record(trade: Trade) -> dict:
@@ -271,9 +282,65 @@ def check_forward_compatibility(old_schema: dict, new_schema: dict) -> tuple[boo
     return len(violations) == 0, violations
 
 
+class CompatibilityMode(StrEnum):
+    """Schema registry compatibility modes (same names as Confluent Schema Registry)."""
+
+    NONE = "NONE"
+    BACKWARD = "BACKWARD"
+    FORWARD = "FORWARD"
+    FULL = "FULL"
+
+
+def _resolve_mode(mode: CompatibilityMode | str | None) -> CompatibilityMode:
+    raw = mode if mode is not None else config.SCHEMA_COMPATIBILITY_MODE
+    try:
+        return CompatibilityMode(str(raw).upper())
+    except ValueError as exc:
+        raise InvalidInputError(
+            f"Unknown schema compatibility mode {raw!r}",
+            source="avro_codec",
+            reason=f"expected one of {[m.value for m in CompatibilityMode]}",
+        ) from exc
+
+
+def check_compatibility(
+    old_schema: dict, new_schema: dict, mode: CompatibilityMode | str
+) -> tuple[bool, list[str]]:
+    """Check *new_schema* against *old_schema* under compatibility *mode*."""
+    mode = _resolve_mode(mode)
+    violations: list[str] = []
+    if mode in (CompatibilityMode.BACKWARD, CompatibilityMode.FULL):
+        violations += check_backward_compatibility(old_schema, new_schema)[1]
+    if mode in (CompatibilityMode.FORWARD, CompatibilityMode.FULL):
+        violations += [
+            v for v in check_forward_compatibility(old_schema, new_schema)[1] if v not in violations
+        ]
+    return len(violations) == 0, violations
+
+
+def _incompatible(subject: str, mode: CompatibilityMode, violations: list[str]) -> None:
+    raise SchemaCompatibilityError(
+        f"Schema for subject {subject!r} violates {mode.value} compatibility: "
+        + "; ".join(violations),
+        source="avro_codec.register",
+        reason="; ".join(violations),
+        details={"subject": subject, "compatibility": mode.value, "violations": violations},
+    )
+
+
 # ---------------------------------------------------------------------------
-# SchemaRegistry (#201)
+# SchemaRegistry (#201, #914)
 # ---------------------------------------------------------------------------
+
+DEFAULT_SUBJECT = f"{config.KAFKA_TOPIC_PREFIX}-value"
+
+
+class SchemaRegistryBackend(Protocol):
+    """What producers and consumers need from a schema registry."""
+
+    def register(self, schema: dict, subject: str = DEFAULT_SUBJECT) -> int: ...
+
+    def get_schema(self, schema_id: int) -> dict | None: ...
 
 
 class SchemaRegistry:
@@ -283,30 +350,55 @@ class SchemaRegistry:
     bundled ``data/`` directory — schemas from untrusted external sources are
     never accepted at runtime.
 
+    Registration enforces *compatibility* (defaults to
+    ``config.SCHEMA_COMPATIBILITY_MODE``) against the latest schema of the same
+    subject and raises :class:`SchemaCompatibilityError` on a violation.
+
     Usage::
 
         registry = SchemaRegistry()
-        v1 = registry.register(load_schema("data/trade_avro_schema.json"))
-        v2 = registry.register(new_schema_dict)
+        v1 = registry.register(read_schema("data/trade_avro_schema.json"))
+        v2 = registry.register(new_schema_dict)  # raises if incompatible
         ok, errors = registry.check_backward_compatibility(v1, v2)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, compatibility: CompatibilityMode | str | None = None) -> None:
+        self.compatibility = _resolve_mode(compatibility)
         # fingerprint -> (version_number, raw_schema_dict)
         self._versions: dict[int, tuple[int, dict]] = {}
+        self._subjects: dict[str, list[int]] = {}
         self._counter: int = 0
 
-    def register(self, schema: dict) -> int:
-        """Register *schema* and return its fingerprint.
+    def register(self, schema: dict, subject: str = DEFAULT_SUBJECT) -> int:
+        """Register *schema* under *subject* and return its fingerprint.
 
-        If the schema is already registered its existing fingerprint is returned
-        without incrementing the version counter.
+        If the schema is already the subject's latest version its fingerprint
+        is returned without incrementing the version counter.
+
+        Raises:
+            SchemaCompatibilityError: If *schema* violates the registry's
+                compatibility mode relative to the subject's latest schema.
         """
         fp = _avro_crc32_fingerprint(schema)
+        history = self._subjects.setdefault(subject, [])
+        if history and history[-1] == fp:
+            return fp
+        if history:
+            ok, violations = check_compatibility(
+                self._versions[history[-1]][1], schema, self.compatibility
+            )
+            if not ok:
+                _incompatible(subject, self.compatibility, violations)
         if fp not in self._versions:
             self._counter += 1
             self._versions[fp] = (self._counter, schema)
+        history.append(fp)
         return fp
+
+    def latest_schema(self, subject: str = DEFAULT_SUBJECT) -> dict | None:
+        """Return the latest schema registered under *subject*, or None."""
+        history = self._subjects.get(subject)
+        return self._versions[history[-1]][1] if history else None
 
     def get_schema(self, fingerprint: int) -> dict | None:
         """Return the raw schema dict for *fingerprint*, or None if unknown."""
@@ -368,15 +460,109 @@ class SchemaRegistry:
         )
 
 
+class ConfluentSchemaRegistry:
+    """Client for a Confluent-compatible Schema Registry REST API.
+
+    :meth:`register` pins the subject's compatibility level to the configured
+    mode, asks the registry whether the schema is compatible with the latest
+    version, and only then registers it. Incompatible schemas raise
+    :class:`SchemaCompatibilityError`; network failures raise
+    :class:`IngestionTransportError`.
+    """
+
+    _CONTENT_TYPE = "application/vnd.schemaregistry.v1+json"
+
+    def __init__(
+        self,
+        url: str,
+        compatibility: CompatibilityMode | str | None = None,
+        *,
+        session: requests.Session | None = None,
+        timeout: float = 10.0,
+    ) -> None:
+        self.url = url.rstrip("/")
+        self.compatibility = _resolve_mode(compatibility)
+        self._session = session or requests.Session()
+        self._timeout = timeout
+        self._cache: dict[int, dict] = {}
+
+    def _request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+        try:
+            return self._session.request(
+                method,
+                f"{self.url}{path}",
+                json=payload,
+                headers={"Content-Type": self._CONTENT_TYPE, "Accept": self._CONTENT_TYPE},
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise IngestionTransportError.from_exception(
+                exc, source="avro_codec.ConfluentSchemaRegistry", operation=f"{method} {path}"
+            ) from exc
+
+    def _raise_for_status(self, response: requests.Response, operation: str) -> None:
+        if response.status_code >= 400:
+            raise IngestionTransportError(
+                f"Schema registry {operation} failed with HTTP {response.status_code}",
+                source="avro_codec.ConfluentSchemaRegistry",
+                reason=response.text,
+                operation=operation,
+                retryable=response.status_code >= 500,
+            )
+
+    def register(self, schema: dict, subject: str = DEFAULT_SUBJECT) -> int:
+        """Register *schema* under *subject* and return the registry's schema id."""
+        payload = {"schema": json.dumps(schema)}
+
+        response = self._request(
+            "PUT", f"/config/{subject}", {"compatibility": self.compatibility.value}
+        )
+        self._raise_for_status(response, "set compatibility")
+
+        response = self._request(
+            "POST", f"/compatibility/subjects/{subject}/versions/latest?verbose=true", payload
+        )
+        if response.status_code != 404:  # 404: first version of a new subject
+            self._raise_for_status(response, "compatibility check")
+            body = response.json()
+            if not body.get("is_compatible", False):
+                _incompatible(subject, self.compatibility, list(body.get("messages") or []))
+
+        response = self._request("POST", f"/subjects/{subject}/versions", payload)
+        if response.status_code == 409:
+            _incompatible(subject, self.compatibility, [response.text])
+        self._raise_for_status(response, "register")
+        schema_id = int(response.json()["id"])
+        self._cache[schema_id] = schema
+        return schema_id
+
+    def get_schema(self, schema_id: int) -> dict | None:
+        """Return the schema registered under *schema_id*, or None if unknown."""
+        if schema_id not in self._cache:
+            response = self._request("GET", f"/schemas/ids/{schema_id}")
+            if response.status_code == 404:
+                return None
+            self._raise_for_status(response, "lookup")
+            self._cache[schema_id] = json.loads(response.json()["schema"])
+        return self._cache[schema_id]
+
+
 # Module-level default registry populated with the bundled schema on first use.
-_default_registry: SchemaRegistry | None = None
+_default_registry: SchemaRegistryBackend | None = None
 
 
-def get_default_registry() -> SchemaRegistry:
-    """Return (and lazily initialise) the module-level SchemaRegistry."""
+def get_default_registry() -> SchemaRegistryBackend:
+    """Return (and lazily initialise) the process-wide schema registry.
+
+    A :class:`ConfluentSchemaRegistry` when ``SCHEMA_REGISTRY_URL`` is set,
+    otherwise an in-process :class:`SchemaRegistry` seeded with the bundled
+    trade schema.
+    """
     global _default_registry
     if _default_registry is None:
-        _default_registry = SchemaRegistry()
-        raw = json.load(open(config.TRADE_AVRO_SCHEMA_PATH, encoding="utf-8"))
-        _default_registry.register(raw)
+        if config.SCHEMA_REGISTRY_URL:
+            _default_registry = ConfluentSchemaRegistry(config.SCHEMA_REGISTRY_URL)
+        else:
+            _default_registry = SchemaRegistry()
+            _default_registry.register(read_schema())
     return _default_registry

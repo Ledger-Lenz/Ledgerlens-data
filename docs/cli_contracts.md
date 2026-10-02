@@ -68,78 +68,109 @@ exactly. Both the standalone script and the pytest run are wired into CI.
 
 ---
 
-## CLI Safety Features (Issues #960–#963)
+## Dry-run mode (Issue #960)
 
-### `--dry-run` flag (Issue #960)
+All state-mutating CLI commands must support a `--dry-run` flag.  When
+active, the command:
 
-All state-mutating CLI commands (`backup`, `restore`, `migrate`, `backfill`)
-now accept a `--dry-run` flag. In dry-run mode the command:
+1. Displays a formatted plan enumerating *exactly* which writes would occur
+   (file paths, table names, row counts, date ranges).
+2. Exits **without** performing any mutation — zero side effects guaranteed.
+3. Exits with code `0`.
 
-1. Prints `[DRY RUN] No data will be written.`
-2. Lists every concrete change that *would* occur (e.g. files written,
-   columns added, rows modified).
-3. Exits cleanly without performing any mutation.
-
-**Recommendation:** always run `--dry-run` before executing a high-blast-radius
-command in production:
+**Recommendation: always run `--dry-run` first before executing any
+state-mutating command in production.**
 
 ```bash
-python -m scripts.restore --dry-run
-python -m scripts.migrate --dry-run
-python -m scripts.backfill_amm_trades --pool-ids <id> --dry-run
+python -m scripts.restore --dry-run           # preview restore plan
+python -m scripts.backfill_amm_trades --dry-run --pool-ids <id>
+ledgerlens-ops validate-artifacts --dry-run
 ```
 
-### Interactive confirmation + blast-radius summary (Issue #962)
+The `cli.dry_run` module provides:
+- `add_dry_run_argument(parser)` — consistent flag registration
+- `DryRunPlan` / `DryRunAction` — structured plan description
+- `check_dry_run(args, plan)` — print & return True if dry-run active
 
-Destructive commands (`restore`, `backfill`) present a blast-radius summary
-before executing. The operator must type `yes` to proceed:
+Tests: `tests/test_cli_dry_run.py`
 
-```
-⚠️  DESTRUCTIVE OPERATION — blast-radius summary:
-  operation: restore database and model artifacts from backup
-  target_database: postgresql://prod/ledgerlens
-  backup_timestamp: 2026-09-01T00:00:00Z
-  ...
+---
 
-Type 'yes' to proceed, anything else to abort:
-```
+## Interactive confirmation & blast-radius summary (Issue #962)
 
-**`--yes` non-interactive override:** passes `--yes` to skip the prompt for
-scripted/CI use. **Use only after reviewing the blast-radius with `--dry-run`
-first.** Never include `--yes` in a one-liner shared in chat without prior
-dry-run confirmation.
+Destructive commands present a **blast-radius summary** before prompting
+for explicit confirmation.  The summary includes:
 
-### CLI audit logging (Issue #961)
+- Operation name
+- Affected record counts (by table)
+- Date range of affected data
+- Affected tenants / environments
+- Any additional context (backup timestamp, target database URL, etc.)
 
-When `LEDGERLENS_ENV=production` every CLI command execution writes a signed
-NDJSON event to `CLI_AUDIT_LOG_PATH` (default `logs/cli_audit.ndjson`):
+The operator must type exactly `yes` to proceed; any other input cancels.
 
-```json
-{
-  "timestamp": "2026-09-29T09:20:55Z",
-  "actor": "ahmadrabiumustapha",
-  "env": "production",
-  "command": "restore",
-  "args": {"dry_run": false, "yes": false, "backup_dir": "..."},
-  "outcome": "success"
-}
+```bash
+python -m scripts.restore     # shows blast-radius, prompts for confirmation
 ```
 
-Sensitive arguments (secrets, keys, tokens, passwords) are automatically
-redacted to `[REDACTED]`. Set `CLI_AUDIT_LOG_PATH` in `.env` to override
-the path.
+**Non-interactive override (`--yes`):**
 
-### Migration snapshot testing (Issue #963)
+```bash
+python -m scripts.restore --yes   # ⚠️  skips confirmation — CI/automation only
+# or
+LEDGERLENS_YES=1 python -m scripts.restore
+```
 
-`migrations/snapshot_testing.py` provides utilities used by the CI job
-`migration-snapshot` to:
+> **Warning:** `--yes` / `LEDGERLENS_YES=1` bypasses the human safety gate
+> entirely.  Only use it in CI pipelines or automation scripts where the
+> blast radius has already been reviewed.  **Never** use it as a shortcut
+> during ad-hoc production operations.
 
-1. Build a 50 000-row representative snapshot of the production schema.
-2. Apply every migration forward and assert data integrity at each step.
-3. Apply the most recent migration backward (when `down()` is defined).
-4. Flag any migration that takes longer than `MAX_MIGRATION_SECONDS` (5 s
-   on SQLite CI ≈ <1 s on PostgreSQL in production).
+The `cli.confirmation` module provides:
+- `BlastRadiusSummary` — structured blast-radius description
+- `confirm_destructive_action(summary, non_interactive=False)` — prompt logic
 
-The CI job also runs a negative test using `build_corrupting_migration()` to
-confirm the integrity assertion detects data corruption introduced by a bad
-migration.
+Tests: `tests/test_cli_confirmation.py`
+
+---
+
+## CLI audit logging (Issue #961)
+
+Every state-mutating CLI command produces an audit-log entry when running
+in a production-configured environment (`LEDGERLENS_ENV=production`).  The
+entry is appended to the same NDJSON trail as forensic-report entries
+(`AUDIT_LOG_PATH`, default `data/audit_trail.ndjson`).
+
+Each entry captures:
+- `event_type`: `"cli_command"`
+- `command`: command name
+- `actor`: from `LEDGERLENS_ACTOR`, `USER`, or `"unknown"`
+- `args`: redacted argument dict (secrets replaced with `"[REDACTED]"`)
+- `outcome`: `"success"` or `"failure"`
+- `error`: error message on failure
+- `timestamp`: UTC ISO-8601
+
+**Activating production auditing:**
+
+```bash
+export LEDGERLENS_ENV=production
+python -m scripts.restore --yes         # audit entry written on exit
+```
+
+**Force auditing in non-production (staging/CI):**
+
+```bash
+export AUDIT_ALL_ENVIRONMENTS=1
+```
+
+**Secret redaction:** any argument key matching `secret`, `password`,
+`token`, `key`, `credential`, `passphrase`, or `private` (case-insensitive)
+has its value replaced with `"[REDACTED]"` in the audit entry.
+
+The `cli.audit` module provides:
+- `audit_cli_command(command, args)` — context manager
+- `cli_audit_hook(command)` — decorator
+- `is_production_env()` — production detection
+- `redact_secrets(args)` — secret scrubbing
+
+Tests: `tests/test_cli_audit.py`

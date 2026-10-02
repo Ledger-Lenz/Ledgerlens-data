@@ -33,6 +33,11 @@ class Effect(TypedDict, total=False):
 MIN_TRADES_FOR_INTERVAL_CV = 5
 STELLAR_GENESIS_TIMESTAMP = datetime(2015, 1, 1, 0, 0, 0, tzinfo=UTC)
 
+# Fingerprint feature version: increment when feature set or computation logic changes
+# Version history:
+# - v1: Initial implementation (trust_line_latency, inter_trade_interval_cv, account_management_entropy)
+FINGERPRINT_VERSION = "v1"
+
 
 def extract_bot_fingerprint(
     account_id: str,
@@ -59,6 +64,9 @@ def extract_bot_fingerprint(
     trades_df = trades_df if trades_df is not None else pd.DataFrame()
 
     fingerprint = BotFingerprint(account_id=account_id)
+
+    # Set fingerprint version to enable version compatibility checks
+    fingerprint.fingerprint_version = FINGERPRINT_VERSION
 
     # 1. Trust line creation latency
     if account_created_at:

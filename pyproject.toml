@@ -57,6 +57,9 @@ markers = [
     "integration: marks tests as live Testnet integration tests (deselect with '-m not integration')",
     "slow: marks tests that run PPO training (deselect with '-m not slow')",
     "concurrency: concurrency validation tests for streaming workers (included by default)",
+    # Issue #966 — flaky-test detection and quarantine
+    "flaky: marks tests that have exhibited intermittent failures and are under investigation",
+    "quarantine: marks tests that are known-flaky; excluded from blocking CI but still executed and reported",
 ]
 
 # ---------------------------------------------------------------------------

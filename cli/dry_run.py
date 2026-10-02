@@ -1,154 +1,184 @@
-"""Dry-run support for state-mutating CLI commands.
+"""Issue #960 — Dry-run mode for all state-mutating CLI commands.
 
-Every command that mutates state (writes to DB, writes files, calls external
-APIs) should call :func:`check_dry_run` or use :class:`DryRunContext` so that
-``--dry-run`` mode produces clear enumeration of *what would happen* without
-performing any mutation.
+Every CLI command that mutates state (backfills, restore, model promotion,
+config changes) must support a ``--dry-run`` flag that:
 
-Usage pattern::
+1. Reports *exactly* what would change without applying it.
+2. Produces clearly formatted output so operators can review the blast radius
+   before committing.
+3. Never performs the actual mutation (zero side effects).
 
-    from cli.dry_run import DryRunContext
+Usage::
 
-    def run_backup(args):
-        with DryRunContext(args.dry_run) as dry:
-            # Stage effects before executing them
-            dry.record("Would write database backup to /backups/db_2026-01-01.db")
-            dry.record("Would write model archive to /backups/models_2026-01-01.tar.gz")
-            dry.record("Would write manifest to /backups/MANIFEST.json")
+    from cli.dry_run import DryRunPlan, add_dry_run_argument, check_dry_run
 
-            if dry:   # truthy when in dry-run mode
-                return   # skip all mutations
+    parser = argparse.ArgumentParser(...)
+    add_dry_run_argument(parser)
+    args = parser.parse_args()
 
-            # Real mutations go here
-            ...
+    plan = DryRunPlan("backfill", [
+        DryRunAction("write", "data/labelled_with_cross_venue.parquet",
+                     detail="1 234 rows × 47 cols"),
+        DryRunAction("upsert", "risk_scores table",
+                     detail="12 wallets, score range 45–92"),
+    ])
 
-The context manager guarantees:
+    if check_dry_run(args, plan):
+        # dry-run: plan was printed, nothing was written
+        sys.exit(0)
 
-- In dry-run mode all recorded effects are printed to stdout and no mutations
-  occur.
-- In live mode nothing extra is printed; effects run normally.
+    # Normal execution path
+    features_df.to_parquet(output_path)
+    ...
 
-Rules enforced
---------------
-- ``DryRunContext.__bool__`` returns ``True`` when dry-run is active so you
-  can use ``if dry:`` to skip mutation blocks.
-- :func:`abort_if_dry_run` raises :class:`DryRunAbort` which the CLI entrypoint
-  catches as a clean success — useful when a command has a single, late
-  mutation that cannot be conditioned easily.
+Documentation
+-------------
+See ``docs/cli_contracts.md`` for the full dry-run contract and the
+recommendation that operators **always run ``--dry-run`` first** before
+executing any state-mutating command in production.
 """
 
 from __future__ import annotations
 
-import logging
 import sys
+from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger(__name__)
 
-_DRY_RUN_BANNER = "[DRY RUN] No data will be written."
-_DRY_RUN_PREFIX = "[dry-run] "
-
-
-class DryRunAbort(Exception):
-    """Raised by :func:`abort_if_dry_run` to stop execution cleanly."""
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 
-class DryRunContext:
-    """Context manager that collects would-be mutations and prints them
-    when in dry-run mode without executing them.
+@dataclass
+class DryRunAction:
+    """A single concrete change that *would* be made if the command ran for real.
 
-    Parameters
+    Attributes
     ----------
-    enabled:
-        ``True`` activates dry-run mode.
-    out:
-        Output stream for dry-run messages. Defaults to ``sys.stdout``.
+    action_type:
+        Verb describing the mutation (e.g. ``"write"``, ``"upsert"``,
+        ``"delete"``, ``"promote"``, ``"send"``).
+    target:
+        The resource that would be affected (file path, table name, API
+        endpoint, …).
+    detail:
+        Optional human-readable elaboration (row counts, date range, etc.).
     """
 
-    def __init__(self, enabled: bool, out: Any = None) -> None:
-        self._enabled = bool(enabled)
-        self._out = out or sys.stdout
-        self._effects: list[str] = []
+    action_type: str
+    target: str
+    detail: str = ""
 
-    # ------------------------------------------------------------------
-    # Context manager protocol
-    # ------------------------------------------------------------------
 
-    def __enter__(self) -> "DryRunContext":
-        if self._enabled:
-            print(_DRY_RUN_BANNER, file=self._out)
-            logger.info(_DRY_RUN_BANNER)
-        return self
+@dataclass
+class DryRunPlan:
+    """A complete dry-run report for one CLI command invocation.
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if self._enabled and not exc_type:
-            if self._effects:
-                print("Would perform the following operations:", file=self._out)
-                for effect in self._effects:
-                    print(f"  {_DRY_RUN_PREFIX}{effect}", file=self._out)
-            else:
-                print(f"  {_DRY_RUN_PREFIX}(no operations to report)", file=self._out)
-        return False  # don't suppress exceptions
+    Attributes
+    ----------
+    command:
+        The CLI command name (e.g. ``"backfill"``, ``"restore"``).
+    actions:
+        Ordered list of :class:`DryRunAction` items — the concrete changes
+        that *would* be made if ``--dry-run`` were not set.
+    extra:
+        Optional additional key/value metadata to append to the report.
+    """
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    command: str
+    actions: list[DryRunAction] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
 
-    def __bool__(self) -> bool:
-        """``True`` when dry-run mode is active."""
-        return self._enabled
+    def add_action(self, action_type: str, target: str, detail: str = "") -> None:
+        """Append a new :class:`DryRunAction` to the plan."""
+        self.actions.append(DryRunAction(action_type, target, detail))
 
-    def record(self, description: str) -> None:
-        """Record an effect that *would* happen (dry-run) or *is* happening (live).
+    def format(self) -> str:
+        """Return a human-readable dry-run report string."""
+        lines: list[str] = [
+            "",
+            "=" * 60,
+            f"🔍 DRY-RUN MODE — {self.command.upper()}",
+            "   No changes will be made.  Review the plan below.",
+            "=" * 60,
+        ]
 
-        In dry-run mode the description is collected and printed at context
-        exit.  In live mode the description is emitted as a DEBUG log so the
-        call is always safe without branching.
-        """
-        self._effects.append(description)
-        if self._enabled:
-            logger.debug("%s%s", _DRY_RUN_PREFIX, description)
+        if not self.actions:
+            lines.append("  (No state-mutating actions identified.)")
         else:
-            logger.debug("Executing: %s", description)
+            lines.append(f"  {len(self.actions)} action(s) would be performed:")
+            for i, action in enumerate(self.actions, start=1):
+                line = f"    {i:2d}. [{action.action_type.upper()}] {action.target}"
+                if action.detail:
+                    line += f"\n        → {action.detail}"
+                lines.append(line)
 
-    @property
-    def effects(self) -> list[str]:
-        """Recorded effect descriptions (read-only snapshot)."""
-        return list(self._effects)
+        for key, value in sorted(self.extra.items()):
+            lines.append(f"  {key}: {value}")
+
+        lines += [
+            "=" * 60,
+            "  Re-run without --dry-run to apply these changes.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def print_report(self, stream=None) -> None:
+        """Print the formatted dry-run report to *stream* (default: stdout)."""
+        out = stream if stream is not None else sys.stdout
+        out.write(self.format())
+        out.flush()
 
 
-def abort_if_dry_run(dry_run: bool, description: str = "") -> None:
-    """Raise :class:`DryRunAbort` when *dry_run* is ``True``.
-
-    Use this at the boundary just before the single irreversible write in a
-    command that is difficult to restructure with a full :class:`DryRunContext`.
-
-    Parameters
-    ----------
-    dry_run:
-        Flag from ``argparse``.
-    description:
-        Human-readable summary of the would-be mutation, printed to stdout.
-    """
-    if dry_run:
-        print(_DRY_RUN_BANNER)
-        if description:
-            print(f"  {_DRY_RUN_PREFIX}{description}")
-        raise DryRunAbort(description)
+# ---------------------------------------------------------------------------
+# Argument parser helper
+# ---------------------------------------------------------------------------
 
 
 def add_dry_run_argument(parser) -> None:
-    """Add the standard ``--dry-run`` flag to an :class:`argparse.ArgumentParser`.
+    """Add a consistent ``--dry-run`` flag to *parser*.
 
-    This helper ensures every command uses an identical flag name, help text,
-    and default so the interface is consistent.
+    All state-mutating CLI commands must call this helper so the flag is
+    defined consistently across the CLI surface.
     """
     parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
         help=(
-            "Report what would change without applying any mutation. "
-            "Recommended before running destructive commands in production."
+            "Report exactly what would change without applying any writes. "
+            "Recommended before running any state-mutating command in production. "
+            "Produces zero side effects."
         ),
     )
+
+
+def check_dry_run(args, plan: DryRunPlan, *, stream=None) -> bool:
+    """If ``args.dry_run`` is True, print the plan and return True.
+
+    The caller should exit immediately after ``check_dry_run`` returns True::
+
+        if check_dry_run(args, plan):
+            sys.exit(0)
+
+    Parameters
+    ----------
+    args:
+        Parsed argument namespace.  Must have a ``dry_run`` attribute.
+    plan:
+        :class:`DryRunPlan` describing the concrete changes that would occur.
+    stream:
+        Output stream (default: ``sys.stdout``).
+
+    Returns
+    -------
+    bool
+        ``True`` if dry-run mode is active (caller should skip all writes),
+        ``False`` otherwise.
+    """
+    if not getattr(args, "dry_run", False):
+        return False
+
+    plan.print_report(stream=stream)
+    return True

@@ -13,16 +13,41 @@ __pycache__/
 .pytest_cache/
 .hypothesis/
 *.snap               # test snapshots (e.g. syrupy)
+__snapshots__/
+# Issue #966 — flaky-test detection and quarantine workflow
+# The quarantine registry is generated at runtime; commit only if you want
+# to track quarantine history in the repo (usually not needed).
+reports/flaky/
+# But keep the empty directory marker if needed
+!reports/flaky/.gitkeep
+
+# Issue #967 — vulnerability scanning outputs (generated at runtime)
+reports/security/
+# security/vuln_exceptions.json IS committed (source-controlled waivers)
+
+# Test snapshots (syrupy and similar snapshot testing tools)
+*.snap
 tests/__snapshots__/
 tests/**/*.snap
 */__snapshots__/
 **/snapshots/
 *.ambr
+# Test caches and artefacts
+.pytest_cache/
+.hypothesis/
 junit*.xml
 test-results/
 test_output/
 # Fuzz corpus (generated at runtime — keep only hand-crafted seeds in VCS)
 tests/fuzz/corpus/generated/
+
+# Generated maturity report and per-module badges (Issue #958)
+# Regenerate with: make maturity-report
+docs/maturity_report.md
+docs/badges/
+
+# Secret-scan reports (generated at runtime — Issue #956)
+reports/secrets_scan_*.json
 
 # Virtual environments
 .venv/
@@ -126,6 +151,7 @@ notebooks/validation_report_*.json
 
 # Coverage reports
 .coverage
+temp_auto_push.bat
 .coverage.*
 htmlcov/
 coverage.xml
@@ -156,8 +182,6 @@ Desktop.ini
 *.swo
 *~
 .idea/
-.vscode/
-.vscode/settings.json
 *.code-workspace
 .project
 .classpath
@@ -251,25 +275,57 @@ dependency_probe_report_*.json
 jwt_public_key.pem
 jwt_private_key.pem
 models/metrics.json.sig
+# Issue #943 — Ed25519 signing keys for audit summaries (never commit private keys)
+audit_signing*.pem
+audit_verify*.pem
+*_priv.pem
+*_signing_key.pem
 
 # Dead-letter queue files (runtime output)
 alerts_dlq.ndjson
 
+# Issue #940 — automated rollback trigger audit logs (runtime-generated JSONL)
+reports/rollback_audit.jsonl
+reports/rollback_audit*.jsonl
+
+# Issue #941 — experiment tracking JSONL store (runtime-generated; use DVC/artifact store for
+# long-term experiment history; the in-repo file is only for local dev/smoke tests)
+models/experiments.jsonl
+# Issue #963 — Migration snapshot test artefacts (generated at runtime)
+tests/migration_snapshots/
+data/migration_test_snapshots/
+migration_snapshot_*.db
+migration_snapshot_*.sqlite
+
+# Issue #961 — CLI audit trail (runtime-generated; not committed)
+data/audit_trail.ndjson
+data/cli_audit_trail.ndjson
+
 # Grafana provisioning secrets
 monitoring/grafana/provisioning/datasources/*.yaml
+branch_structure.json
 
-# -----------------------------------------------------------------------
-# Issues #960-#963 — CLI dry-run, audit logging, confirmation, migration testing
-# -----------------------------------------------------------------------
+# Issue #952-955 additions -----------------------------------------------
 
-# CLI audit log (runtime output, not source)
-logs/cli_audit.ndjson
-logs/
+# Additional snapshot patterns (belt-and-suspenders)
+__snapshots__/
+**/__pycache__/
+*.pyc
 
-# Migration snapshot test artefacts (generated; not committed)
-data/migration_snapshots/
-tests/snapshots/
-migration_test_snapshot_*.db
+# Tox virtualenv artefacts
+.tox/
 
-# Backup/restore runtime outputs (timestamped; never committed)
-backups/
+# Benchmark raw outputs (keep .md reports; exclude generated data files)
+benchmarks/*.json
+benchmarks/*.csv
+
+# Model binary artefacts (any location, not just models/)
+*.joblib
+*.pkl
+*.h5
+
+# Data files at repo root (not just data/ subdir)
+!data/dataset_card.md
+
+# reports/ keep-marker
+!reports/.gitkeep

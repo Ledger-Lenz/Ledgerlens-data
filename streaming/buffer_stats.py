@@ -42,13 +42,19 @@ def start_buffer_stats_logger(
     _stop = stop_event or threading.Event()
 
     def _run() -> None:
+        last_evictions = buffer.evictions_total
         while not _stop.wait(timeout=interval_seconds):
-            wallets = buffer.all_wallets()
-            total = sum(buffer.wallet_trade_count(w) for w in wallets)
+            # stats() also publishes occupancy gauges to Prometheus (Issue #901).
+            s = buffer.stats()
+            evicted = s["evictions_total"] - last_evictions
+            last_evictions = s["evictions_total"]
             logger.info(
-                "FeatureBuffer stats: %d wallet(s), %d total buffered trade(s)",
-                len(wallets),
-                total,
+                "FeatureBuffer stats: %d wallet(s), %d total buffered trade(s), "
+                "occupancy=%.2f, eviction_rate=%.3f/s",
+                s["wallets"],
+                s["trades"],
+                s["occupancy"],
+                evicted / interval_seconds,
             )
 
     t = threading.Thread(target=_run, daemon=True, name="buffer-stats-logger")

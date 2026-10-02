@@ -1,0 +1,32 @@
+{
+  "_comment": "Vulnerability exception waivers for LedgerLens-data (Issue #967).",
+  "_process": "See docs/vulnerability_scanning.md for the exception process and approval requirements.",
+  "_format": {
+    "vuln_id": "CVE or GHSA identifier from pip-audit output",
+    "package": "Affected package name",
+    "version_range": "Affected version range (informational)",
+    "severity": "CRITICAL | HIGH | MEDIUM | LOW",
+    "reason": "Why immediate remediation is not possible",
+    "mitigation": "Compensating controls in place",
+    "tracking_issue": "GitHub issue URL tracking the fix",
+    "approved_by": "GitHub username of approver",
+    "approved_at": "ISO-8601 approval timestamp",
+    "expires": "ISO-8601 expiry date (max 90 days from approval for HIGH/CRITICAL)"
+  },
+  "waivers": [
+    {
+      "_comment": "EXAMPLE WAIVER — demonstrating the exception process per issue #967.",
+      "_note": "This waiver is for documentation purposes. In production, waivers must reference real CVEs.",
+      "vuln_id": "GHSA-EXAMPLE-0000-0000",
+      "package": "example-package",
+      "version_range": "<=1.2.3",
+      "severity": "HIGH",
+      "reason": "The vulnerable code path (example_function) is never reachable from LedgerLens ingestion or detection pipelines. The package is used only in an optional development-time script (scripts/sandbox.py) that never runs in production or CI.",
+      "mitigation": "Production container image is built without dev-only dependencies (see Dockerfile). The vulnerable function is not called anywhere in the call graph (verified by scripts/detect_dead_paths.py).",
+      "tracking_issue": "https://github.com/Ledger-Lenz/Ledgerlens-data/issues/968",
+      "approved_by": "chibeike-AI",
+      "approved_at": "2026-09-28T17:00:00Z",
+      "expires": "2026-12-27T17:00:00Z"
+    }
+  ]
+}

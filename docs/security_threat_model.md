@@ -100,6 +100,7 @@ TRUST BOUNDARIES:
 |----------|--------|--------|---------------------|----------|-----------------|
 | **S** (Spoofing) | Attacker substitutes labelled training dataset | Model learns false positives → no wash trades detected | Training data SHA-256 recorded in `model_metadata.json` | Medium | Implement cryptographic attestation for dataset provenance; store checksums in contract |
 | **T** (Tampering) | Poisoned labels injected into annotation queue | Model trained on mislabelled data | HMAC-SHA256 verification on `data/annotation_queue.json` entries (see `detection/active_learning/annotation_queue.py`) | Medium | Require all annotations signed by annotator's Ed25519 key; audit trail in database |
+| **T** (Tampering) | Backdoor/trojan trigger poisoning: a minority of training samples carry a consistent, attacker-chosen feature pattern (trigger) so the trained model behaves normally except when that trigger is present | Attacker crafts wallets matching the trigger to reliably evade or falsely trigger detection | Activation-clustering backdoor detector (`detection/adversarial/backdoor_detector.py`, Issue #871) flags anomalous minority activation clusters, localizes the candidate trigger feature(s) via a difference-of-means effect size, and auto-quarantines the trained candidate (`detection.model_governance.quarantine_candidate`) when the flagged fraction is unusually large — `promote_candidate` refuses to ever publish a quarantined candidate; the full localization report is written for every training run regardless of outcome, for manual review | Low-Medium (unsupervised heuristic tuned for low false positives — measured clean-model flagged fractions of 25-47% mean auto-quarantine only fires on large-scale poisoning, not subtle small-fraction attacks; does not catch clean-label attacks — see module docstring and docs/adversarial_robustness.md) | Replace per-class k=2 clustering with a supervised spectral-signature SVD pass per Tran et al. (2018) for a cleaner clean/backdoor separation and better recall; require human sign-off workflow UI for quarantined-candidate review |
 | **R** (Repudiation) | Annotator claims they didn't label a wallet as wash trade | False accusation / regulatory dispute | Annotation HMAC includes annotator_id and timestamp | Low | Store signed annotations in immutable ledger; add annotator signature |
 | **I** (Information Disclosure) | Training dataset with sensitive wallet activity exposed | Privacy violation; GDPR/CCPA liability | No explicit redaction; relies on access control to training data | Low | Implement differential privacy in training (DP-SGD via Opacus in `detection/privacy/dp_training.py`) |
 | **D** (Denial of Service) | Retraining process consumes 100% CPU/memory | Scoring pipeline starved of resources | Separate retraining script; can be run off-peak | Medium | Implement resource quotas; add monitoring for training job hangs; timeout after 1 hour |
@@ -111,6 +112,9 @@ TRUST BOUNDARIES:
 - `detection/active_learning/annotation_queue.py` — Annotation integrity
 - `detection/privacy/dp_training.py` — Differentially-private training
 - `scripts/retrain_if_drifted.py` — Automated retraining trigger
+- `detection/adversarial/backdoor_detector.py` — Activation-clustering backdoor detection + trigger localization (Issue #871)
+- `detection/adversarial/robustness.py::run_adversarial_training` — Curriculum-scheduled FGSM adversarial training loop (Issue #872)
+- `detection/model_governance.py::quarantine_candidate` — Auto-quarantine gate for flagged candidates (Issue #871)
 
 ---
 
@@ -249,6 +253,11 @@ TRUST BOUNDARIES:
    - **Risk**: Unauthenticated producers inject fake trades
    - **Entry Control**: SASL/SCRAM authentication; TLS in transit
    - **Dev Guidance**: Enforce TLS and SASL for all brokers; sign messages with HMAC
+
+7. **Model Promotion Quarantine Gate** (`detection/model_governance.py::promote_candidate`)
+   - **Risk**: A candidate model poisoned with a backdoor trigger (Issue #871) reaches production undetected
+   - **Entry Control**: `BACKDOOR_SCAN_ENABLED=true` runs activation-clustering detection after every training run; a flagged candidate is auto-quarantined and `promote_candidate` raises `QuarantinedModelError` for that `candidate_dir` on every subsequent attempt, regardless of whether `backdoor_report` is passed again
+   - **Dev Guidance**: Never bypass `promote_candidate` for a training-pipeline-produced candidate; a quarantined version requires human review (clearing the quarantine currently means promoting a *newly retrained* candidate — there is no "un-quarantine" API by design)
 
 ---
 

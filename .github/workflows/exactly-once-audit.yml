@@ -1,0 +1,57 @@
+name: Exactly-Once Audit
+
+# Scheduled health check (Issue #918): traces sample records through every
+# pipeline stage boundary in staging and fails if any boundary has degraded to
+# at-least-once or at-most-once behaviour. See docs/exactly_once_audit.md.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 04:17 UTC
+    - cron: "17 4 * * *"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run exactly-once audit against staging
+        env:
+          STAGING_REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+          STAGING_RISK_SCORE_DB_URL: ${{ secrets.STAGING_RISK_SCORE_DB_URL }}
+          # Staging's stage TTLs must match production's, so audit them with
+          # production's values rather than whatever the runner defaults to.
+          TRADE_DEDUP_TTL_SECONDS: ${{ vars.TRADE_DEDUP_TTL_SECONDS || '86400' }}
+          KAFKA_DEDUP_TTL_SECONDS: ${{ vars.KAFKA_DEDUP_TTL_SECONDS || '3600' }}
+        run: |
+          if [ -z "$STAGING_REDIS_URL" ] || [ -z "$STAGING_RISK_SCORE_DB_URL" ]; then
+            echo "::error::STAGING_REDIS_URL and STAGING_RISK_SCORE_DB_URL must be set in the staging environment"
+            exit 1
+          fi
+          python -m scripts.audit_exactly_once \
+            --redis-url "$STAGING_REDIS_URL" \
+            --db-url "$STAGING_RISK_SCORE_DB_URL" \
+            --sample-size 5 \
+            --min-ttl-seconds 3600 \
+            --output reports/exactly_once_audit.json
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exactly-once-audit
+          path: reports/exactly_once_audit.json
+          if-no-files-found: ignore
+          retention-days: 30

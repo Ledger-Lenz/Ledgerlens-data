@@ -159,6 +159,88 @@
           "legendFormat": "Memory growth (bytes/s)"
         }
       ]
+    },
+    {
+      "id": 7,
+      "title": "Python Forecast — CPU Trend Line with Confidence Interval",
+      "description": "Trend line and 95% CI computed by the Python CapacityForecaster (OLS linear + weekly seasonal decomposition). Published via ledgerlens_forecast_cpu_ratio. The 1-day and 7-day horizon points show where the forecast model expects utilisation to be. Use this alongside the Prometheus predict_linear panel (panel 4) to cross-validate projections. Data only appears after the Python forecaster has accumulated sufficient history (default: 14 observations).",
+      "type": "timeseries",
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 21},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "Capacity limit (90%)"},
+            "properties": [
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}},
+              {"id": "custom.lineWidth", "value": 2},
+              {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [8, 4]}}
+            ]
+          },
+          {
+            "matcher": {"id": "byRegexp", "options": ".*CI.*"},
+            "properties": [
+              {"id": "custom.fillOpacity", "value": 10},
+              {"id": "custom.lineWidth", "value": 0}
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "avg(ledgerlens_cpu_usage_ratio)",
+          "legendFormat": "Current utilisation"
+        },
+        {
+          "expr": "ledgerlens_forecast_cpu_ratio{horizon_days=\"1\"}",
+          "legendFormat": "Forecast +1 day ({{component}})"
+        },
+        {
+          "expr": "ledgerlens_forecast_cpu_ratio{horizon_days=\"7\"}",
+          "legendFormat": "Forecast +7 days ({{component}})"
+        },
+        {
+          "expr": "vector(0.9)",
+          "legendFormat": "Capacity limit (90%)"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Python Forecast — Days to Capacity Limit",
+      "description": "Days until each metric is projected to reach its configured capacity threshold, as computed by the Python CapacityForecaster. A value of -1 means no crossing is projected (trend is flat or declining). Thresholds: red < 5 days (alert fires), yellow < 14 days (warning), green ≥ 14 days.",
+      "type": "stat",
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 21},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "noValue": "No breach projected",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "orange", "value": 0},
+              {"color": "yellow", "value": 5},
+              {"color": "green", "value": 14}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "graphMode": "none",
+        "colorMode": "background"
+      },
+      "targets": [
+        {
+          "expr": "ledgerlens_forecast_days_to_capacity_limit",
+          "legendFormat": "Days to limit — {{metric}}"
+        }
+      ]
     }
   ]
 }

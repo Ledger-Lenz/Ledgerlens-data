@@ -4,6 +4,12 @@ Detects Stellar wallets linked to Solana addresses through Wormhole bridge
 transactions. Extracts Stellar destination addresses from Wormhole VAA
 (Verified Action Approval) payloads embedded in Solana transactions.
 
+Also classifies Solana addresses as user-controlled wallets vs program-derived
+addresses (PDAs) so program-internal accounting accounts (token vaults,
+associated token accounts, DeFi pool authorities, bridge custody accounts) are
+not misattributed as user wallets in the cross-chain identity graph (#881).
+See ``docs/solana_pda_detection.md``.
+
 References:
     - Wormhole Bridge: https://wormhole.com/
     - Wormhole Program ID (Solana): wormDTL6mgvNpWAoVgqKmqDQMUqr94c3gqPqstQQQm
@@ -12,8 +18,10 @@ References:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
+from dataclasses import dataclass, field
 from typing import Any
 
 import requests
@@ -34,6 +42,317 @@ WORMHOLE_PROGRAM_ID = "wormDTL6mgvNpWAoVgqKmqDQMUqr94c3gqPqstQQQm"
 # For now, we perform basic structure validation. Full verification requires
 # Wormhole client libraries or custom implementation.
 WORMHOLE_INSTRUCTION_PREFIX = bytes.fromhex("d0e81637b694")  # Common Wormhole instruction prefix
+
+
+# ---------------------------------------------------------------------------
+# Program-derived address (PDA) detection (#881)
+# ---------------------------------------------------------------------------
+
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BASE58_INDEX = {ch: i for i, ch in enumerate(_BASE58_ALPHABET)}
+
+# Ed25519 curve parameters (RFC 8032). A PDA is by construction a 32-byte
+# value that does NOT decode to a point on this curve, so no private key can
+# exist for it and it can only be "signed for" by its owning program.
+_ED25519_P = 2**255 - 19
+_ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+
+_PDA_MARKER = b"ProgramDerivedAddress"
+_MAX_SEED_LEN = 32
+_MAX_SEEDS = 16
+
+SYSTEM_PROGRAM_ID = "11111111111111111111111111111111"
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EAFqZ1ALBG8PS3Kd1pJG"
+ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+WORMHOLE_CORE_PROGRAM_ID = "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth"
+WORMHOLE_TOKEN_BRIDGE_PROGRAM_ID = "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb"
+RAYDIUM_AMM_V4_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+ORCA_WHIRLPOOL_PROGRAM_ID = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+MARINADE_PROGRAM_ID = "MarBmsSgKXdrN1egZf5sqe1TMai9K1rChYNDJgjq7aD"
+
+# Program IDs whose owned accounts are program-internal accounting state, not
+# user wallets. To cover a new program, add its ID here (and, if its PDAs use a
+# fixed seed layout, a derivation helper in ``KNOWN_PDA_SEED_PATTERNS``).
+KNOWN_PROGRAM_IDS: dict[str, str] = {
+    TOKEN_PROGRAM_ID: "spl_token",
+    TOKEN_2022_PROGRAM_ID: "spl_token_2022",
+    ASSOCIATED_TOKEN_PROGRAM_ID: "associated_token_account",
+    WORMHOLE_CORE_PROGRAM_ID: "wormhole_core",
+    WORMHOLE_TOKEN_BRIDGE_PROGRAM_ID: "wormhole_token_bridge",
+    RAYDIUM_AMM_V4_PROGRAM_ID: "raydium_amm_v4",
+    ORCA_WHIRLPOOL_PROGRAM_ID: "orca_whirlpool",
+    MARINADE_PROGRAM_ID: "marinade",
+}
+
+# Documented fixed-seed PDA layouts. Each entry maps a pattern name to
+# (program_id, seed layout description). Seeds written as <name> are
+# pubkeys/values supplied by the caller in ``derivation_hints``.
+KNOWN_PDA_SEED_PATTERNS: dict[str, tuple[str, str]] = {
+    "associated_token_account": (
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+        "[<wallet>, <token_program>, <mint>]",
+    ),
+    "wormhole_token_bridge_custody": (WORMHOLE_TOKEN_BRIDGE_PROGRAM_ID, "[<mint>]"),
+    "wormhole_token_bridge_authority_signer": (
+        WORMHOLE_TOKEN_BRIDGE_PROGRAM_ID,
+        '["authority_signer"]',
+    ),
+    "wormhole_token_bridge_custody_signer": (
+        WORMHOLE_TOKEN_BRIDGE_PROGRAM_ID,
+        '["custody_signer"]',
+    ),
+    "raydium_amm_authority": (RAYDIUM_AMM_V4_PROGRAM_ID, '["amm authority"]'),
+    "orca_whirlpool": (
+        ORCA_WHIRLPOOL_PROGRAM_ID,
+        '["whirlpool", <config>, <mint_a>, <mint_b>, <tick_spacing u16 LE>]',
+    ),
+    "marinade_reserve": (MARINADE_PROGRAM_ID, '[<state>, "reserve"]'),
+}
+
+
+def base58_decode(value: str) -> bytes:
+    """Decode a base58 string into raw bytes (leading '1's become zero bytes)."""
+    n = 0
+    for ch in value:
+        try:
+            n = n * 58 + _BASE58_INDEX[ch]
+        except KeyError as exc:
+            raise SolanaValidationError(f"Invalid base58 character {ch!r}") from exc
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(value) - len(value.lstrip("1"))
+    return b"\x00" * pad + body
+
+
+def base58_encode(raw: bytes) -> str:
+    """Encode raw bytes as base58 (leading zero bytes become '1's)."""
+    n = int.from_bytes(raw, "big")
+    out = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        out.append(_BASE58_ALPHABET[r])
+    pad = len(raw) - len(raw.lstrip(b"\x00"))
+    return "1" * pad + "".join(reversed(out))
+
+
+def _pubkey_bytes(value: str | bytes) -> bytes:
+    raw = value if isinstance(value, bytes) else base58_decode(value)
+    if len(raw) != 32:
+        raise SolanaValidationError(f"Solana public key must be 32 bytes, got {len(raw)}")
+    return raw
+
+
+def is_on_ed25519_curve(pubkey: str | bytes) -> bool:
+    """Return True if the 32-byte key decompresses to a valid Ed25519 point.
+
+    Mirrors ``curve25519_dalek::CompressedEdwardsY::decompress`` as used by
+    the Solana runtime: y must be canonical (< p) and x^2 = (y^2 - 1) /
+    (d*y^2 + 1) must be a quadratic residue mod p.
+    """
+    raw = _pubkey_bytes(pubkey)
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _ED25519_P:
+        return False
+    y2 = y * y % _ED25519_P
+    u = (y2 - 1) % _ED25519_P
+    v = (_ED25519_D * y2 + 1) % _ED25519_P
+    x2 = u * pow(v, _ED25519_P - 2, _ED25519_P) % _ED25519_P
+    if x2 == 0:
+        return True
+    return pow(x2, (_ED25519_P - 1) // 2, _ED25519_P) == 1
+
+
+def _seed_bytes(seed: str | bytes | int) -> bytes:
+    if isinstance(seed, bytes):
+        return seed
+    if isinstance(seed, int):
+        return bytes([seed])
+    # Treat strings that decode to a 32-byte pubkey as pubkeys, else UTF-8 text.
+    if validate_solana_address(seed):
+        try:
+            raw = base58_decode(seed)
+            if len(raw) == 32:
+                return raw
+        except SolanaValidationError:
+            pass
+    return seed.encode("utf-8")
+
+
+def create_program_address(seeds: list[str | bytes | int], program_id: str) -> str | None:
+    """Solana ``Pubkey::create_program_address``; None if the result is on-curve."""
+    if len(seeds) > _MAX_SEEDS:
+        raise SolanaValidationError(f"At most {_MAX_SEEDS} seeds are allowed")
+    h = hashlib.sha256()
+    for seed in seeds:
+        raw = _seed_bytes(seed)
+        if len(raw) > _MAX_SEED_LEN:
+            raise SolanaValidationError(f"Seed longer than {_MAX_SEED_LEN} bytes")
+        h.update(raw)
+    h.update(_pubkey_bytes(program_id))
+    h.update(_PDA_MARKER)
+    digest = h.digest()
+    if is_on_ed25519_curve(digest):
+        return None
+    return base58_encode(digest)
+
+
+def find_program_address(seeds: list[str | bytes | int], program_id: str) -> tuple[str, int]:
+    """Solana ``Pubkey::find_program_address``: canonical PDA and bump seed."""
+    for bump in range(255, -1, -1):
+        address = create_program_address([*seeds, bytes([bump])], program_id)
+        if address is not None:
+            return address, bump
+    raise SolanaValidationError("Unable to find a viable program address bump seed")
+
+
+def get_associated_token_address(
+    wallet: str, mint: str, token_program_id: str = TOKEN_PROGRAM_ID
+) -> str:
+    """Derive the associated token account (ATA) PDA for ``wallet`` and ``mint``."""
+    address, _ = find_program_address([wallet, token_program_id, mint], ASSOCIATED_TOKEN_PROGRAM_ID)
+    return address
+
+
+@dataclass(frozen=True)
+class PDADerivationHint:
+    """A candidate derivation to verify an address against."""
+
+    program_id: str
+    seeds: list[str | bytes | int] = field(default_factory=list)
+    pattern: str = "custom"
+
+
+@dataclass(frozen=True)
+class SolanaAddressClassification:
+    """Result of classifying a Solana address.
+
+    ``kind`` is one of:
+      - ``"wallet"``: on-curve key, not owned by a known program (user-controlled).
+      - ``"pda"``: off-curve and verified against a known derivation.
+      - ``"pda_unverified"``: off-curve, so it cannot be a keypair, but no
+        supplied derivation reproduced it.
+      - ``"program"``: the address is itself a known program ID.
+      - ``"program_owned"``: on-curve keypair account owned by a known program
+        (e.g. a non-associated SPL token account).
+      - ``"invalid"``: not a 32-byte base58 public key.
+    """
+
+    address: str
+    kind: str
+    program_id: str | None = None
+    program_name: str | None = None
+    pattern: str | None = None
+    bump: int | None = None
+
+    @property
+    def is_user_wallet(self) -> bool:
+        return self.kind == "wallet"
+
+
+def classify_solana_address(
+    address: str,
+    derivation_hints: list[PDADerivationHint] | None = None,
+    owner_program_id: str | None = None,
+) -> SolanaAddressClassification:
+    """Classify ``address`` as a user wallet or a program-derived/program-owned account.
+
+    Args:
+        address: base58 Solana address.
+        derivation_hints: candidate (program_id, seeds) pairs. When one of them
+            re-derives ``address`` the PDA is attributed to that program.
+        owner_program_id: account owner as reported by ``getAccountInfo``,
+            when known. Accounts owned by a program in ``KNOWN_PROGRAM_IDS``
+            are program-internal even when on-curve.
+    """
+    if not validate_solana_address(address):
+        return SolanaAddressClassification(address=address, kind="invalid")
+    if address in KNOWN_PROGRAM_IDS:
+        return SolanaAddressClassification(
+            address=address,
+            kind="program",
+            program_id=address,
+            program_name=KNOWN_PROGRAM_IDS[address],
+        )
+    try:
+        on_curve = is_on_ed25519_curve(address)
+    except SolanaValidationError:
+        return SolanaAddressClassification(address=address, kind="invalid")
+
+    for hint in derivation_hints or []:
+        try:
+            derived, bump = find_program_address(hint.seeds, hint.program_id)
+        except SolanaValidationError:
+            continue
+        if derived == address:
+            return SolanaAddressClassification(
+                address=address,
+                kind="pda",
+                program_id=hint.program_id,
+                program_name=KNOWN_PROGRAM_IDS.get(hint.program_id),
+                pattern=hint.pattern,
+                bump=bump,
+            )
+
+    if not on_curve:
+        return SolanaAddressClassification(
+            address=address,
+            kind="pda_unverified",
+            program_id=owner_program_id,
+            program_name=KNOWN_PROGRAM_IDS.get(owner_program_id or ""),
+        )
+
+    if owner_program_id and owner_program_id in KNOWN_PROGRAM_IDS:
+        return SolanaAddressClassification(
+            address=address,
+            kind="program_owned",
+            program_id=owner_program_id,
+            program_name=KNOWN_PROGRAM_IDS[owner_program_id],
+        )
+
+    return SolanaAddressClassification(address=address, kind="wallet")
+
+
+NON_USER_ADDRESS_KINDS = frozenset({"pda", "pda_unverified", "program", "program_owned"})
+
+
+def filter_pda_links(
+    links: list[dict[str, Any]],
+    include_pdas: bool | None = None,
+    address_key: str = "solana_address",
+) -> list[dict[str, Any]]:
+    """Drop (or tag) links whose Solana side is a PDA / program-owned account.
+
+    By default (``config.SOLANA_INCLUDE_PDA_EDGES`` false) such links are
+    excluded from the user-identity graph. When included, each surviving link
+    is tagged with ``solana_address_kind`` so downstream consumers can tell
+    them apart.
+    """
+    if include_pdas is None:
+        include_pdas = bool(getattr(config, "SOLANA_INCLUDE_PDA_EDGES", False))
+
+    kept: list[dict[str, Any]] = []
+    for link in links:
+        address = link.get(address_key)
+        if not address:
+            kept.append(link)
+            continue
+        classification = classify_solana_address(
+            address,
+            derivation_hints=link.get("derivation_hints"),
+            owner_program_id=link.get("owner_program_id"),
+        )
+        tagged = {**link, "solana_address_kind": classification.kind}
+        if classification.kind in NON_USER_ADDRESS_KINDS:
+            if not include_pdas:
+                logger.info(
+                    "Excluding %s Solana address %s from identity graph",
+                    classification.kind,
+                    address,
+                )
+                continue
+            tagged["program_id"] = classification.program_id
+        kept.append(tagged)
+    return kept
 
 
 class SolanaValidationError(Exception):
@@ -475,7 +794,7 @@ def resolve_stellar_to_solana(
 
     try:
         deposits = rpc_client.find_wormhole_deposits(stellar_address)
-        return deposits
+        return filter_pda_links(deposits)
     except Exception as exc:
         logger.error("Failed to resolve Stellar %s to Solana: %s", stellar_address, exc)
         return []

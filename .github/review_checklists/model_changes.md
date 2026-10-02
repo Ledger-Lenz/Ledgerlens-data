@@ -2,8 +2,8 @@
 
 > **When to use this checklist:**  
 > A PR touches `detection/model_training.py`, `detection/model_inference.py`,
-> `detection/ensemble_calibrator.py`, `detection/drift_monitor.py`, or the
-> `models/` artifact directory.
+> `detection/ensemble_calibrator.py`, `detection/drift_monitor.py`,
+> `detection/model_governance.py`, or the `models/` artifact directory.
 
 ---
 
@@ -59,12 +59,24 @@
 - [ ] SHAP explainer works on new model (`ShapExplainer.explain()` doesn't crash)
 - [ ] Feature columns coerced to numeric dtypes before model input
 
-### 7. Test coverage
+### 7. Shadow-mode evaluation & promotion gate
+
+- [ ] Shadow-mode scoring runs the candidate model alongside production with **zero effect on live alerts/decisions** (shadow scores never written to alert paths)
+- [ ] Shadow period is mandatory before promotion; candidate cannot be promoted without a completed shadow run
+- [ ] Comparison report generated automatically at the end of the shadow period
+- [ ] Report includes agreement rate and per-pair metric deltas computed via `per_pair_metrics.py`
+- [ ] Promotion gate blocks candidates failing documented acceptance criteria
+- [ ] Any override path requires explicit written justification and is recorded in the audit trail
+- [ ] Acceptance criteria thresholds documented and unchanged (or change justified in PR)
+
+### 8. Test coverage
 
 - [ ] `tests/test_model_training.py` passes
 - [ ] `tests/test_model_inference.py` covers new inference path
 - [ ] `tests/test_ensemble_calibrator.py` covers new calibration logic (if changed)
 - [ ] BFT divergence scenario tested (one model returns anomalous score)
+- [ ] Shadow-mode test verifies zero effect on live alerts
+- [ ] Promotion gate test verifies a failing candidate is blocked without an override
 
 ---
 
@@ -78,6 +90,19 @@
 
 ✅ Pass if all Δ ≥ -0.01 (tolerate up to 1% drop)  
 ❌ Fail if any Δ < -0.01 (regressions must be justified or reverted)
+
+---
+
+## Shadow-mode acceptance criteria
+
+| Metric | Threshold | Pass? |
+|--------|-----------|-------|
+| Agreement rate (candidate vs. production) | ≥ documented minimum | ☐ |
+| Per-pair metric deltas (`per_pair_metrics.py`) | within documented tolerance | ☐ |
+| Shadow period duration | ≥ required minimum | ☐ |
+
+✅ Pass if all criteria met  
+❌ Fail if any criterion unmet — promotion blocked unless an override with justification is recorded
 
 ---
 

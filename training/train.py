@@ -10,6 +10,27 @@ module:
 Usage
 -----
     python -m training.train --data-path data/synthetic_dataset.parquet
+
+Planned for Issue #858 (DANN gradient-reversal schedule)
+--------------------------------------------------------
+This entry point will read the GRL schedule from config and pass it to the
+DANN trainers (detection.dann_adapter / detection.dann_encoder):
+
+    DANN_GRL_SCHEDULE    "annealed" (default) | "static"
+    DANN_GRL_GAMMA       10.0 (default) — steepness of the 0 -> lambda_max ramp
+    DANN_GRL_LAMBDA_MAX  1.0  (default) — final gradient-reversal strength
+
+with matching ``--grl-schedule``, ``--grl-gamma`` and ``--grl-lambda-max``
+CLI flags that override config. The defaults match what dann_adapter.py does
+today (annealed, gamma=10), so existing runs are unchanged. "static"
+reproduces the old dann_encoder behaviour for A/B comparison. The keys also
+go in .env.example (for ``make check-env-example``) and in
+config/settings_validator.py (gamma > 0, lambda_max >= 0).
+
+The training README the issue mentions does not exist yet (training/ has
+only __init__.py, calibration.py and train.py), so this docstring documents
+the defaults. Per-epoch domain/task curves are written through
+mlops.experiment_tracking (see the plan there).
 """
 
 from __future__ import annotations

@@ -345,6 +345,93 @@ class EnsembleCalibrator:
 
 
 # ---------------------------------------------------------------------------
+# Uncertainty-aware score fusion (Issue #856) — implementation plan
+# ---------------------------------------------------------------------------
+#
+# Problem: the weights produced above (and by EnsembleDynamicWeightController
+# below) are fixed per model. They ignore each sub-model's predictive
+# uncertainty, so a low-confidence GNN embedding can dominate a confident
+# tabular model. `RiskScorer.score_with_uncertainty` (detection/model_inference.py)
+# computes per-model conformal intervals but only unions them
+# (min(lowers), max(uppers)); it never feeds them back into the point score.
+#
+# Planned design:
+#
+# 1. `FusionStrategy` enum, defined in detection/meta_learner.py (see the plan
+#    there) and resolved by `resolve_fusion_strategy()`:
+#       FIXED_WEIGHT      — today's behaviour: weights from
+#                           select_operating_point() / dynamic controller.
+#       INVERSE_VARIANCE  — weights derived from conformal interval widths.
+#       STACKED           — a logistic meta-learner over per-model scores and
+#                           interval widths, fitted on the calibration split.
+#    Chosen through a new config key `ENSEMBLE_FUSION_STRATEGY`
+#    (default "fixed_weight", so existing deployments see no change).
+#
+# 2. A pure function in this module:
+#
+#       def fuse_scores(
+#           scores: dict[str, float],            # per-model score, 0-100
+#           intervals: dict[str, tuple[float, float]] | None,  # conformal (lower, upper)
+#           strategy: FusionStrategy,
+#           base_weights: dict[str, float] | None = None,
+#           meta_learner: StackedFusionMetaLearner | None = None,
+#       ) -> FusedScore
+#
+#    returning a slotted dataclass
+#       FusedScore(score: float, lower: float, upper: float,
+#                  weights: dict[str, float], strategy: str)
+#
+#    INVERSE_VARIANCE math, treating each model's conformal half-width as a
+#    proxy standard deviation:
+#       half_width_i = max((upper_i - lower_i) / 2, _MIN_HALF_WIDTH)
+#       w_i          = base_w_i / half_width_i**2      (base_w_i defaults to 1)
+#       w            = w / sum(w)
+#       score        = sum(w_i * score_i)
+#       half_width   = sqrt(1 / sum(base_w_i / half_width_i**2))   (renormalised)
+#       [lower, upper] = clip(score -/+ half_width, 0, 100)
+#    `_MIN_HALF_WIDTH` (e.g. 0.5 score points) stops a degenerate zero-width
+#    interval from taking all the weight. Models with no calibrator (the
+#    current [0, 100] placeholder) get half_width = 50, so they are
+#    down-weighted instead of excluded. A per-model weight cap (reuse
+#    `_DYNAMIC_WEIGHT_MAX`) keeps the fusion robust against one model with an
+#    over-tight interval; this keeps the spirit of the BFT trimmed mean.
+#
+#    FIXED_WEIGHT fused interval: the weighted average of the per-model
+#    bounds, which is tighter than today's union but still conservative.
+#
+#    Note: split-conformal intervals from ConformalCalibrator have a constant
+#    width per model (2 * q_hat), apart from clipping at 0/100. So
+#    INVERSE_VARIANCE weights are per model rather than per row until a
+#    locally adaptive (normalised) nonconformity score is added. That is
+#    still what the issue asks for: a model calibrated as uncertain is
+#    down-weighted everywhere.
+#
+# 3. Wiring:
+#    - `RiskScorer.score_with_uncertainty` calls `fuse_scores(...)` instead
+#      of taking min/max, and emits `fused_score_lower`, `fused_score_upper`
+#      and `fusion_strategy`. Existing `score_lower` / `score_upper` keep
+#      their current union semantics, so current consumers are unchanged.
+#    - The plain `score()` path is untouched when the strategy is
+#      FIXED_WEIGHT.
+#
+# 4. Tests (tests/test_ensemble_fusion.py), all synthetic, no model files:
+#    - confident model (interval 45-55) + uncertain model (interval 0-100):
+#      the fused score lands near the confident model's score and its weight
+#      is > 0.9.
+#    - two equally confident models: equal weights, and the fused score is
+#      their mean.
+#    - fused interval is never wider than the widest input and stays in
+#      [0, 100].
+#    - zero-width interval: no division by zero, weight capped.
+#    - FIXED_WEIGHT reproduces the current weighted-average score exactly
+#      (regression guard).
+#    - STACKED: fits on a toy calibration set where one model is noise and
+#      learns to ignore it.
+#    - invalid strategy string in config raises a ValueError naming the
+#      allowed values.
+
+
+# ---------------------------------------------------------------------------
 # Dynamic weight adjustment based on observed per-model false positive rates
 # ---------------------------------------------------------------------------
 

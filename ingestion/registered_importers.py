@@ -74,6 +74,7 @@ __all__ = [
 
 
 @register_importer(
+    strict=True,
     name="horizon_streamer",
     description="""Real-time trade streaming via Horizon Server-Sent Events (SSE).
     
@@ -146,6 +147,7 @@ class HorizonStreamerRegistry:
 
 
 @register_importer(
+    strict=True,
     name="historical_loader",
     description="""Bulk historical trade loading via Horizon's paginated REST API.
     
@@ -238,6 +240,7 @@ class HistoricalLoaderRegistry:
 
 
 @register_importer(
+    strict=True,
     name="orderbook_loader",
     description="""Order-book event ingestion via Horizon's operations endpoint.
     
@@ -306,6 +309,7 @@ class OrderbookLoaderRegistry:
 
 
 @register_importer(
+    strict=True,
     name="account_activity_loader",
     description="""Account creation and funding data via Horizon's effects endpoint.
     
@@ -365,6 +369,7 @@ class AccountActivityLoaderRegistry:
 
 
 @register_importer(
+    strict=True,
     name="amm_pool_loader",
     description="""AMM liquidity pool trade ingestion via Horizon's pool endpoints.
     
@@ -453,11 +458,13 @@ class AMMPoolLoaderRegistry:
 
 
 @register_importer(
+    strict=True,
     name="asset_metadata_fetcher",
     description="""Asset metadata fetcher for circulating supply from Horizon.
     
     Fetches and caches asset circulating supply with 1-hour TTL. Supports both
-    Redis distributed cache and in-process fallback.
+    Redis distributed cache and in-process fallback. Every record carries a
+    trust tier and staleness (primary -> cache -> alternate fallback chain).
     
     Key features:
     - Metadata enrichment: Circulating supply for liquidity scoring
@@ -505,6 +512,26 @@ class AssetMetadataFetcherRegistry:
             redis_client=redis_client,
         )
 
+    @staticmethod
+    def get_asset_metadata(
+        asset_code: str,
+        asset_issuer: str,
+        horizon_url: str,
+        redis_client=None,
+        alternate_horizon_url: str | None = None,
+    ) -> asset_metadata_fetcher.AssetMetadataRecord:
+        """Fetch asset metadata labelled with its trust tier and staleness.
+
+        See asset_metadata_fetcher.get_asset_metadata() for the fallback chain.
+        """
+        return asset_metadata_fetcher.get_asset_metadata(
+            asset_code=asset_code,
+            asset_issuer=asset_issuer,
+            horizon_url=horizon_url,
+            redis_client=redis_client,
+            alternate_horizon_url=alternate_horizon_url,
+        )
+
 
 # ============================================================================
 # 7. Payment Path Analyzer (Multi-hop wash trade detection)
@@ -512,6 +539,7 @@ class AssetMetadataFetcherRegistry:
 
 
 @register_importer(
+    strict=True,
     name="payment_path_analyzer",
     description="""Payment path analysis for multi-hop wash trade routing detection.
     

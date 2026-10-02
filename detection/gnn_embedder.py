@@ -16,6 +16,12 @@ from torch_geometric.nn import SAGEConv
 class WalletGraphSAGE(nn.Module):
     """Inductive GraphSAGE encoder with a binary wallet classifier head."""
 
+    # Issue #857 audit: this model has no node-id embedding table, so it can
+    # embed unseen wallets from their features. Planned change: train with
+    # torch_geometric.loader.NeighborLoader using the same `num_neighbors`
+    # fan-out as GNNEncoder.encode_inductive, so the inference-time sampled
+    # neighbourhoods match what the model saw in training.
+
     def __init__(
         self,
         input_dim: int,

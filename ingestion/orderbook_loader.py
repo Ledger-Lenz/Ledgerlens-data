@@ -178,3 +178,80 @@ def load_accounts_orderbook_events(account_ids: list[str]) -> pd.DataFrame:
     if not frames:
         return orderbook_events_to_dataframe(iter([]))
     return pd.concat(frames, ignore_index=True)
+
+
+class SequenceGapError(Exception):
+    """Raised internally when an incremental update skips a sequence number."""
+
+
+class OrderBookState:
+    """Order book maintained from a snapshot + incremental update stream.
+
+    Every update must carry `sequence == last_sequence + 1`. On a gap the
+    current book is discarded and a fresh snapshot is fetched via
+    `snapshot_fetcher()` before incremental application resumes. Updates
+    older than the snapshot sequence are ignored.
+
+    Snapshot shape: {"sequence": int, "bids": {price: qty}, "asks": {price: qty}}
+    Update shape:   {"sequence": int, "side": "bids"|"asks", "price": float, "qty": float}
+    (qty == 0 removes the level).
+    """
+
+    def __init__(self, snapshot_fetcher, resync_alert_threshold: int = 5):
+        self._fetch_snapshot = snapshot_fetcher
+        self.resync_alert_threshold = resync_alert_threshold
+        self.metrics = {"resync_count": 0, "updates_applied": 0, "updates_skipped": 0}
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+        self.sequence = -1
+        self._load_snapshot()
+
+    def _load_snapshot(self) -> None:
+        snap = self._fetch_snapshot()
+        self.bids = dict(snap.get("bids", {}))
+        self.asks = dict(snap.get("asks", {}))
+        self.sequence = int(snap["sequence"])
+
+    def resync(self) -> None:
+        self.metrics["resync_count"] += 1
+        logger.warning(
+            "Order book sequence gap at %s; resyncing (resync #%d)",
+            self.sequence,
+            self.metrics["resync_count"],
+        )
+        if self.metrics["resync_count"] >= self.resync_alert_threshold:
+            logger.error(
+                "Order book resynced %d times; investigate upstream feed",
+                self.metrics["resync_count"],
+            )
+        self._load_snapshot()
+
+    def _apply(self, update: dict) -> None:
+        seq = int(update["sequence"])
+        if seq <= self.sequence:
+            self.metrics["updates_skipped"] += 1
+            return
+        if seq != self.sequence + 1:
+            raise SequenceGapError(f"expected {self.sequence + 1}, got {seq}")
+        book = self.bids if update["side"] == "bids" else self.asks
+        if float(update["qty"]) == 0:
+            book.pop(update["price"], None)
+        else:
+            book[update["price"]] = float(update["qty"])
+        self.sequence = seq
+        self.metrics["updates_applied"] += 1
+
+    def apply_update(self, update: dict) -> None:
+        try:
+            self._apply(update)
+        except SequenceGapError:
+            self.resync()
+            # The fresh snapshot may already include this update.
+            if int(update["sequence"]) == self.sequence + 1:
+                self._apply(update)
+            elif int(update["sequence"]) <= self.sequence:
+                self.metrics["updates_skipped"] += 1
+
+    def apply_updates(self, updates: Iterable[dict]) -> None:
+        for u in updates:
+            self.apply_update(u)

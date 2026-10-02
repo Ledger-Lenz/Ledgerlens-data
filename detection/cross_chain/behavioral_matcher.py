@@ -1,11 +1,19 @@
 """Behavioral fingerprint matcher.
 
 Links wallet addresses across chains by analyzing trade amounts and timing.
+
+``match_jitter_robust`` (#882) is the adversarially robust variant: it scores
+source/destination legs of a cross-chain transfer by a fee-aware amount
+fingerprint and a heavy-tailed delay prior instead of a hard time window, so
+an adversary adding random delay between the legs no longer defeats matching.
+See docs/cross_chain_jitter_matching.md for assumptions and limitations.
 """
 
 from __future__ import annotations
 
+import bisect
 import logging
+import math
 from datetime import datetime
 from typing import Any
 
@@ -232,4 +240,182 @@ class BehavioralMatcher:
                         }
                     )
 
+        return links
+
+    @staticmethod
+    def match_jitter_robust(
+        stellar_txs: list[dict[str, Any]],
+        external_txs: list[dict[str, Any]],
+        fee_models: list[tuple[float, float]] | None = None,
+        amount_tolerance: float = 0.0005,
+        max_delay_seconds: float = 6 * 3600.0,
+        max_clock_skew_seconds: float = 120.0,
+        typical_delay_seconds: float = 120.0,
+        adversarial_mix: float = 0.5,
+        min_confidence: float = 0.6,
+        density_band: float = 20.0,
+        match_prior: float = 0.5,
+    ) -> list[dict[str, Any]]:
+        """Match cross-chain transfer legs robustly to deliberate timing jitter.
+
+        Treat each Stellar leg ``s`` as the source and each external leg ``e``
+        arriving within ``[-max_clock_skew_seconds, max_delay_seconds]`` as a
+        candidate destination. The likelihood that ``e`` is ``s``'s other leg is
+
+            L(s, e) = A(rel) * D(dt)
+
+        * ``A`` — amount fingerprint: ``rel = |e.amount - expected| / s.amount``
+          where ``expected = s.amount * (1 - rate) - fixed`` for the best
+          fitting ``(fixed, rate)`` in ``fee_models`` (default: no fee). ``A``
+          is a Gaussian in ``rel`` with sigma ``amount_tolerance / 2``,
+          truncated at ``amount_tolerance``.
+        * ``D`` — delay prior: a mixture of an exponential with mean
+          ``typical_delay_seconds`` (honest bridge latency) and a uniform over
+          the whole window (an adversary may pick any delay).
+          ``adversarial_mix`` is the uniform's weight.
+
+        Candidates are normalised against each other *and* against a null
+        hypothesis (the true destination is not among them, i.e. every
+        candidate is background traffic), giving a posterior per pair. The
+        null weight is distribution-aware: it grows with the number of chance
+        matches expected in the window for this amount, estimated from how
+        often the amount occurs across the whole external set. Popular round
+        amounts therefore need tighter timing to be linked than distinctive
+        ones. ``match_prior`` is the prior probability that a source leg's
+        destination is present in ``external_txs`` at all; the null weight is
+        scaled by the prior odds ``(1 - match_prior) / match_prior``. Set it
+        from the observed base rate (e.g. the share of bridge deposits whose
+        destination chain is ingested); a value that is too high trades
+        precision for recall in dense traffic. Pairs
+        are then assigned one-to-one greedily by posterior, and kept when the
+        posterior is ``>= min_confidence``.
+
+        Input records use the same shape as :meth:`match_amount_fingerprints`.
+        """
+        fee_models = fee_models or [(0.0, 0.0)]
+        sigma = amount_tolerance / 2.0
+        window = max_delay_seconds + max_clock_skew_seconds
+        uniform_density = 1.0 / window
+        # Null likelihood: a borderline (2-sigma) amount match at a delay the
+        # honest-latency component considers implausible.
+        null_likelihood = math.exp(-2.0) * adversarial_mix * uniform_density
+
+        if not 0.0 < match_prior < 1.0:
+            raise ValueError("match_prior must be in (0, 1)")
+        prior_odds = (1.0 - match_prior) / match_prior
+        skew_scale = max(max_clock_skew_seconds / 10.0, 1e-9)
+
+        def delay_density(dt: float) -> float:
+            # The destination leg cannot precede the source except by clock
+            # skew, so negative delays decay quickly instead of scoring as 0 s.
+            decay = dt / typical_delay_seconds if dt >= 0 else -dt / skew_scale
+            honest = math.exp(-decay) / typical_delay_seconds
+            return (1 - adversarial_mix) * honest + adversarial_mix * uniform_density
+
+        s_records = []
+        for tx in stellar_txs:
+            try:
+                s_records.append(
+                    (
+                        tx["wallet"],
+                        to_timestamp(tx["timestamp"]),
+                        float(tx["amount"]),
+                        tx.get("id", tx.get("tx_id", "")),
+                    )
+                )
+            except Exception as e:
+                logger.warning("Skipping invalid Stellar record: %s. Error: %s", tx, e)
+        ext_records = []
+        for tx in external_txs:
+            try:
+                ext_records.append(
+                    (
+                        to_timestamp(tx["timestamp"]),
+                        float(tx["amount"]),
+                        tx["wallet"],
+                        tx.get("chain", "ethereum").lower(),
+                        tx.get("id", tx.get("tx_id", "")),
+                    )
+                )
+            except Exception as e:
+                logger.warning("Skipping invalid external record: %s. Error: %s", tx, e)
+        ext_records.sort(key=lambda r: r[0])
+        ext_times = [r[0] for r in ext_records]
+        ext_amounts = sorted(r[1] for r in ext_records)
+        span = max(ext_times[-1] - ext_times[0], window) if ext_times else window
+
+        def count_near(center: float, half_width: float) -> int:
+            return bisect.bisect_right(ext_amounts, center + half_width) - bisect.bisect_left(
+                ext_amounts, center - half_width
+            )
+
+        def chance_matches(expected: float, s_amt: float) -> float:
+            """Expected background amount collisions inside one window.
+
+            Takes the larger of the exact-band count (minus the true leg; this
+            catches spikes at popular round amounts) and the smoothed local
+            density from a band ``density_band`` times wider (which catches
+            dense traffic where a lone collision is still likely chance).
+            """
+            tol = amount_tolerance * s_amt
+            exact = max(count_near(expected, tol) - 1, 0)
+            smoothed = count_near(expected, tol * density_band) / density_band
+            return max(exact, smoothed) * window / span
+
+        candidates: list[tuple[float, int, int, float, float]] = []
+        for si, (_, s_time, s_amt, _) in enumerate(s_records):
+            if s_amt <= 0:
+                continue
+            lo = bisect.bisect_left(ext_times, s_time - max_clock_skew_seconds)
+            hi = bisect.bisect_right(ext_times, s_time + max_delay_seconds)
+            scored = []
+            chance = min(
+                chance_matches(s_amt * (1 - rate) - fixed, s_amt) for fixed, rate in fee_models
+            )
+            for ei in range(lo, hi):
+                e_time, e_amt = ext_records[ei][0], ext_records[ei][1]
+                rel = min(
+                    abs(e_amt - (s_amt * (1 - rate) - fixed)) / s_amt for fixed, rate in fee_models
+                )
+                if rel > amount_tolerance:
+                    continue
+                dt = e_time - s_time
+                likelihood = math.exp(-0.5 * (rel / sigma) ** 2) * delay_density(dt)
+                scored.append((likelihood, ei, rel, dt))
+            null = (null_likelihood + chance * uniform_density) * prior_odds
+            total = sum(lk for lk, *_ in scored) + null
+            for likelihood, ei, rel, dt in scored:
+                candidates.append((likelihood / total, si, ei, rel, dt))
+
+        links = []
+        used_s: set[int] = set()
+        used_e: set[int] = set()
+        for posterior, si, ei, rel, dt in sorted(candidates, key=lambda c: -c[0]):
+            if posterior < min_confidence:
+                break
+            if si in used_s or ei in used_e:
+                continue
+            used_s.add(si)
+            used_e.add(ei)
+            s_wallet, s_time, s_amt, s_id = s_records[si]
+            e_time, e_amt, e_wallet, chain, e_id = ext_records[ei]
+            links.append(
+                {
+                    "stellar_address": s_wallet,
+                    "linked_address": e_wallet,
+                    "chain": chain,
+                    "confidence": float(posterior),
+                    "metadata": {
+                        "stellar_tx_id": s_id,
+                        "external_tx_id": e_id,
+                        "stellar_amount": s_amt,
+                        "external_amount": e_amt,
+                        "stellar_timestamp": s_time,
+                        "external_timestamp": e_time,
+                        "delay_seconds": dt,
+                        "amount_residual": rel,
+                        "type": "jitter_robust_fingerprint",
+                    },
+                }
+            )
         return links

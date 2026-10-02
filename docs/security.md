@@ -224,3 +224,13 @@ check_export_permission(current_user.permissions)  # raises PermissionError if n
 
 Only users with the `forensic_export` permission may trigger exports with
 decrypted addresses.
+
+
+## File scanning for historical uploads
+
+`ingestion/secure_file_handler.py` scans every file before parsing. The
+default `NoOpScanner` logs a warning that scanning is inactive. Enable the
+hash-based scanner with
+`set_scanner(HashListScanner())` (uses `data/denylist.json` /
+`data/allowlist.json`, lists of SHA-256 hex digests), or plug in ClamAV by
+implementing `FileScanner.scan(path) -> ScanResult`.

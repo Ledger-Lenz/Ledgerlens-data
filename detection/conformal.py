@@ -1,5 +1,179 @@
 """Conformal Prediction calibration and inference.
 
+# =============================================================================
+# Issue #859 — Formalize conformal prediction coverage guarantees under
+# distribution shift
+# https://github.com/Ledger-Lenz/Ledgerlens-data/issues/859
+#
+# ─── PROBLEM ─────────────────────────────────────────────────────────────────
+#
+# The current ConformalCalibrator assumes exchangeability of calibration and
+# test data. When drift_monitor.py detects covariate shift (PSI > threshold),
+# the conformal coverage guarantee is silently invalidated — the q_hat computed
+# on the original calibration set is no longer valid for the shifted
+# distribution, but no user-facing signal is emitted.
+#
+# ─── PROPOSED IMPLEMENTATION ─────────────────────────────────────────────────
+#
+# Step 1 — Weighted/adaptive conformal calibration (ACI or Mondrian)
+# ------------------------------------------------------------------
+# Two complementary approaches; implement both, selecting via config:
+#
+# APPROACH A: Covariate-shift-weighted conformal (Tibshirani et al. 2019)
+# -----------------------------------------------------------------------
+# Weight each calibration sample by an importance ratio:
+#   w_i = p_test(x_i) / p_cal(x_i)
+#
+# In practice, estimate weights using a density ratio classifier:
+#   fit classifier C on (X_cal labeled 0, X_test labeled 1)
+#   w_i = C.predict_proba(x_i)[1] / C.predict_proba(x_i)[0]
+#
+# Replace the unweighted quantile in _calibrate_*:
+#   # Weighted quantile
+#   w = np.array(weights) / np.array(weights).sum()
+#   sorted_idx = np.argsort(nonconformity)
+#   cum_w = np.cumsum(w[sorted_idx])
+#   q_hat = nonconformity[sorted_idx][np.searchsorted(cum_w, 1 - alpha)]
+#
+# APPROACH B: Mondrian conformal by drift regime
+# ------------------------------------------------
+# Partition calibration samples into drift regimes based on DriftReport:
+#   regime 0 = PSI < 0.1   (no drift)
+#   regime 1 = 0.1 <= PSI < 0.25  (moderate drift)
+#   regime 2 = PSI >= 0.25  (significant drift)
+#
+# Compute a separate q_hat per regime. At inference time, look up the
+# regime of the current request (from LiveDriftMonitor.update()) and use
+# the matching q_hat:
+#
+#   class MondricanConformalCalibrator(ConformalCalibrator):
+#       def calibrate_by_regime(self, model, X_cal, y_cal, regimes):
+#           for regime in set(regimes):
+#               mask = [r == regime for r in regimes]
+#               X_r, y_r = X_cal[mask], y_cal[mask]
+#               # Compute q_hat_r for this regime
+#               self._q_hat_by_regime[regime] = ...
+#
+#       def predict_set(self, model, X, drift_regimes=None):
+#           # Use regime-specific q_hat
+#           ...
+#
+# Step 2 — Wire drift_monitor.py output into calibration weighting
+# ----------------------------------------------------------------
+# Add a method to ConformalCalibrator:
+#
+#   def recalibrate_with_drift_weights(
+#       self,
+#       model,
+#       X_cal: pd.DataFrame,
+#       y_cal: pd.Series,
+#       drift_report: DriftReport,
+#       psi_cap: float = 5.0,
+#   ) -> None:
+#       """Recompute q_hat weighting calibration samples by their drift exposure.
+#
+#       For each calibration sample, the weight is 1 / (1 + max_psi_of_its_features).
+#       Samples from high-drift feature directions are down-weighted so the
+#       quantile is driven by the low-drift (more reliable) samples.
+#       """
+#       drifted_features = {f["feature"]: f["psi"] for f in drift_report.features
+#                           if f["drift_flag"]}
+#       weights = []
+#       for i in range(len(X_cal)):
+#           row_psi = max(
+#               (drifted_features.get(col, 0.0) for col in X_cal.columns),
+#               default=0.0
+#           )
+#           weights.append(1.0 / (1.0 + min(row_psi, psi_cap)))
+#       # Use weighted quantile with these weights
+#       self._recalibrate_weighted(model, X_cal, y_cal, np.array(weights))
+#
+# Step 3 — Coverage-confidence flag on every emitted risk score
+# -------------------------------------------------------------
+# Add a `coverage_confidence` field to every result returned by
+# predict_set() and predict_with_interval():
+#
+#   {
+#     "score": 74.2,
+#     "prediction_set": [1],
+#     "coverage_guarantee": 0.90,
+#     "q_hat": 0.23,
+#     "coverage_confidence": "low",  ← NEW: "high" | "moderate" | "low"
+#     "drift_context": {             ← NEW: populated when drift detected
+#       "drifted_features": ["benford_mad_24h", "round_trip_frequency"],
+#       "max_psi": 0.41,
+#     }
+#   }
+#
+# coverage_confidence is computed from the current PSI:
+#   PSI < 0.1  → "high"     (guarantee is well-founded)
+#   PSI < 0.25 → "moderate" (moderate drift, coverage may be slightly off)
+#   PSI >= 0.25 → "low"     (significant drift, guarantee is unreliable)
+#
+# Step 4 — Surface low-confidence flags in forensic_report.py
+# -----------------------------------------------------------
+# forensic_report.py should include a "conformal_coverage_warning" section
+# when any scored transaction's coverage_confidence is "low":
+#
+#   {
+#     "conformal_coverage_warning": {
+#       "active": true,
+#       "reason": "PSI drift detected on features: benford_mad_24h (PSI=0.41)",
+#       "affected_scores": 12,
+#       "recommendation": "Recalibrate conformal predictor on recent data."
+#     }
+#   }
+#
+# ─── EMPIRICAL COVERAGE TEST ─────────────────────────────────────────────────
+#
+# Add tests/test_conformal_under_shift.py:
+#
+#   def test_coverage_under_covariate_shift():
+#       """Empirical coverage on a synthetic shifted test set stays within
+#       ±2% of the nominal target (90% coverage)."""
+#       rng = np.random.default_rng(42)
+#       # Calibration: N(0, 1) features
+#       X_cal = pd.DataFrame(rng.normal(0, 1, (500, 10)),
+#                            columns=[f"f{i}" for i in range(10)])
+#       y_cal = pd.Series((X_cal.sum(axis=1) > 0).astype(int))
+#       # Shifted test: N(2, 1) features (covariate shift)
+#       X_test = pd.DataFrame(rng.normal(2, 1, (200, 10)),
+#                             columns=[f"f{i}" for i in range(10)])
+#       y_test = pd.Series((X_test.sum(axis=1) > 0).astype(int))
+#
+#       # Weighted calibration
+#       calibrator = ConformalCalibrator(alpha=0.10)
+#       calibrator.recalibrate_with_drift_weights(model, X_cal, y_cal, drift_report)
+#       results = calibrator.predict_set(model, X_test)
+#       empirical_coverage = np.mean([
+#           y_test.iloc[i] in r["prediction_set"] for i, r in enumerate(results)
+#       ])
+#       assert abs(empirical_coverage - 0.90) <= 0.02
+#
+# ─── ACCEPTANCE CRITERIA MAPPING ─────────────────────────────────────────────
+#
+#  ✅  Empirical coverage stays within ±2% of nominal target under shift
+#      → tests/test_conformal_under_shift.py
+#
+#  ✅  Flagged low-confidence scores visible in forensic_report.py
+#      → coverage_confidence field in every result; warning in forensic report
+#
+#  ✅  Unit tests for weighting function with adversarially shifted calibration data
+#      → tests/test_conformal_under_shift.py::test_weighting_with_adversarial_shift
+#
+# ─── FILES TO MODIFY ─────────────────────────────────────────────────────────
+#
+#   detection/conformal.py          ← (THIS FILE) weighted calibration,
+#                                      Mondrian by drift regime,
+#                                      coverage_confidence field
+#   detection/drift_monitor.py      ← export DriftReport.max_psi() helper
+#   forensic_report.py              ← add conformal_coverage_warning section
+#   tests/test_conformal_under_shift.py  ← new test file
+#   config.py                       ← CONFORMAL_DRIFT_RECAL_PSI_THRESHOLD (0.1),
+#                                      CONFORMAL_WEIGHTED_MODE ("weighted"|"mondrian")
+#
+# =============================================================================
+
 Implements split conformal prediction (classification with RAPS extension
 and regression framing) producing distribution-free prediction intervals
 at a user-specified coverage level (default 90%).

@@ -7,6 +7,31 @@ import redis
 SCORE_NORM_WINDOW_SIZE = 1000
 SCORE_NORM_MIN_SAMPLES = 50
 
+# Keep this list aligned with detection.model_training.MODEL_REGISTRY.  The
+# normaliser is deliberately model-agnostic: all registered estimators emit a
+# raw anomaly score that is calibrated with the same per-pair percentile rule.
+REGISTERED_MODEL_TYPES = ("random_forest", "xgboost", "lightgbm")
+
+# Percentile calibration preserves ordering within one model/pair/window. It
+# does not make independently calibrated model outputs comparable in absolute
+# terms across models or asset pairs.
+DIRECT_COMPARISON_MATRIX = {
+    model: {other: model == other for other in REGISTERED_MODEL_TYPES}
+    for model in REGISTERED_MODEL_TYPES
+}
+
+
+def is_directly_comparable(model_a: str, model_b: str) -> bool:
+    """Return whether normalized scores may be compared directly.
+
+    Direct comparison is safe only for the same registered model type (and
+    only when the pair/window calibration context is also the same).
+    """
+    if model_a not in REGISTERED_MODEL_TYPES or model_b not in REGISTERED_MODEL_TYPES:
+        raise ValueError(f"unknown model type: {model_a!r} or {model_b!r}")
+    return DIRECT_COMPARISON_MATRIX[model_a][model_b]
+
+
 ASSET_PAIR_ALLOWLIST = {
     "USDC:GA5ZSEJYBY3RJRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
 }

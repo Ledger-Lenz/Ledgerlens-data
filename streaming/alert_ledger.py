@@ -30,7 +30,12 @@ from typing import Any, Literal
 from config import config
 from pipeline.exactly_once import DedupKey, ExactlyOnceStore, SqlExactlyOnceBackend
 
-AlertOutcome = Literal["delivered", "dead_lettered", "suppressed_cooldown"]
+AlertOutcome = Literal[
+    "in_flight", "delivered", "dead_lettered", "suppressed_cooldown", "reconciled_skipped"
+]
+
+# Outcomes that close out an ``in_flight`` intent for a given idempotency key.
+TERMINAL_OUTCOMES = frozenset({"delivered", "dead_lettered", "reconciled_skipped"})
 
 
 @dataclass(frozen=True)
@@ -41,6 +46,8 @@ class AlertDeliveryRecord:
     outcome: AlertOutcome
     channel: str
     reason: str | None
+    idempotency_key: str | None = None
+    risk_score: dict | None = None
 
 
 class AlertDeliveryLedger:
@@ -69,6 +76,7 @@ class AlertDeliveryLedger:
         *,
         channel: str,
         reason: str | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
         key = self._key(wallet, pair_id, risk_score)
         self._store.commit(
@@ -80,8 +88,35 @@ class AlertDeliveryLedger:
                 "outcome": outcome,
                 "channel": channel,
                 "reason": reason,
+                "idempotency_key": idempotency_key,
+                "risk_score": risk_score,
             },
         )
+
+    def is_delivered(self, idempotency_key: str) -> bool:
+        """True if a terminal outcome is already recorded for *idempotency_key*."""
+        return any(
+            r.idempotency_key == idempotency_key and r.outcome in TERMINAL_OUTCOMES
+            for r in self.all_records()
+        )
+
+    def in_flight(self) -> list[AlertDeliveryRecord]:
+        """Return ``in_flight`` intents with no matching terminal outcome.
+
+        These are alerts whose external call may or may not have happened
+        because the dispatcher died between recording intent and outcome.
+        """
+        records = self.all_records()
+        closed = {
+            r.idempotency_key
+            for r in records
+            if r.idempotency_key and r.outcome in TERMINAL_OUTCOMES
+        }
+        pending: dict[str, AlertDeliveryRecord] = {}
+        for r in records:
+            if r.outcome == "in_flight" and r.idempotency_key and r.idempotency_key not in closed:
+                pending[r.idempotency_key] = r
+        return list(pending.values())
 
     def for_wallet_pair(self, wallet: str, pair_id: str) -> list[AlertDeliveryRecord]:
         """Return every recorded dispatch outcome for a (wallet, pair_id)."""
@@ -116,6 +151,8 @@ class AlertDeliveryLedger:
                     outcome=payload.get("outcome"),
                     channel=payload.get("channel", ""),
                     reason=payload.get("reason"),
+                    idempotency_key=payload.get("idempotency_key"),
+                    risk_score=payload.get("risk_score"),
                 )
             )
         return out

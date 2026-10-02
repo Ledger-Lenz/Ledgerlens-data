@@ -1,4 +1,4 @@
-"""Audit-ready summaries for anomaly investigation outputs.
+"""Audit-ready summaries for anomaly investigation outputs — Issue #943.
 
 Produces structured, tamper-evident summary documents from anomaly
 investigation results that are suitable for compliance review, regulatory
@@ -11,25 +11,52 @@ Each ``AuditSummary`` includes:
 - A SHA-256 integrity hash over all fields (excluding the hash itself).
 - An optional chain-of-custody record linking to prior summaries.
 
-Usage::
+Issue #943 additions — cryptographic signing
+--------------------------------------------
+Exported audit summaries can now be **Ed25519-signed** so that any downstream
+recipient can verify the report has not been altered since generation.
 
-    from reporting.audit_summary import AuditSummaryBuilder
+Signing::
 
-    builder = AuditSummaryBuilder()
-    summary = builder.build(forensic_report.to_dict())
-    assert summary.verify_integrity()
+    from reporting.audit_summary import AuditSummaryBuilder, sign_summary, load_signing_key
 
-    # Serialise for storage or transmission
-    doc = summary.to_dict()
-    json_str = summary.to_json()
+    private_key = load_signing_key()           # reads AUDIT_SIGNING_KEY_PATH env var
+    summary = AuditSummaryBuilder().build(report)
+    signed = sign_summary(summary, private_key)
+    # signed["ed25519_signature"] is a hex-encoded detached signature
 
-    # Batch processing
-    summaries = builder.build_batch([r.to_dict() for r in reports])
+Verification (recipient side)::
+
+    from reporting.audit_summary import verify_summary_signature, load_verify_key
+
+    verify_key = load_verify_key()             # reads AUDIT_VERIFY_KEY_PATH env var
+    ok = verify_summary_signature(signed_doc, verify_key)
+
+CLI wrapper::
+
+    python -m reporting.audit_summary verify report.json
+
+Key management and rotation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- Keys are Ed25519 key pairs (32-byte seed / 32-byte public key).
+- The signing key path defaults to ``AUDIT_SIGNING_KEY_PATH`` (env var) and
+  must be protected with mode ``0o600``.
+- The verification key path defaults to ``AUDIT_VERIFY_KEY_PATH`` (env var).
+- Generate a new key pair with :func:`generate_signing_key_pair`.
+- Key rotation: generate a new pair, update ``AUDIT_SIGNING_KEY_PATH`` and
+  ``AUDIT_VERIFY_KEY_PATH``.  Previously issued summaries signed with the old
+  key remain verifiable if the old verification key is retained — rotate the
+  verification key only once all old summaries have been re-signed or archived.
+- Store private keys in a secrets manager (Vault, AWS Secrets Manager, etc.);
+  never commit them to VCS.
 
 Security invariants
 -------------------
 - ``summary_sha256`` is computed over all other fields in ``__post_init__``.
-- ``verify_integrity()`` recomputes and compares the hash.
+- ``verify_integrity()`` recomputes and compares the SHA-256 hash.
+- ``ed25519_signature`` covers the canonical JSON of the full summary dict
+  (including ``summary_sha256``) so both integrity and provenance are verified
+  in one step.
 - All timestamps are UTC ISO-8601.
 - No user-supplied URLs are included; Horizon links are constructed from
   ``config.HORIZON_URL`` only.
@@ -42,12 +69,210 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from config import config
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Cryptographic helpers (Ed25519 via cryptography library)
+# ---------------------------------------------------------------------------
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+        load_pem_private_key,
+        load_pem_public_key,
+    )
+
+    _CRYPTO_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _CRYPTO_AVAILABLE = False
+
+
+class SigningError(Exception):
+    """Raised when signing or verification fails."""
+
+
+class SignatureVerificationError(SigningError):
+    """Raised when a signature does not match the document."""
+
+
+def _require_crypto() -> None:
+    if not _CRYPTO_AVAILABLE:
+        raise SigningError(
+            "The 'cryptography' package is required for Ed25519 signing. "
+            "Install it with: pip install cryptography"
+        )
+
+
+def generate_signing_key_pair(
+    private_key_path: str | Path,
+    public_key_path: str | Path,
+) -> None:
+    """Generate a new Ed25519 key pair and write PEM files.
+
+    The private key is written with mode ``0o600`` (owner-read-write only).
+
+    Parameters
+    ----------
+    private_key_path:
+        Destination path for the PEM-encoded private key.
+    public_key_path:
+        Destination path for the PEM-encoded public key.
+    """
+    _require_crypto()
+    priv_path = Path(private_key_path)
+    pub_path = Path(public_key_path)
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    priv_pem = private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+    pub_pem = public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
+
+    priv_path.parent.mkdir(parents=True, exist_ok=True)
+    priv_path.write_bytes(priv_pem)
+    priv_path.chmod(0o600)
+
+    pub_path.parent.mkdir(parents=True, exist_ok=True)
+    pub_path.write_bytes(pub_pem)
+
+    logger.info("Generated Ed25519 key pair: private=%s public=%s", priv_path, pub_path)
+
+
+def load_signing_key(path: str | None = None) -> "Ed25519PrivateKey":
+    """Load an Ed25519 private key from a PEM file.
+
+    The path defaults to the ``AUDIT_SIGNING_KEY_PATH`` environment variable.
+    """
+    _require_crypto()
+    import os
+
+    key_path = path or os.getenv("AUDIT_SIGNING_KEY_PATH")
+    if not key_path:
+        raise SigningError(
+            "No signing key path provided. Set AUDIT_SIGNING_KEY_PATH "
+            "or pass the path explicitly."
+        )
+    pem_data = Path(key_path).read_bytes()
+    return load_pem_private_key(pem_data, password=None)  # type: ignore[return-value]
+
+
+def load_verify_key(path: str | None = None) -> "Ed25519PublicKey":
+    """Load an Ed25519 public key from a PEM file.
+
+    The path defaults to the ``AUDIT_VERIFY_KEY_PATH`` environment variable.
+    """
+    _require_crypto()
+    import os
+
+    key_path = path or os.getenv("AUDIT_VERIFY_KEY_PATH")
+    if not key_path:
+        raise SigningError(
+            "No verification key path provided. Set AUDIT_VERIFY_KEY_PATH "
+            "or pass the path explicitly."
+        )
+    pem_data = Path(key_path).read_bytes()
+    return load_pem_public_key(pem_data)  # type: ignore[return-value]
+
+
+def _canonical_bytes(doc: dict[str, Any]) -> bytes:
+    """Return a deterministic UTF-8 encoding of a dict for signing/verification."""
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+
+def sign_summary(summary: "AuditSummary", private_key: "Ed25519PrivateKey") -> dict[str, Any]:
+    """Sign an :class:`AuditSummary` and return a dict with an ``ed25519_signature`` field.
+
+    The signature covers the canonical JSON of the full summary document
+    (including ``summary_sha256``) so both integrity and provenance are
+    verified together.
+
+    Parameters
+    ----------
+    summary:
+        The audit summary to sign.
+    private_key:
+        An Ed25519 private key (e.g. from :func:`load_signing_key`).
+
+    Returns
+    -------
+    dict
+        The full summary dict (as from :meth:`AuditSummary.to_dict`) with an
+        additional ``ed25519_signature`` field containing the hex-encoded
+        detached signature.
+    """
+    _require_crypto()
+    doc = summary.to_dict()
+    payload = _canonical_bytes(doc)
+    signature_bytes = private_key.sign(payload)
+    doc["ed25519_signature"] = signature_bytes.hex()
+    return doc
+
+
+def verify_summary_signature(
+    signed_doc: dict[str, Any],
+    public_key: "Ed25519PublicKey",
+) -> bool:
+    """Verify the Ed25519 signature on a signed audit summary document.
+
+    Parameters
+    ----------
+    signed_doc:
+        A dict produced by :func:`sign_summary` — must contain
+        ``ed25519_signature``.
+    public_key:
+        An Ed25519 public key (e.g. from :func:`load_verify_key`).
+
+    Returns
+    -------
+    bool
+        ``True`` when the signature is valid and the document is untampered.
+
+    Raises
+    ------
+    SignatureVerificationError
+        When the signature is missing, malformed, or invalid.
+    """
+    _require_crypto()
+    from cryptography.exceptions import InvalidSignature
+
+    sig_hex = signed_doc.get("ed25519_signature")
+    if not sig_hex:
+        raise SignatureVerificationError(
+            "Document does not contain an 'ed25519_signature' field."
+        )
+
+    # Reconstruct the payload that was signed: full doc minus the signature field
+    doc_without_sig = {k: v for k, v in signed_doc.items() if k != "ed25519_signature"}
+    payload = _canonical_bytes(doc_without_sig)
+
+    try:
+        signature_bytes = bytes.fromhex(sig_hex)
+    except ValueError as exc:
+        raise SignatureVerificationError(
+            f"Invalid signature encoding: {exc}"
+        ) from exc
+
+    try:
+        public_key.verify(signature_bytes, payload)
+        return True
+    except InvalidSignature as exc:
+        raise SignatureVerificationError(
+            "Signature verification failed — the document may have been tampered with."
+        ) from exc
+
 
 # ---------------------------------------------------------------------------
 # Verdict classification

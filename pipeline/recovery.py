@@ -23,6 +23,16 @@ This module builds on the ``CheckpointStore`` from ``pipeline.idempotency``
    checkpoint.  Deletes rows written during a failed run so re-runs start
    from a clean slate.
 
+4. ``verify_recovery`` / ``RecoveryManager.complete_recovery`` (Issue #920)
+   — post-recovery consistency verification.  After a recovery completes,
+   the expected state (record counts / checksums per stage, captured from
+   the source of truth) is compared against the actual recovered state.
+   The result is a ``RecoveryReport`` that renders as a human-readable
+   summary for on-call responders (see ``docs/recovery_verification.md``).
+   A failed check blocks auto-resumption: ``RecoveryManager.stage()``
+   raises ``RecoveryBlockedError`` for that ``(run_id, pair_id)`` until an
+   operator calls ``approve_resume()`` after manual review.
+
 Design decisions
 ----------------
 * **No saga-style compensating transactions** — the pipeline writes to a
@@ -66,10 +76,13 @@ Usage
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from pipeline.idempotency import (
@@ -144,6 +157,205 @@ class StageTracker:
 
 
 # ---------------------------------------------------------------------------
+# Post-recovery consistency verification (Issue #920)
+# ---------------------------------------------------------------------------
+
+
+class RecoveryBlockedError(RuntimeError):
+    """Raised when a stage is entered for a run whose post-recovery
+    consistency check failed and has not yet been approved by an operator."""
+
+    def __init__(self, run_id: str, pair_id: str, report: RecoveryReport) -> None:
+        self.run_id = run_id
+        self.pair_id = pair_id
+        self.report = report
+        super().__init__(
+            f"auto-resumption blocked for run={run_id} pair={pair_id}: post-recovery "
+            f"consistency check failed for stage(s) {report.failed_stages()}; "
+            "manual review required (RecoveryManager.approve_resume)"
+        )
+
+
+def compute_checksum(records: Iterable[Any]) -> str:
+    """Order-independent SHA-256 checksum over a collection of records.
+
+    Each record is serialised to canonical JSON (sorted keys, ``str`` fallback
+    for non-JSON types); the per-record digests are sorted before hashing so
+    the checksum does not depend on row order, which recovery does not
+    guarantee to preserve.
+    """
+    digests = sorted(
+        hashlib.sha256(json.dumps(r, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        for r in records
+    )
+    return hashlib.sha256("".join(digests).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class StageSnapshot:
+    """Record count and optional checksum of one stage's output."""
+
+    record_count: int
+    checksum: str | None = None
+
+    @classmethod
+    def from_records(cls, records: Iterable[Any]) -> StageSnapshot:
+        materialised = list(records)
+        return cls(record_count=len(materialised), checksum=compute_checksum(materialised))
+
+
+@dataclass
+class ConsistencyCheck:
+    """Expected-vs-actual comparison for a single recovered stage."""
+
+    stage: str
+    expected: StageSnapshot | None
+    actual: StageSnapshot | None
+
+    @property
+    def issues(self) -> list[str]:
+        if self.expected is None:
+            return ["no expected state recorded"]
+        if self.actual is None:
+            return ["stage output missing after recovery"]
+        problems = []
+        if self.expected.record_count != self.actual.record_count:
+            problems.append(
+                f"record count mismatch: expected {self.expected.record_count}, "
+                f"actual {self.actual.record_count}"
+            )
+        if (
+            self.expected.checksum is not None
+            and self.actual.checksum is not None
+            and self.expected.checksum != self.actual.checksum
+        ):
+            problems.append(
+                f"checksum mismatch: expected {self.expected.checksum[:12]}…, "
+                f"actual {self.actual.checksum[:12]}…"
+            )
+        return problems
+
+    @property
+    def passed(self) -> bool:
+        return not self.issues
+
+
+@dataclass
+class RecoveryReport:
+    """Outcome of a post-recovery consistency verification.
+
+    ``render()`` produces the on-call report documented in
+    ``docs/recovery_verification.md``; ``to_dict()`` is JSON-serialisable
+    for structured logs / ticket attachments.
+    """
+
+    run_id: str
+    pair_id: str
+    recovered_range: tuple[str, str] | None
+    recovered_stages: list[str]
+    checks: list[ConsistencyCheck]
+    generated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    approved_by: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return all(c.passed for c in self.checks)
+
+    @property
+    def resume_allowed(self) -> bool:
+        return self.passed or self.approved_by is not None
+
+    def failed_stages(self) -> list[str]:
+        return [c.stage for c in self.checks if not c.passed]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "pair_id": self.pair_id,
+            "generated_at": self.generated_at,
+            "recovered_range": list(self.recovered_range) if self.recovered_range else None,
+            "recovered_stages": list(self.recovered_stages),
+            "result": "PASS" if self.passed else "FAIL",
+            "resume_allowed": self.resume_allowed,
+            "approved_by": self.approved_by,
+            "checks": [
+                {
+                    "stage": c.stage,
+                    "status": "PASS" if c.passed else "FAIL",
+                    "expected_count": c.expected.record_count if c.expected else None,
+                    "actual_count": c.actual.record_count if c.actual else None,
+                    "expected_checksum": c.expected.checksum if c.expected else None,
+                    "actual_checksum": c.actual.checksum if c.actual else None,
+                    "issues": c.issues,
+                }
+                for c in self.checks
+            ],
+        }
+
+    def render(self) -> str:
+        """Human-readable report for on-call responders."""
+        if self.recovered_range:
+            range_text = f"{self.recovered_range[0]} → {self.recovered_range[1]}"
+        else:
+            range_text = "(not specified)"
+        if self.passed:
+            action = "Automatic resumption of normal processing: ALLOWED"
+        elif self.approved_by:
+            action = f"Automatic resumption: ALLOWED after manual review by {self.approved_by}"
+        else:
+            action = (
+                "Automatic resumption: BLOCKED — manual review required. Investigate the "
+                "failed stages, then call RecoveryManager.approve_resume(run_id, pair_id, "
+                "reviewer) or re-run recovery."
+            )
+        lines = [
+            "=== LedgerLens post-recovery consistency report ===",
+            f"Run ID:           {self.run_id}",
+            f"Pair:             {self.pair_id}",
+            f"Generated at:     {self.generated_at}",
+            f"Recovered range:  {range_text}",
+            f"Recovered stages: {', '.join(self.recovered_stages) or '(none)'}",
+            f"Result:           {'PASS' if self.passed else 'FAIL'}",
+            "",
+            "Stage checks:",
+        ]
+        for c in self.checks:
+            exp = c.expected.record_count if c.expected else "-"
+            act = c.actual.record_count if c.actual else "-"
+            lines.append(
+                f"  [{'PASS' if c.passed else 'FAIL'}] {c.stage}: expected={exp} actual={act}"
+            )
+            lines.extend(f"         - {issue}" for issue in c.issues)
+        lines += ["", action]
+        return "\n".join(lines)
+
+
+def verify_recovery(
+    run_id: str,
+    pair_id: str,
+    expected: dict[str, StageSnapshot],
+    actual: dict[str, StageSnapshot],
+    recovered_range: tuple[str, str] | None = None,
+    recovered_stages: list[str] | None = None,
+) -> RecoveryReport:
+    """Compare expected vs actual per-stage state across a recovered range.
+
+    Every stage present in either ``expected`` or ``actual`` is checked, so
+    a stage that unexpectedly appears (or disappears) after recovery is
+    reported as a failure rather than silently ignored.
+    """
+    stages = list(dict.fromkeys([*expected, *actual]))
+    checks = [ConsistencyCheck(s, expected.get(s), actual.get(s)) for s in stages]
+    return RecoveryReport(
+        run_id=run_id,
+        pair_id=pair_id,
+        recovered_range=recovered_range,
+        recovered_stages=list(recovered_stages) if recovered_stages is not None else stages,
+        checks=checks,
+    )
+
+
+# ---------------------------------------------------------------------------
 # RecoveryManager — main API
 # ---------------------------------------------------------------------------
 
@@ -161,6 +373,8 @@ class RecoveryManager:
         self._store = store
         # Keyed by (run_id, pair_id) to support multiple concurrent pairs.
         self._trackers: dict[tuple[str, str], StageTracker] = {}
+        # Latest post-recovery verification report per (run_id, pair_id).
+        self._reports: dict[tuple[str, str], RecoveryReport] = {}
 
     def _tracker(self, run_id: str, pair_id: str) -> StageTracker:
         key = (run_id, pair_id)
@@ -194,7 +408,18 @@ class RecoveryManager:
             Name of the stage (one of ``PIPELINE_STAGES`` or custom).
         force:
             Re-run even if already completed.
+
+        Raises
+        ------
+        RecoveryBlockedError
+            If a post-recovery consistency check for this ``(run_id,
+            pair_id)`` failed and has not been approved via
+            ``approve_resume``.
         """
+        report = self._reports.get((run_id, pair_id))
+        if report is not None and not report.resume_allowed:
+            raise RecoveryBlockedError(run_id, pair_id, report)
+
         tracker = self._tracker(run_id, pair_id)
         cp = PipelineCheckpoint(self._store, run_id, pair_id, stage_name, force=force)
 
@@ -262,6 +487,76 @@ class RecoveryManager:
     def has_failures(self, run_id: str, pair_id: str) -> bool:
         """True if any stage for this (run_id, pair_id) failed in this process."""
         return self._tracker(run_id, pair_id).has_failures()
+
+    def complete_recovery(
+        self,
+        run_id: str,
+        pair_id: str,
+        expected: dict[str, StageSnapshot],
+        actual: dict[str, StageSnapshot],
+        recovered_range: tuple[str, str] | None = None,
+    ) -> RecoveryReport:
+        """Run the post-recovery consistency check and gate resumption.
+
+        Must be called once recovery has finished and before the pipeline is
+        declared healthy.  On success normal processing may resume
+        automatically; on failure every subsequent ``stage()`` call for this
+        ``(run_id, pair_id)`` raises ``RecoveryBlockedError`` until
+        ``approve_resume`` is called.
+        """
+        recovered_stages = [
+            r.stage for r in self._tracker(run_id, pair_id)._stages if r.status == "completed"
+        ]
+        report = verify_recovery(
+            run_id,
+            pair_id,
+            expected,
+            actual,
+            recovered_range=recovered_range,
+            recovered_stages=recovered_stages or None,
+        )
+        self._reports[(run_id, pair_id)] = report
+        if report.passed:
+            logger.info(
+                "complete_recovery: consistency check PASSED run=%s pair=%s; resuming",
+                run_id,
+                pair_id,
+            )
+        else:
+            logger.error(
+                "complete_recovery: consistency check FAILED run=%s pair=%s stages=%s; "
+                "auto-resumption blocked pending manual review\n%s",
+                run_id,
+                pair_id,
+                report.failed_stages(),
+                report.render(),
+            )
+        return report
+
+    def can_auto_resume(self, run_id: str, pair_id: str) -> bool:
+        """False only while a failed, unapproved recovery report is on file."""
+        report = self._reports.get((run_id, pair_id))
+        return report is None or report.resume_allowed
+
+    def recovery_report(self, run_id: str, pair_id: str) -> RecoveryReport | None:
+        """Return the latest post-recovery report for (run_id, pair_id), if any."""
+        return self._reports.get((run_id, pair_id))
+
+    def approve_resume(self, run_id: str, pair_id: str, reviewer: str) -> None:
+        """Record a manual-review sign-off, unblocking a failed recovery."""
+        if not reviewer:
+            raise ValueError("reviewer must be a non-empty identifier")
+        report = self._reports.get((run_id, pair_id))
+        if report is None:
+            raise KeyError(f"no recovery report for run={run_id} pair={pair_id}")
+        report.approved_by = reviewer
+        logger.warning(
+            "approve_resume: run=%s pair=%s resumption approved by %s despite failed stages %s",
+            run_id,
+            pair_id,
+            reviewer,
+            report.failed_stages(),
+        )
 
 
 # ---------------------------------------------------------------------------

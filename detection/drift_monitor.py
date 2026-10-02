@@ -8,6 +8,11 @@ has shifted from the reference (training-time) distribution.
 PSI formula:
     PSI = Σ_i (observed_i - expected_i) * ln(observed_i / expected_i)
 where i iterates over bins of each feature's value distribution.
+
+This module also provides a unified triage view that correlates upstream
+feature drift with model-output drift, so an operator investigating an alert
+can immediately tell whether output drift is explained by feature drift or is
+unexplained. See ``build_triage_view`` and ``TRIAGE_DECISION_TREE``.
 """
 
 import json
@@ -27,6 +32,34 @@ PSI_MODERATE_DRIFT_THRESHOLD = 0.25
 PSI_EPSILON = 1e-4
 
 REPORTS_DIR = "reports"
+
+# Documented triage decision tree based on the combination of signals.
+# Keys are the correlation states produced by ``correlate_drift_signals``.
+TRIAGE_DECISION_TREE: dict[str, str] = {
+    "both_drifted": (
+        "Both input feature drift and output drift are flagged in the same "
+        "window. Output drift is likely EXPLAINED by upstream feature drift. "
+        "Action: inspect the drifted features, confirm the upstream data "
+        "source change, and plan a retrain on fresh data. No model bug "
+        "investigation required unless feature drift is expected/benign."
+    ),
+    "only_output_drifted": (
+        "Output drift is flagged but no tracked input feature drifted. Output "
+        "drift is UNEXPLAINED by feature drift. Action: treat as a potential "
+        "model or pipeline defect — check scoring code, label leakage, "
+        "post-processing, and untracked inputs before retraining."
+    ),
+    "only_input_drifted": (
+        "Input feature drift is flagged but output drift is not. The model is "
+        "currently robust to the upstream shift. Action: monitor; no immediate "
+        "retrain required, but watch for output drift developing in later "
+        "windows."
+    ),
+    "no_drift": (
+        "Neither input feature drift nor output drift is flagged. Action: no "
+        "triage required."
+    ),
+}
 
 
 @dataclass
@@ -63,6 +96,90 @@ def compute_psi(
 
     psi = np.sum((observed - expected) * np.log(observed / expected))
     return float(psi)
+
+
+def correlate_drift_signals(
+    feature_drift: bool,
+    output_drift: bool,
+    drifted_features: list[str] | None = None,
+) -> dict:
+    """Correlate feature-drift and model-output-drift signals for one window.
+
+    When output drift is flagged, this checks whether any tracked input
+    feature also drifted in the same window, producing one of three
+    drift-combination states:
+
+    * ``both_drifted`` — output drift is explained by upstream feature drift.
+    * ``only_output_drifted`` — output drift is unexplained by feature drift.
+    * ``only_input_drifted`` — feature drift without output drift.
+
+    Returns a dict with the ``state``, the raw signals, the drifted feature
+    names, and the matching ``triage`` guidance from ``TRIAGE_DECISION_TREE``.
+    """
+
+    drifted_features = list(drifted_features or [])
+
+    if feature_drift and output_drift:
+        state = "both_drifted"
+    elif output_drift:
+        state = "only_output_drifted"
+    elif feature_drift:
+        state = "only_input_drifted"
+    else:
+        state = "no_drift"
+
+    return {
+        "state": state,
+        "feature_drift": bool(feature_drift),
+        "output_drift": bool(output_drift),
+        "drifted_features": drifted_features,
+        "output_drift_explained": state == "both_drifted",
+        "triage": TRIAGE_DECISION_TREE[state],
+    }
+
+
+def build_triage_view(
+    feature_report: DriftReport | dict | None,
+    output_drift: bool,
+    output_metric: str | None = None,
+) -> dict:
+    """Build a single unified triage view combining both drift signals.
+
+    Accepts either a ``DriftReport`` or its ``to_dict()`` form for the
+    feature-drift side, plus the model-output-drift flag, and returns a
+    dashboard/report-ready payload with the correlation annotation.
+    """
+
+    if isinstance(feature_report, DriftReport):
+        feature_report = feature_report.to_dict()
+    feature_report = feature_report or {}
+
+    features = feature_report.get("features", [])
+    drifted_features = [f["feature"] for f in features if f.get("drift_flag")]
+    feature_drift = bool(feature_report.get("any_drift_detected", False)) or bool(
+        drifted_features
+    )
+
+    correlation = correlate_drift_signals(
+        feature_drift=feature_drift,
+        output_drift=output_drift,
+        drifted_features=drifted_features,
+    )
+
+    return {
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "feature_drift": {
+            "any_drift_detected": feature_drift,
+            "n_features_drifted": len(drifted_features),
+            "drifted_features": drifted_features,
+            "features": features,
+        },
+        "output_drift": {
+            "drift_detected": bool(output_drift),
+            "metric": output_metric,
+        },
+        "correlation": correlation,
+    }
 
 
 class DriftMonitor:

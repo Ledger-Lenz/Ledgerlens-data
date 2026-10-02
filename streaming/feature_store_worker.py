@@ -20,6 +20,26 @@ When Redis is unavailable the worker logs a warning and skips the write.
 The streaming scorer's fallback path (direct recomputation) takes over
 transparently.
 
+Exactly-once materialization (#896)
+-----------------------------------
+Before: no checkpoint was tied to feature writes, so a crash mid-materialization
+left no record of which events were applied; the upstream stream resumed from
+its own cursor, which could be committed *before* the feature row was written
+(missing rows) or replay already-applied events (duplicate work).
+
+After: when a ``cursor_store`` is supplied, each task carrying an
+``event_cursor`` is processed as write-then-commit:
+
+1. The feature row is written with an idempotent keyed ``put`` (same
+   wallet/pair/window key overwrites, never appends).
+2. Only after a successful write is the cursor committed to the cursor store.
+
+A crash between (1) and (2) replays the event on restart, which re-writes the
+same key (no duplicate); a crash before (1) replays it too (no missing row).
+Events at or behind the committed cursor are skipped. Guarantee: effectively
+exactly-once final state per (wallet, pair). Overhead is one cursor-store write
+per task (sub-millisecond for SQLite/in-memory stores).
+
 Usage
 -----
     worker = FeatureStoreWorker(feature_store, feature_buffer)
@@ -43,6 +63,7 @@ from streaming.health import WorkerHealthMonitor, get_health_registry
 from utils.logging import get_logger
 
 if TYPE_CHECKING:
+    from streaming.cursor_store import BaseCursorStore
     from streaming.feature_buffer import FeatureBuffer
     from streaming.pubsub_router import PubSubRouter
 
@@ -99,6 +120,8 @@ class FeatureStoreWorker:
         pubsub_router: PubSubRouter | None = None,
         max_queue_depth: int = 1000,
         min_trade_threshold: int | None = None,
+        cursor_store: BaseCursorStore | None = None,
+        stream_id: str = "feature_store_worker",
     ) -> None:
         self._store = feature_store
         self._buffer = feature_buffer
@@ -109,6 +132,8 @@ class FeatureStoreWorker:
             else config.MIN_TRADES_FOR_SCORING
         )
         self._queue: queue.Queue = queue.Queue(maxsize=max_queue_depth)
+        self._cursor_store = cursor_store
+        self._stream_id = stream_id
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
         self._worker_id = "feature_store_worker"
@@ -164,6 +189,7 @@ class FeatureStoreWorker:
         wallet_id: str,
         pair_id: str,
         event_metadata: dict[str, Any] | None = None,
+        event_cursor: str | None = None,
     ) -> None:
         """Queue a refresh task for ``(wallet_id, pair_id)``.
 
@@ -176,6 +202,7 @@ class FeatureStoreWorker:
             "pair_id": pair_id,
             "queued_at": time.monotonic(),
             "metadata": event_metadata or {},
+            "event_cursor": event_cursor,
         }
         try:
             self._queue.put_nowait(task)
@@ -233,6 +260,11 @@ class FeatureStoreWorker:
         """
         wallet_id: str = task["wallet_id"]
         pair_id: str = task["pair_id"]
+        event_cursor: str | None = task.get("event_cursor")
+
+        if event_cursor is not None and not self._is_after_committed(event_cursor):
+            logger.debug("FeatureStoreWorker: skipping already-committed cursor %s", event_cursor)
+            return
 
         trade_count = self._buffer.wallet_trade_count(wallet_id)
         if trade_count < self._min_trades:
@@ -242,11 +274,13 @@ class FeatureStoreWorker:
                 trade_count,
                 self._min_trades,
             )
+            self._commit(event_cursor)
             return
 
         # Rebuild the feature row from the buffer
         feature_row = self._buffer.get_feature_row(wallet_id)
         if feature_row is None:
+            self._commit(event_cursor)
             return
 
         # Convert pd.Series to plain dict with JSON-safe scalar types
@@ -262,6 +296,8 @@ class FeatureStoreWorker:
         )
 
         if success:
+            # Commit only after the idempotent write succeeded (write-then-commit).
+            self._commit(event_cursor)
             logger.debug(
                 "FeatureStoreWorker: refreshed wallet=%s pair=%s (%d trades)",
                 wallet_id,
@@ -279,6 +315,28 @@ class FeatureStoreWorker:
                 wallet_id,
                 pair_id,
             )
+
+    def _commit(self, event_cursor: str | None) -> None:
+        if event_cursor is None or self._cursor_store is None:
+            return
+        self._cursor_store.save_cursor(self._stream_id, event_cursor)
+
+    def _is_after_committed(self, event_cursor: str) -> bool:
+        committed = self.committed_cursor
+        if committed is None:
+            return True
+        try:
+            return int(event_cursor) > int(committed)
+        except ValueError:
+            return event_cursor != committed
+
+    @property
+    def committed_cursor(self) -> str | None:
+        """Last cursor whose feature row is durably materialized (None if none)."""
+        if self._cursor_store is None:
+            return None
+        cursor = self._cursor_store.get_cursor(self._stream_id, default="")
+        return cursor or None
 
     @property
     def queue_depth(self) -> int:

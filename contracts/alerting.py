@@ -21,6 +21,16 @@ class AlertEvent(typing.TypedDict, total=False):
     - ``score`` — risk score 0–100
     - ``detectors`` — list of detector names that fired
     - ``timestamp`` — unix seconds
+
+    Freshness attribution
+    ---------------------
+    - ``source`` — originating data source (e.g. ``"ethereum"``)
+    - ``source_event_ts`` — unix seconds of the on-chain event that
+      triggered this alert; propagated through ingestion -> feature ->
+      scoring -> alert so end-to-end freshness can be measured.
+    - ``stage_timestamps`` — per-stage unix-second timestamps keyed by
+      stage name (``ingestion``, ``feature``, ``scoring``, ``alert``),
+      enabling per-stage freshness breakdowns for root-causing.
     """
 
     wallet: str
@@ -30,6 +40,9 @@ class AlertEvent(typing.TypedDict, total=False):
     timestamp: int
     severity: str
     message: str
+    source: str
+    source_event_ts: int
+    stage_timestamps: dict[str, int]
 
 
 @runtime_checkable

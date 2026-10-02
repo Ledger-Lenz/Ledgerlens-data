@@ -62,6 +62,67 @@ rejection of concurrent in-flight duplicates, reclaiming an expired lease,
 retrying a previously-failed job, `reset()`, the decorator form, and
 independent keys not interfering with each other.
 
+## Pipeline idempotency-key TTL and eviction
+
+`pipeline/idempotency.py::CheckpointStore` keeps one idempotency key per
+`(run_id, pair_id, stage)` so that re-running the batch pipeline with the same
+inputs skips stages that already completed. Without a bound, a long-running
+deployment would accumulate one key per stage per run for as long as it runs.
+
+### Policy
+
+- `IDEMPOTENCY_TTL_HOURS` (default `48`) sets how long a key is honoured. A key
+  older than the TTL no longer blocks reprocessing, so the stage re-runs.
+- Expired keys are evicted from the store. `CheckpointStore.evict_expired()`
+  deletes every entry last updated before `now - IDEMPOTENCY_TTL_HOURS`,
+  whether it is completed, failed, or a `running` stage that never finished.
+  It runs when a store is opened and then at most once an hour as stages
+  start, so no separate cron job is needed.
+- The store is therefore bounded to about one TTL window of keys:
+  `pairs × stages × runs per TTL window`. For example, 50 pairs × 7 stages ×
+  hourly runs × 48 h is about 17k rows.
+
+### Recommended TTL: 48 hours
+
+The TTL has to cover the longest realistic gap between a run and its
+re-invocation with the same inputs, because that is the window in which a
+replay must be skipped:
+
+- At-least-once redelivery and cron or worker retries re-invoke a job within
+  minutes to a few hours.
+- The longest routine gap is an operator re-running a failed overnight job
+  the next working day, up to about 24 hours later.
+
+48 hours is twice that daily cycle, so a job that failed and was re-run the
+next day is still covered even if the re-run itself slips. Going longer buys
+little. Past the TTL, a replay only recomputes stages: risk scores are
+upserted by `(wallet, asset_pair)` in `RiskScoreStore`, and
+`idempotent_upsert` also skips unchanged scores, so an expired key costs
+compute and never creates duplicate rows. Raise the TTL only if re-runs routinely happen more than a day
+after the original run, for example when failures over a weekend are only
+retried on Monday. In that case use 72 to 96 hours and expect the store to
+grow in proportion.
+
+### Monitoring
+
+The store exports `ledgerlens_idempotency_store_entries{status}` (gauge) and
+`ledgerlens_idempotency_store_evicted_total` (counter), shown on the
+"LedgerLens — Idempotency Key Store" Grafana dashboard
+(`monitoring/grafana/dashboards/idempotency_store.json`). Once a full TTL
+window of keys is stored, size should plateau and the growth rate should
+hover around zero. Sustained growth means eviction is not running.
+
+### Validation
+
+```
+pytest tests/test_idempotency_ttl.py -v
+```
+
+Covers eviction of keys older than the TTL (they no longer block
+reprocessing), retention of keys inside the TTL, eviction of stale `running`
+and `failed` entries, eviction on open and on stage start, and the exported
+metrics.
+
 ## Design tradeoffs / follow-ups
 
 - SQLite (WAL mode) was chosen over a JSON file (as used in
