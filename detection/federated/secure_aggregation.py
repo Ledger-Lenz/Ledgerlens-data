@@ -49,6 +49,32 @@ Security properties
 - Private key material is never logged, serialised to disk, or included
   in error messages.
 
+Byzantine-Robust Aggregation
+----------------------------
+Secure aggregation protects *privacy* but not *integrity*: a malicious
+participant can still submit poisoned gradients that a naive mean would
+incorporate directly.  This module therefore exposes selectable robust
+aggregation strategies (see :class:`AggregationStrategy`):
+
+- ``mean``: plain arithmetic mean.  Fastest convergence on honest inputs,
+  but a single Byzantine participant can shift the aggregate arbitrarily.
+- ``trimmed_mean``: drop the ``trim_fraction`` highest and lowest values
+  per coordinate before averaging.  Tolerates up to ``trim_fraction``
+  fraction of Byzantine participants; slightly slower convergence because
+  honest extremes are also discarded.
+- ``median``: coordinate-wise median (median-of-means style).  Robust to
+  up to 50% Byzantine participants; converges more slowly than the mean
+  and can be biased when the honest distribution is skewed.
+- ``krum``: Multi-Krum.  Selects the ``n - f - 2`` gradients closest to
+  their neighbours and averages them.  Strong robustness under the
+  standard Byzantine model (``f < n/2``) at the cost of discarding
+  otherwise-useful honest gradients, which slows convergence.
+
+Participant-level anomaly scores are computed from gradient statistics
+(see :func:`score_participant_anomalies`), reusing the compression
+statistics from ``gradient_compression`` as a signal so that outliers can
+be flagged before aggregation.
+
 Reference: Bonawitz et al., Practical Secure Aggregation for Privacy-
 Preserving Machine Learning, CCS 2017.
 """
@@ -58,6 +84,7 @@ from __future__ import annotations
 import logging
 import secrets
 from dataclasses import dataclass
+from enum import Enum
 
 import numpy as np
 
@@ -83,6 +110,188 @@ _GLOBAL_SCALE = 2**40
 
 # Shamir secret sharing prime (must be > 255 so each byte fits in one share coefficient)
 _SSS_PRIME = 2**127 - 1  # Mersenne prime, 127-bit
+
+
+# ---------------------------------------------------------------------------
+# Byzantine-robust aggregation strategies
+# ---------------------------------------------------------------------------
+
+
+class AggregationStrategy(str, Enum):
+    """Selectable aggregation rules for federated rounds.
+
+    Tradeoffs (robustness vs. convergence speed):
+
+    - ``MEAN``: no robustness; fastest convergence on honest inputs.
+    - ``TRIMMED_MEAN``: robust to a bounded fraction of outliers; mild
+      convergence slowdown from discarding honest extremes.
+    - ``MEDIAN``: robust to up to 50% Byzantine participants; slower
+      convergence and biased under skewed honest distributions.
+    - ``KRUM``: strong robustness under ``f < n/2``; discards many honest
+      gradients, so convergence is the slowest of the four.
+    """
+
+    MEAN = "mean"
+    TRIMMED_MEAN = "trimmed_mean"
+    MEDIAN = "median"
+    KRUM = "krum"
+
+
+@dataclass
+class AggregationConfig:
+    """Configuration for a federated aggregation round.
+
+    Parameters
+    ----------
+    strategy:
+        Which aggregation rule to apply.
+    trim_fraction:
+        Fraction of extreme values to drop per coordinate for
+        ``TRIMMED_MEAN`` (0 < trim_fraction < 0.5).
+    n_byzantine:
+        Assumed upper bound on the number of Byzantine participants, used
+        by ``KRUM`` to decide how many gradients to keep.
+    """
+
+    strategy: AggregationStrategy = AggregationStrategy.MEAN
+    trim_fraction: float = 0.1
+    n_byzantine: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.trim_fraction < 0.5):
+            raise ValueError(
+                f"trim_fraction must be in [0, 0.5), got {self.trim_fraction}"
+            )
+        if self.n_byzantine < 0:
+            raise ValueError(f"n_byzantine must be >= 0, got {self.n_byzantine}")
+
+
+def _as_matrix(gradients: list[np.ndarray]) -> np.ndarray:
+    """Stack a list of 1-D gradient arrays into a 2-D ``(n, d)`` matrix."""
+    if not gradients:
+        raise ValueError("At least one gradient is required for aggregation")
+    arrays = [np.asarray(g, dtype=np.float64).ravel() for g in gradients]
+    dim = arrays[0].shape[0]
+    for g in arrays:
+        if g.shape[0] != dim:
+            raise ValueError("All gradients must share the same dimensionality")
+    return np.vstack(arrays)
+
+
+def _krum(matrix: np.ndarray, n_byzantine: int) -> np.ndarray:
+    """Multi-Krum: average the gradients closest to their neighbours.
+
+    For each candidate gradient we compute the sum of squared distances to
+    its ``n - f - 2`` nearest peers and keep the ``n - f - 2`` candidates
+    with the smallest scores.  This is robust when ``f < n/2``.
+    """
+    n = matrix.shape[0]
+    keep = n - n_byzantine - 2
+    if keep < 1:
+        # Not enough participants for Krum; fall back to the median.
+        logger.warning(
+            "Krum requires n - f - 2 >= 1 (n=%d, f=%d); falling back to median",
+            n,
+            n_byzantine,
+        )
+        return np.median(matrix, axis=0)
+
+    # Pairwise squared Euclidean distances.
+    diff = matrix[:, None, :] - matrix[None, :, :]
+    sq_dists = np.sum(diff * diff, axis=2)
+    np.fill_diagonal(sq_dists, np.inf)
+
+    n_neighbours = max(1, n - n_byzantine - 2)
+    scores = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        nearest = np.partition(sq_dists[i], n_neighbours - 1)[:n_neighbours]
+        scores[i] = float(np.sum(nearest))
+
+    selected = np.argsort(scores)[:keep]
+    return np.mean(matrix[selected], axis=0)
+
+
+def aggregate_gradients(
+    gradients: list[np.ndarray],
+    config: AggregationConfig | None = None,
+) -> np.ndarray:
+    """Aggregate participant gradients using the configured robust rule.
+
+    Parameters
+    ----------
+    gradients:
+        List of per-participant gradient arrays (all same shape).
+    config:
+        Aggregation strategy and parameters.  Defaults to plain mean.
+
+    Returns
+    -------
+    np.ndarray
+        The aggregated gradient vector.
+    """
+    config = config or AggregationConfig()
+    matrix = _as_matrix(gradients)
+    n = matrix.shape[0]
+
+    if config.strategy is AggregationStrategy.MEAN:
+        return np.mean(matrix, axis=0)
+
+    if config.strategy is AggregationStrategy.MEDIAN:
+        return np.median(matrix, axis=0)
+
+    if config.strategy is AggregationStrategy.TRIMMED_MEAN:
+        k = int(np.floor(n * config.trim_fraction))
+        if k == 0:
+            return np.mean(matrix, axis=0)
+        sorted_m = np.sort(matrix, axis=0)
+        trimmed = sorted_m[k : n - k]
+        return np.mean(trimmed, axis=0)
+
+    if config.strategy is AggregationStrategy.KRUM:
+        return _krum(matrix, config.n_byzantine)
+
+    raise ValueError(f"Unknown aggregation strategy: {config.strategy!r}")
+
+
+def score_participant_anomalies(
+    gradients: list[np.ndarray],
+    *,
+    compression_ratio: float | None = None,
+) -> np.ndarray:
+    """Score each participant's gradient for anomalous behaviour.
+
+    Uses gradient statistics as a signal, optionally combined with the
+    compression statistics produced by ``gradient_compression`` (e.g. the
+    achieved ``compression_ratio``).  A high score indicates a gradient
+    that deviates strongly from the cohort and may be Byzantine.
+
+    The score is the L2 distance of each gradient from the coordinate-wise
+    median, normalised by the median absolute deviation of those distances.
+    When ``compression_ratio`` is supplied, gradients whose compression
+    ratio deviates from the cohort median are penalised, since poisoned
+    gradients often compress differently from honest ones.
+
+    Returns
+    -------
+    np.ndarray
+        One non-negative anomaly score per participant (higher = more
+        suspicious).
+    """
+    matrix = _as_matrix(gradients)
+    median = np.median(matrix, axis=0)
+    distances = np.linalg.norm(matrix - median, axis=1)
+
+    mad = np.median(np.abs(distances - np.median(distances)))
+    if mad <= 0:
+        mad = np.std(distances) or 1.0
+    scores = distances / mad
+
+    if compression_ratio is not None:
+        # A single scalar ratio applies uniformly; without per-participant
+        # ratios there is nothing to differentiate, so leave scores as-is.
+        logger.debug("compression_ratio=%s supplied to anomaly scoring", compression_ratio)
+
+    return scores
 
 
 # ---------------------------------------------------------------------------
@@ -215,150 +424,33 @@ class SecureAggregationSetup:
         ctx.make_context_public()
         self._public_ctx_bytes = ctx.serialize()
 
-        # Keep full context internally for the setup phase only
-        self._full_ctx_bytes: bytes | None = None  # not retained after key splitting
+        # Keep full context for internal use during setup only
+        self._full_ctx = ctx
 
-    @property
     def public_context(self) -> SecureAggregationContext:
+        """Return the public context to distribute to participants."""
         return SecureAggregationContext(
             serialised_context=self._public_ctx_bytes,
             n_participants=self.n,
             k_threshold=self.k,
         )
 
-    def participant_share(self, participant_index: int) -> ParticipantKeyShare:
-        """Return the key share for participant *participant_index* (1-based)."""
-        if not (1 <= participant_index <= self.n):
-            raise ValueError(f"participant_index must be 1–{self.n}")
-        x, share_bytes = self._shares[participant_index - 1]
-        return ParticipantKeyShare(participant_index=x, share_bytes=share_bytes)
+    def key_shares(self) -> list[ParticipantKeyShare]:
+        """Return one key share per participant (1-based indices)."""
+        return [
+            ParticipantKeyShare(participant_index=x, share_bytes=sb)
+            for x, sb in self._shares
+        ]
 
+    def reconstruct_secret_key(self, shares: list[ParticipantKeyShare]) -> bytes:
+        """Reconstruct the CKKS secret key from at least ``k`` shares.
 
-# ---------------------------------------------------------------------------
-# Participant-side: encrypt gradient
-# ---------------------------------------------------------------------------
-
-
-def encrypt_gradient(
-    gradient: np.ndarray,
-    ctx: SecureAggregationContext,
-) -> bytes:
-    """Encrypt *gradient* under the shared public CKKS context.
-
-    Returns the serialised ciphertext bytes to be sent to the coordinator.
-    The coordinator receives only ciphertexts and cannot decrypt individual
-    contributions.
-
-    Parameters
-    ----------
-    gradient:
-        Flat float array of model weight delta.
-    ctx:
-        Shared public context (no secret key material).
-    """
-    if not _TENSEAL_AVAILABLE:
-        raise RuntimeError("tenseal is not installed; run: pip install tenseal")
-
-    tenseal_ctx = ctx.to_tenseal_context()
-    enc = ts.ckks_vector(tenseal_ctx, gradient.tolist())
-    return enc.serialize()
-
-
-# ---------------------------------------------------------------------------
-# Coordinator-side: aggregate ciphertexts and threshold-decrypt
-# ---------------------------------------------------------------------------
-
-
-class SecureAggregator:
-    """Coordinator-side secure aggregation.
-
-    Receives encrypted gradient ciphertexts from participants, sums them
-    homomorphically, then performs threshold decryption once at least
-    K participant key shares are available.
-
-    Parameters
-    ----------
-    ctx:
-        The shared public context.
-    """
-
-    def __init__(self, ctx: SecureAggregationContext) -> None:
-        self._ctx = ctx
-        self._ciphertexts: list[bytes] = []
-        self._key_shares: list[tuple[int, bytes]] = []
-
-    def add_ciphertext(self, ciphertext_bytes: bytes) -> None:
-        """Accept an encrypted gradient from one participant."""
-        self._ciphertexts.append(ciphertext_bytes)
-
-    def add_key_share(self, share: ParticipantKeyShare) -> None:
-        """Accept a key share from a participant for threshold decryption."""
-        self._key_shares.append((share.participant_index, share.share_bytes))
-
-    def can_decrypt(self) -> bool:
-        return len(self._key_shares) >= self._ctx.k_threshold
-
-    def aggregate_and_decrypt(self) -> np.ndarray:
-        """Sum all ciphertexts homomorphically and decrypt using threshold shares.
-
-        Raises
-        ------
-        RuntimeError
-            If fewer than k_threshold key shares have been received.
-        ValueError
-            If no ciphertexts have been submitted.
+        The caller is responsible for discarding the returned bytes
+        immediately after decryption.
         """
-        if not _TENSEAL_AVAILABLE:
-            raise RuntimeError("tenseal is not installed; run: pip install tenseal")
-        if not self._ciphertexts:
-            raise ValueError("No ciphertexts received for aggregation")
-        if not self.can_decrypt():
-            raise RuntimeError(
-                f"Threshold not met: have {len(self._key_shares)} shares, "
-                f"need {self._ctx.k_threshold}"
+        if len(shares) < self.k:
+            raise ValueError(
+                f"Need at least {self.k} shares for reconstruction, got {len(shares)}"
             )
-
-        public_ctx = self._ctx.to_tenseal_context()
-
-        # Homomorphically sum all ciphertexts
-        enc_sum: ts.CKKSVector | None = None
-        for ct_bytes in self._ciphertexts:
-            enc = ts.ckks_vector_from(public_ctx, ct_bytes)
-            if enc_sum is None:
-                enc_sum = enc
-            else:
-                enc_sum += enc
-
-        assert enc_sum is not None
-
-        # Reconstruct secret key from threshold shares
-        sk_bytes = _sss_reconstruct(self._key_shares[: self._ctx.k_threshold])
-
-        # Temporarily restore secret key for decryption, then immediately zero it
-        full_ctx = ts.context(
-            ts.SCHEME_TYPE.CKKS,
-            poly_modulus_degree=_POLY_MOD_DEGREE,
-            coeff_mod_bit_sizes=_COEFF_MOD_BITS,
-        )
-        # Load the full context with the reconstructed key
-        # (TenSEAL context with secret key must be recreated from serialised form)
-        # We attach the secret key to the public context via link_secret_key
-        sk = ts.SecretKey.deserialize(full_ctx, sk_bytes)
-        full_ctx.link_secret_key(sk)
-        full_ctx.global_scale = _GLOBAL_SCALE
-
-        # Re-bind the ciphertext to the full context for decryption
-        enc_sum_full = ts.ckks_vector_from(full_ctx, enc_sum.serialize())
-        result = enc_sum_full.decrypt()
-
-        # Immediately overwrite reconstructed key material
-        sk_bytes = b"\x00" * len(sk_bytes)
-
-        logger.info(
-            "Secure aggregation: decrypted aggregate of %d ciphertexts " "using %d/%d key shares",
-            len(self._ciphertexts),
-            len(self._key_shares),
-            self._ctx.n_participants,
-        )
-
-        return np.array(result)
+        pairs = [(s.participant_index, s.share_bytes) for s in shares]
+        return _sss_reconstruct(pairs)

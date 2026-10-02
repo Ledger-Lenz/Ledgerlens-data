@@ -30,7 +30,7 @@ from typing import Any
 import jsonschema
 
 from config import config
-from reporting.fatf_risk_codes import RiskCode, map_to_risk_codes
+from reporting.fatf_risk_codes import RiskCode, map_to_risk_codes, validate_mapping_version
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -247,6 +247,11 @@ def export_ivms101(
             "reveal_addresses=True requires the FATF_ADMIN_TOKEN environment "
             "variable to be set to a non-empty value."
         )
+
+    # Issue #942 — validate that the risk-code mapping version meets the
+    # configured minimum before generating a report.  Raises MappingVersionError
+    # (or warns, depending on FATF_MAPPING_VERSION_BLOCK) when the mapping is stale.
+    validate_mapping_version()
 
     wallet: str = forensic_report.get("wallet", "")
     account_ref: Any = (

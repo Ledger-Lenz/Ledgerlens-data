@@ -77,6 +77,10 @@ class DANNEncoder(nn.Module):
             return torch.sigmoid(label_logits.squeeze(-1)).cpu().numpy()
 
 
+# Issue #858: `domain_lambda=1.0` below is the static GRL coefficient the
+# issue refers to. Planned: replace with `make_dann_loss(schedule,
+# total_steps)` driven by a shared `GRLSchedule`. See the plan block above
+# `_lambda_schedule` in detection/dann_adapter.py.
 def _dann_loss(model: nn.Module, batch: tuple) -> torch.Tensor:
     x, y, domain = batch
     label_logits, domain_logits, _ = model(x, domain_lambda=1.0)

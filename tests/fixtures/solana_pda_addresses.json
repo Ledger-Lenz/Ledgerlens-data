@@ -1,0 +1,27 @@
+{
+  "_comment": "Curated Solana addresses for PDA classification (#881). Every derived address was cross-checked against solders.Pubkey.find_program_address (the reference Solana SDK binding).",
+  "mints": {
+    "usdc": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "wallets": [
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+    "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH",
+    "vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg"
+  ],
+  "associated_token_accounts": [
+    {"wallet": "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "address": "FGETo8T8wMcN2wCjav8VK6eh3dLk63evNDPxzLSJra8B", "bump": 254},
+    {"wallet": "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "address": "AmvU9KEJZ2F3u7E3H43k1VU3S5GZPPSKQzJnbJtAJjvN", "bump": 249},
+    {"wallet": "vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg", "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "address": "9jrTvdU2Am3UmgSAX8EKS9wwrSufkWRbZzEukDogqpQg", "bump": 253}
+  ],
+  "program_vaults": [
+    {"pattern": "wormhole_token_bridge_authority_signer", "program_id": "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb", "seeds": ["authority_signer"], "address": "7oPa2PHQdZmjSPqvpZN7MQxnC7Dcf3uL4oLqknGLk2S3"},
+    {"pattern": "wormhole_token_bridge_custody_signer", "program_id": "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb", "seeds": ["custody_signer"], "address": "GugU1tP7doLeTw9hQP51xRJyS8Da1fWxuiy2rVrnMD2m"},
+    {"pattern": "wormhole_token_bridge_custody", "program_id": "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb", "seeds": ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"], "address": "9EhGiXJFGG7NGneq76Mfu6LCvGxHKmeq4tQv9HD4iBxV"},
+    {"pattern": "raydium_amm_authority", "program_id": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "seeds": ["amm authority"], "address": "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"}
+  ],
+  "program_owned_token_account": {
+    "_comment": "Non-associated SPL token account: an on-curve keypair account whose owner is the SPL Token program.",
+    "address": "HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH",
+    "owner_program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+  }
+}

@@ -146,6 +146,74 @@ class CoreSet(BaseQueryStrategy):
         return cast(list[str], pool.iloc[selected_idx]["wallet"].tolist())
 
 
+class DiversityAwareBatch(BaseQueryStrategy):
+    """Batch acquisition that combines uncertainty with k-center diversity (Issue #886).
+
+    Greedily picks the candidate maximising
+    ``(1 - diversity_weight) * uncertainty + diversity_weight * normalised_min_distance``,
+    where the distance is to the closest point already labelled or selected (k-center
+    greedy in feature space). ``diversity_weight=0`` is pure uncertainty sampling;
+    ``diversity_weight=1`` is pure k-center coverage. Defaults to
+    ``config.AL_DIVERSITY_WEIGHT`` (0.5 when that setting is missing).
+    """
+
+    def __init__(self, diversity_weight: float | None = None):
+        if diversity_weight is None:
+            diversity_weight = float(getattr(config, "AL_DIVERSITY_WEIGHT", 0.5))
+        if not 0.0 <= diversity_weight <= 1.0:
+            raise ValueError(f"diversity_weight must be in [0, 1], got {diversity_weight}")
+        self.diversity_weight = diversity_weight
+
+    def select(
+        self,
+        pool: pd.DataFrame,
+        n_query: int,
+        model=None,
+        labelled_pool: pd.DataFrame | None = None,
+    ) -> list[str]:
+        limit = _selection_limit(pool, n_query)
+        if limit == 0:
+            return []
+        cols = _feature_cols(pool)
+        X = pool[cols].astype(float).values
+        if model is not None:
+            probs = _proba(model, pool[cols])
+            uncertainty = 1.0 - np.abs(probs[:, 1] - probs[:, 0])
+        else:
+            uncertainty = np.ones(len(pool))
+
+        if labelled_pool is not None and len(labelled_pool) > 0:
+            min_dist = _min_dist_to_set(X, labelled_pool[cols].astype(float).values)
+        else:
+            min_dist = np.full(len(pool), np.inf)
+
+        selected: list[int] = []
+        available = np.ones(len(pool), dtype=bool)
+        for _ in range(limit):
+            finite = np.where(np.isfinite(min_dist), min_dist, np.nan)
+            max_d = np.nanmax(finite[available]) if np.any(np.isfinite(finite[available])) else 0.0
+            if max_d > 0:
+                diversity = np.where(np.isfinite(min_dist), min_dist / max_d, 1.0)
+            else:
+                # Every candidate is identical to a chosen/labelled point (or none chosen yet)
+                diversity = np.where(np.isfinite(min_dist), 0.0, 1.0)
+            score = (1 - self.diversity_weight) * uncertainty + self.diversity_weight * diversity
+            score = np.where(available, score, -np.inf)
+            chosen = int(np.argmax(score))
+            selected.append(chosen)
+            available[chosen] = False
+            min_dist = np.minimum(min_dist, _min_dist_to_set(X, X[chosen : chosen + 1]))
+
+        return cast(list[str], pool.iloc[selected]["wallet"].tolist())
+
+
+def label_efficiency(accuracy_curve: list[float], n_labelled_curve: list[int]) -> float:
+    """Accuracy gain per labelled example between the first and last AL rounds."""
+    if len(accuracy_curve) < 2 or n_labelled_curve[-1] == n_labelled_curve[0]:
+        return 0.0
+    return (accuracy_curve[-1] - accuracy_curve[0]) / (n_labelled_curve[-1] - n_labelled_curve[0])
+
+
 def _min_dist_to_set(points: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """For each point, return the distance to its nearest reference point."""
     diffs = points[:, np.newaxis, :] - reference[np.newaxis, :, :]  # (N, M, D)
@@ -339,6 +407,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseQueryStrategy]] = {
     "badge": BADGE,
     "committee_disagreement": CommitteeDisagreement,
     "coreset_hybrid": CoresetHybrid,
+    "diversity_aware_batch": DiversityAwareBatch,
 }
 
 

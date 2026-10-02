@@ -140,9 +140,44 @@ def restore_models(backup_path: Path, restore_dir: Path, manifest: dict) -> bool
 
 
 def main():
-    """Restore from backup with full verification."""
+    """Restore from backup with full verification.
+
+    Flags
+    -----
+    --yes
+        Non-interactive override: skip the confirmation prompt and proceed
+        automatically.
+
+        .. warning::
+            Using ``--yes`` bypasses the human confirmation gate entirely.
+            Only use it in CI/automation pipelines where the blast radius has
+            already been reviewed.  **Never** use it as a shortcut during
+            ad-hoc production operations.
+    """
+    import argparse
     import os
     import sys
+
+    from cli.audit import audit_cli_command
+    from cli.confirmation import BlastRadiusSummary, confirm_destructive_action
+
+    parser = argparse.ArgumentParser(description="Restore LedgerLens database and model artifacts")
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help=(
+            "Non-interactive override: skip confirmation prompt. "
+            "⚠️  Use with extreme caution — this bypasses the human safety gate."
+        ),
+    )
+
+    # Issue #960 — dry-run support
+    from cli.dry_run import DryRunPlan, add_dry_run_argument, check_dry_run
+
+    add_dry_run_argument(parser)
+    args = parser.parse_args()
 
     backup_dir = Path(os.getenv("BACKUP_DIR", "./backups"))
     db_url = os.getenv("DATABASE_URL", "sqlite:///ledgerlens.db")
@@ -159,24 +194,85 @@ def main():
         logger.error("Failed to load backup manifest")
         return 1
 
-    logger.info(f"Restoring to database: {db_url[:40]}...")
     db_meta = manifest.get("database", {})
+    models_meta = manifest.get("models", {})
     db_backup = Path(db_meta.get("path", ""))
 
     if not db_backup.exists():
         logger.error(f"Database backup file not found: {db_backup}")
         return 1
 
-    if not restore_database(db_url, db_backup, manifest):
-        logger.error("Database restore verification failed")
+    # -----------------------------------------------------------------
+    # Issue #960 — Dry-run: report what would happen and exit early
+    # -----------------------------------------------------------------
+    plan = DryRunPlan(
+        command="restore",
+        extra={"backup_timestamp": manifest.get("timestamp", "unknown")},
+    )
+    plan.add_action(
+        "overwrite",
+        f"database: {db_url[:60]}",
+        detail=f"from backup: {db_meta.get('path', 'unknown')} "
+        f"({db_meta.get('size_bytes', 0) / 1024 / 1024:.1f} MB)",
+    )
+    if models_meta:
+        plan.add_action(
+            "overwrite",
+            f"models directory: {model_dir}",
+            detail=f"from backup: {models_meta.get('path', 'unknown')} "
+            f"({models_meta.get('size_bytes', 0) / 1024 / 1024:.1f} MB)",
+        )
+    if check_dry_run(args, plan):
+        return 0
+
+    # -----------------------------------------------------------------
+    # Issue #962 — Blast-radius summary + confirmation
+    # -----------------------------------------------------------------
+    affected: dict[str, int] = {}
+    if db_meta:
+        size_mb = db_meta.get("size_bytes", 0) / (1024 * 1024)
+        affected["database (size)"] = int(size_mb)
+    if models_meta:
+        size_mb = models_meta.get("size_bytes", 0) / (1024 * 1024)
+        affected["models archive (size MB)"] = int(size_mb)
+
+    summary = BlastRadiusSummary(
+        operation="Database + model artifact restore",
+        affected_records=affected,
+        affected_tenants=[db_url.split("@")[-1].split("/")[0] if "@" in db_url else "local"],
+        extra={
+            "backup_dir": str(backup_dir),
+            "backup_timestamp": manifest.get("timestamp", "unknown"),
+            "target_db": db_url[:60] + ("..." if len(db_url) > 60 else ""),
+            "WARNING": "This will OVERWRITE the current database and models",
+        },
+    )
+
+    if not confirm_destructive_action(summary, non_interactive=args.yes):
+        logger.info("Restore cancelled by operator.")
         return 1
 
-    models_meta = manifest.get("models", {})
-    if models_meta:
-        models_backup = Path(models_meta.get("path", ""))
-        if not restore_models(models_backup, model_dir, manifest):
-            logger.error("Models restore verification failed")
+    # -----------------------------------------------------------------
+    logger.info(f"Restoring to database: {db_url[:40]}...")
+
+    with audit_cli_command(
+        "restore",
+        args={
+            "backup_dir": str(backup_dir),
+            "db_url": db_url[:60],
+            "model_dir": str(model_dir),
+            "yes": args.yes,
+        },
+    ):
+        if not restore_database(db_url, db_backup, manifest):
+            logger.error("Database restore verification failed")
             return 1
+
+        if models_meta:
+            models_backup = Path(models_meta.get("path", ""))
+            if not restore_models(models_backup, model_dir, manifest):
+                logger.error("Models restore verification failed")
+                return 1
 
     logger.info("✅ Restore complete and verified")
     return 0

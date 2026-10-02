@@ -18,6 +18,21 @@ rules:
         target: "${AUDIT_WEBHOOK_URL}"
         severity_label: critical
 
+  # Pipeline latency SLO-burn alerts (issue #921), raised by
+  # monitoring.latency_budget.LatencyBudgetTracker. These are operational,
+  # not wash-trade detections, so they go exclusively to the on-call ops
+  # rotation rather than the detection channels below.
+  - name: latency-slo-burn-oncall
+    detectors: ["latency_slo_burn"]
+    stop_on_match: true
+    destinations:
+      - channel: pagerduty
+        target: "ledgerlens-pipeline-oncall"
+        severity_label: high
+      - channel: slack
+        target: "#ledgerlens-ops"
+        severity_label: high
+
   - name: consensus-escalated-slack
     detectors: ["consensus_escalator"]
     destinations:
@@ -34,12 +49,102 @@ rules:
         target: "${COMPLIANCE_WEBHOOK_URL}"
         severity_label: high
 
+  - name: capacity-forecast-lead-time
+    # Routes alerts produced by CapacityForecaster.check_lead_time_alert().
+    # These carry the detector name "capacity_forecaster" and indicate that a
+    # capacity metric is projected to hit its threshold within lead_time_days.
+    detectors: ["capacity_forecaster"]
+    destinations:
+      - channel: slack
+        target: "#capacity-alerts"
+        severity_label: warning
+      - channel: webhook
+        target: "${CAPACITY_WEBHOOK_URL}"
+        severity_label: warning
+
   - name: tenant-acme-dedicated-channel
     tenant: acme
     destinations:
       - channel: slack
         target: "#acme-wash-trade-alerts"
         severity_label: default
+
+  - name: ingestion-stream-quality
+    detectors: ["stream_quality_monitor"]
+    stop_on_match: true
+    destinations:
+      - channel: slack
+        target: "#data-quality"
+        severity_label: high
+  # Emergency watchdog self-test / dead-man's-switch (#928).
+  #
+  # The watchdog emits a heartbeat to an external, independently-monitored
+  # endpoint on a fixed interval. If that heartbeat is missed, the external
+  # monitor (outside the primary monitoring stack, so a failure of the
+  # primary stack cannot mask a dead watchdog) fires this rule. It is
+  # intentionally `stop_on_match: true` so a missed watchdog heartbeat is
+  # never diluted by other routing rules and always reaches the on-call
+  # pager plus the external dead-man's-switch webhook.
+  #
+  # Escalation path for a missed watchdog heartbeat:
+  #   1. External monitor detects a missed heartbeat and fires this rule.
+  #   2. PagerDuty `ledgerlens-watchdog` pages the primary on-call engineer.
+  #   3. If unacknowledged within the documented SLA, PagerDuty escalates to
+  #      the secondary on-call and the platform lead.
+  #   4. On-call confirms whether the watchdog process is alive; if dead,
+  #      restart it and follow the incident runbook in docs/alerting.md.
+  - name: watchdog-heartbeat-missed
+    detectors: ["emergency_watchdog_heartbeat"]
+    stop_on_match: true
+    destinations:
+      - channel: pagerduty
+        target: "ledgerlens-watchdog"
+        severity_label: critical
+      - channel: webhook
+        target: "${WATCHDOG_DEADMAN_WEBHOOK_URL}"
+        severity_label: critical
+
+# Automated runbook execution policy for well-understood incident classes (#929).
+#
+# Consumed by monitoring.incident_responder to decide whether a matched
+# incident class may be remediated automatically, and under which rollout
+# mode. Rollout is staged: `dry_run` -> `approval_required` -> `full`.
+#   - dry_run:            log the runbook that *would* run; take no action.
+#   - approval_required:  queue the runbook for manual approval before it runs.
+#   - full:               execute the runbook automatically.
+# Every automated action (and every dry-run/approval decision) is written to
+# the audit log with the incident class, runbook, mode, and triggering context
+# so post-incident review has a complete trail.
+#
+# Only incident classes with a well-established, low-risk runbook belong here.
+# Each entry names the incident class, the runbook to execute, the rollout
+# mode, and the blast-radius guardrails the responder must respect.
+automated_runbooks:
+  mode: dry_run
+  incident_classes:
+    # Stuck consumer group: a specific consumer group has stopped making
+    # progress while the broker is healthy. Restarting the group is a
+    # well-understood, low-risk remediation.
+    - name: stuck_consumer_group
+      runbook: restart_consumer_group
+      mode: dry_run
+      params:
+        consumer_group: "${STUCK_CONSUMER_GROUP}"
+      guardrails:
+        max_restarts_per_hour: 3
+        require_broker_healthy: true
+
+    # Stale detection worker: a detection worker has not emitted a heartbeat
+    # within its expected interval but the process is still registered.
+    # Restarting the worker is a well-understood, low-risk remediation.
+    - name: stale_detection_worker
+      runbook: restart_detection_worker
+      mode: dry_run
+      params:
+        worker_id: "${STALE_WORKER_ID}"
+      guardrails:
+        max_restarts_per_hour: 3
+        require_no_active_incident: true
 
 # Used when no rule above matches at all.
 default_destinations:

@@ -8,6 +8,7 @@ Supports three delivery channels:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -96,7 +97,59 @@ class AlertDispatcher:
                 return
             self._cooldowns[wallet] = now + self._alert_cooldown_seconds
 
-        self._deliver(wallet, risk_score, pair_id)
+        key = self.idempotency_key(wallet, risk_score, pair_id, now)
+        if self._delivery_ledger is not None:
+            # Write-ahead: an intent is durable *before* the external call, so a
+            # crash mid-delivery leaves a trace that reconcile_on_startup() sees.
+            if self._delivery_ledger.is_delivered(key):
+                return
+            self._delivery_ledger.record(
+                wallet, pair_id, risk_score, "in_flight", channel=self._channel,
+                idempotency_key=key,
+            )
+        self._deliver(wallet, risk_score, pair_id, key)
+
+    def idempotency_key(
+        self, wallet: str, risk_score: dict, pair_id: str, now: float | None = None
+    ) -> str:
+        """Deterministic key for one alert: stable within a cooldown window."""
+        ts = now if now is not None else time.time()
+        window = int(ts // max(self._alert_cooldown_seconds, 1))
+        raw = f"{wallet}|{pair_id}|{risk_score.get('score')}|{window}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def reconcile_on_startup(self) -> dict[str, int]:
+        """Resolve alerts left ``in_flight`` by a crash before resuming delivery.
+
+        Per-channel policy (see docs/alert_idempotency.md):
+
+        * ``webhook`` supports an ``Idempotency-Key`` header, so the alert is
+          re-sent with the *same* key — the receiver dedupes if the first
+          attempt actually landed.
+        * ``stdout`` / ``websocket`` have no downstream dedup, so re-sending
+          could page twice; the intent is closed as ``reconciled_skipped``
+          (at-most-once) and logged for operator follow-up.
+        """
+        counts = {"redelivered": 0, "skipped": 0}
+        if self._delivery_ledger is None:
+            return counts
+        for rec in self._delivery_ledger.in_flight():
+            risk_score = rec.risk_score or {"score": rec.score}
+            if rec.channel == "webhook" and self._channel == "webhook":
+                self._deliver(rec.wallet, risk_score, rec.pair_id, rec.idempotency_key)
+                counts["redelivered"] += 1
+            else:
+                self._delivery_ledger.record(
+                    rec.wallet, rec.pair_id, risk_score, "reconciled_skipped",
+                    channel=rec.channel, reason="in-flight at crash; channel not idempotent",
+                    idempotency_key=rec.idempotency_key,
+                )
+                logger.warning(
+                    "Alert in flight at crash not re-sent (non-idempotent channel %s): wallet=%s",
+                    rec.channel, rec.wallet,
+                )
+                counts["skipped"] += 1
+        return counts
 
     # ------------------------------------------------------------------
     # Internal delivery
@@ -107,15 +160,19 @@ class AlertDispatcher:
             return self._threshold_controller.get_threshold(asset)
         return float(self._threshold)
 
-    def _deliver(self, wallet: str, risk_score: dict, pair_id: str) -> None:
+    def _deliver(
+        self, wallet: str, risk_score: dict, pair_id: str, key: str | None = None
+    ) -> None:
         if self._channel == "stdout":
-            self._deliver_stdout(wallet, risk_score, pair_id)
+            self._deliver_stdout(wallet, risk_score, pair_id, key)
         elif self._channel == "webhook":
-            self._deliver_webhook(wallet, risk_score, pair_id)
+            self._deliver_webhook(wallet, risk_score, pair_id, key)
         elif self._channel == "websocket":
-            self._deliver_websocket(wallet, risk_score, pair_id)
+            self._deliver_websocket(wallet, risk_score, pair_id, key)
 
-    def _deliver_stdout(self, wallet: str, risk_score: dict, pair_id: str) -> None:
+    def _deliver_stdout(
+        self, wallet: str, risk_score: dict, pair_id: str, key: str | None = None
+    ) -> None:
         # Human-readable line on real stdout — this is what the "stdout" channel
         # name promises, and what operators tailing the process expect to see.
         print(
@@ -141,10 +198,14 @@ class AlertDispatcher:
             },
         )
         if self._delivery_ledger is not None:
-            self._delivery_ledger.record(wallet, pair_id, risk_score, "delivered", channel="stdout")
+            self._delivery_ledger.record(
+                wallet, pair_id, risk_score, "delivered", channel="stdout",
+                idempotency_key=key,
+            )
 
     def _write_to_dead_letter(
-        self, payload: dict, *, wallet: str, risk_score: dict, pair_id: str, reason: str
+        self, payload: dict, *, wallet: str, risk_score: dict, pair_id: str, reason: str,
+        key: str | None = None,
     ) -> None:
         try:
             path = config.ALERT_DEAD_LETTER_PATH
@@ -157,18 +218,25 @@ class AlertDispatcher:
             logger.error("Failed to write alert to dead-letter file: %s", exc)
         if self._delivery_ledger is not None:
             self._delivery_ledger.record(
-                wallet, pair_id, risk_score, "dead_lettered", channel="webhook", reason=reason
+                wallet, pair_id, risk_score, "dead_lettered", channel="webhook", reason=reason,
+                idempotency_key=key,
             )
 
-    def _deliver_webhook(self, wallet: str, risk_score: dict, pair_id: str) -> None:
-        payload = {**risk_score, "wallet": wallet, "pair_id": pair_id}
+    def _deliver_webhook(
+        self, wallet: str, risk_score: dict, pair_id: str, key: str | None = None
+    ) -> None:
+        payload = {**risk_score, "wallet": wallet, "pair_id": pair_id, "idempotency_key": key}
+        headers = {"Idempotency-Key": key} if key else None
         for attempt in range(self._max_retries + 1):
             try:
-                resp = requests.post(self._webhook_url or "", json=payload, timeout=5)
+                resp = requests.post(
+                    self._webhook_url or "", json=payload, headers=headers, timeout=5
+                )
                 resp.raise_for_status()
                 if self._delivery_ledger is not None:
                     self._delivery_ledger.record(
-                        wallet, pair_id, risk_score, "delivered", channel="webhook"
+                        wallet, pair_id, risk_score, "delivered", channel="webhook",
+                        idempotency_key=key,
                     )
                 return
             except requests.HTTPError as exc:
@@ -184,6 +252,7 @@ class AlertDispatcher:
                         risk_score=risk_score,
                         pair_id=pair_id,
                         reason=f"HTTP {status_code} client error",
+                        key=key,
                     )
                     return
                 else:
@@ -210,12 +279,16 @@ class AlertDispatcher:
                     risk_score=risk_score,
                     pair_id=pair_id,
                     reason=f"exhausted {self._max_retries} retries",
+                    key=key,
                 )
 
-    def _deliver_websocket(self, wallet: str, risk_score: dict, pair_id: str) -> None:
-        payload = {**risk_score, "wallet": wallet, "pair_id": pair_id}
+    def _deliver_websocket(
+        self, wallet: str, risk_score: dict, pair_id: str, key: str | None = None
+    ) -> None:
+        payload = {**risk_score, "wallet": wallet, "pair_id": pair_id, "idempotency_key": key}
         self._ws_client.send(json.dumps(payload))
         if self._delivery_ledger is not None:
             self._delivery_ledger.record(
-                wallet, pair_id, risk_score, "delivered", channel="websocket"
+                wallet, pair_id, risk_score, "delivered", channel="websocket",
+                idempotency_key=key,
             )

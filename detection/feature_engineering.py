@@ -990,6 +990,11 @@ def compute_graph_embedding_features(
         Any exceptions from the encoder are caught and not propagated.
     """
 
+    # Planned for Issue #857: the `wallet not in graph` branch below returns
+    # zeros, which sit far outside the trained embedding distribution. It
+    # will call `encoder.encode_inductive(...)` (cold-start path) instead;
+    # zeros stay only as the last-resort fallback when the encoder errors.
+    # See the plan block in detection/gnn_encoder.py.
     dim = config.GNN_EMBEDDING_DIM
     zero_features = {f"gnn_{i}": 0.0 for i in range(dim)}
 

@@ -367,6 +367,32 @@ def cluster_similar_paths(flows: list[ReconstructedPathFlow]) -> dict[str, list]
 
 **Area of Specialty**: Stellar SDK, blockchain analytics, Python, graph algorithms.
 
+## Bounded Payment-Graph Traversal (Issue #916)
+
+`trace_payment_paths(start_wallet, payments, max_depth, max_branching, max_paths)`
+builds a directed wallet graph from payment operations and walks every
+payment path that starts at `start_wallet`. A cyclic or very deep/wide
+graph, whether built by an adversary or produced by bad data, cannot make
+the walk run without limit:
+
+- **Iterative walk.** The walk uses an explicit stack instead of recursion,
+  so it cannot hit Python's recursion limit.
+- **Cycle detection.** A payment back into a wallet already on the current
+  path is recorded in `result.cycles`, and the walk does not follow it.
+- **`max_depth`** (default 12) limits the number of hops in a path.
+- **`max_branching`** (default 32) limits how many outgoing payments are
+  followed from each wallet.
+- **`max_paths`** (default 10,000) limits the total number of paths a single
+  trace returns.
+
+When any bound is hit, the trace does not raise. It returns the paths found
+so far with `result.truncated = True`, lists which bounds were hit in
+`truncation_reasons`, and puts the transaction IDs it skipped in
+`truncated_payment_ids`. It also logs a WARNING that names the start wallet,
+the bounds, and a sample of the skipped transaction IDs, so an analyst can
+follow up on that payment. Paths within the bounds are returned exactly as
+before.
+
 **How to Contribute**:
 
 1. Comment on the issue describing your experience with:

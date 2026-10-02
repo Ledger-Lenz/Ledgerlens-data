@@ -11,6 +11,11 @@ flags wash traders exploiting cross-chain opacity.
 Bridge transactions carrying on-chain ``events`` are classified by bridge
 mechanism (lock-and-mint vs liquidity-pool) and scored with
 mechanism-specific heuristics from ``bridge_mechanisms`` (Issue #880).
+
+Where the bridge publishes a verifiable proof of the transfer (Issue #884),
+detect_bridge_links() verifies it via ``integrations.bridge_attestation`` and
+upgrades the link to a high-confidence ``attestation`` level; otherwise the
+link stays heuristic (memo correlation). See docs/bridge_attestation.md.
 """
 
 from __future__ import annotations
@@ -24,6 +29,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from detection.cross_chain.bridge_mechanisms import analyze_bridge_transaction
+from integrations.bridge_attestation import (
+    ATTESTATION_CONFIDENCE,
+    ATTESTATION_HEURISTIC,
+    BridgeAttestationVerifier,
+    attested_recipient_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +68,42 @@ def bytes_to_base58(b: bytes) -> str:
 class BridgeDetector:
     """Detects cross-chain identities via Stellar bridge transaction memos."""
 
-    def __init__(self, anchor_addresses: list[str] | None = None):
+    def __init__(
+        self,
+        anchor_addresses: list[str] | None = None,
+        attestation_verifier: BridgeAttestationVerifier | None = None,
+    ):
         self.anchor_addresses = set(anchor_addresses or [])
+        self._attestation_verifier = attestation_verifier
+
+    @property
+    def attestation_verifier(self) -> BridgeAttestationVerifier:
+        if self._attestation_verifier is None:
+            self._attestation_verifier = BridgeAttestationVerifier()
+        return self._attestation_verifier
+
+    def _attest(
+        self, tx: dict[str, Any], linked_addr: str, chain: str
+    ) -> tuple[str, float, dict[str, Any]]:
+        """Return (attestation level, confidence, details) for a memo-derived link.
+
+        A proof only upgrades the link when it verifies *and* attests a transfer
+        to ``linked_addr``; a valid proof for some other transfer is ignored.
+        """
+        proof = tx.get("bridge_proof")
+        heuristic = ATTESTATION_CONFIDENCE[ATTESTATION_HEURISTIC]
+        if not proof:
+            return ATTESTATION_HEURISTIC, heuristic, {}
+        result = self.attestation_verifier.verify(proof)
+        if not result.verified:
+            return ATTESTATION_HEURISTIC, heuristic, {"proof_rejected": result.reason}
+        if not attested_recipient_matches(result, linked_addr, chain):
+            return (
+                ATTESTATION_HEURISTIC,
+                heuristic,
+                {"proof_rejected": "proof does not attest a transfer to the linked address"},
+            )
+        return result.level, result.confidence, {"bridge": result.bridge, **result.details}
 
     def parse_memo_address(self, memo_type: str, memo_val: Any) -> tuple[str, str] | None:
         """Parse an Ethereum or Solana address from a memo.
@@ -137,7 +182,11 @@ class BridgeDetector:
             "memo": "...",
             "from": "...",  # optional
             "to": "...",    # optional
+            "bridge_proof": {"bridge": "wormhole", "vaa": "<base64>"},  # optional
         }
+
+        Each link carries ``attestation`` (``zk_proof`` / ``guardian_signatures``
+        / ``heuristic``) and a ``confidence`` weighted by that level.
         """
         links = []
         for tx in transactions:
@@ -172,13 +221,16 @@ class BridgeDetector:
                     stellar_addr = stellar_addr or tx_from
 
             if stellar_addr:
+                attestation, confidence, details = self._attest(tx, linked_addr, chain)
                 link = {
                     "stellar_address": stellar_addr,
                     "linked_address": linked_addr,
                     "chain": chain,
                     "tx_id": tx_id,
                     "memo": str(memo),
-                    "confidence": 1.0,
+                    "confidence": confidence,
+                    "attestation": attestation,
+                    "attestation_details": details,
                 }
                 if tx.get("events"):
                     analysis = analyze_bridge_transaction(tx)

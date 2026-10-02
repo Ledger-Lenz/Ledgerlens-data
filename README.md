@@ -883,6 +883,7 @@ We're actively looking for collaborators with experience in:
 
 | Resource | Description |
 |----------|-------------|
+| [**`docs/maturity_report.md`**](docs/maturity_report.md) | Repository maturity report — auto-generated from `config/repo_maturity.yaml` via `make maturity-report` (Issue #958). Shows composite score and per-dimension breakdown. |
 | [**`notebooks/benford_explainer.ipynb`**](notebooks/benford_explainer.ipynb) | Interactive Benford's Law explainer — visualises digit distributions, chi-square, Z-scores, and MAD on synthetic Stellar DEX trade data; shows how a wash-trade ring distorts the distribution over time |
 | [`detection/benford_engine.py`](detection/benford_engine.py) | Production Benford metrics engine (`chi_square_statistic`, `z_scores`, `mad_score`) |
 | [`docs/drift_detection.md`](docs/drift_detection.md) | PSI-based feature drift detection methodology |
@@ -905,3 +906,12 @@ MIT
 *Built for the Stellar ecosystem. Open source. Community owned.*
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-878 -->
+- #878: MPC aggregator: add dropout-resilient secret reconstruction
+<!-- handsoff-issue-935 -->
+- #935: Grafana dashboards: add a single 'detection pipeline health' overview dashboard
+<!-- handsoff-issue-939 -->
+- #939: Hyperparameter search: add search-budget-aware early termination for unpromising trials

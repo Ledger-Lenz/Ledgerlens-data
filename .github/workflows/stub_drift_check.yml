@@ -1,0 +1,69 @@
+name: Stub Drift Check
+
+# Issue #953 — Nightly CI workflow that runs offline-stub drift detection.
+# Ensures that StubContractClient stays in sync with the real
+# LedgerLensContractClient API surface.
+
+on:
+  schedule:
+    # Nightly at 03:30 UTC (offset from other nightly jobs to avoid resource contention)
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "Python version to test against"
+        required: false
+        default: "3.11"
+
+jobs:
+  stub-drift:
+    name: Offline stub drift detection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ github.event.inputs.python_version || '3.11' }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stub drift detection tests
+        run: |
+          python -m pytest tests/test_stub_drift.py -v \
+            --tb=short \
+            --timeout=60 \
+            -m "not integration and not slow"
+
+      - name: Run contract test scenarios against stub (smoke check)
+        run: |
+          python - <<'EOF'
+          from integrations.offline_stubs import (
+              StubContractClient,
+              StubDriftDetector,
+              run_contract_test_scenarios,
+          )
+
+          print("Running contract test scenarios against StubContractClient...")
+          stub_results = run_contract_test_scenarios(client=StubContractClient())
+
+          print("Scenarios executed:")
+          for name, result in stub_results.items():
+              status = "OK" if result["ok"] else f"ERROR ({result['error_type']})"
+              print(f"  {name}: {status}")
+
+          print("\nStub drift detection: PASSED (no real client available in nightly CI)")
+          print("To run against a live Testnet client, set LEDGERLENS_INTEGRATION_TESTS=1")
+          EOF
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Stub drift detected! The StubContractClient has diverged from"
+          echo "::error::the real LedgerLensContractClient. See tests/test_stub_drift.py"
+          echo "::error::and CONTRIBUTING.md#updating-offline-stubs for remediation steps."

@@ -32,7 +32,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pandas as pd
 
@@ -331,6 +331,9 @@ class SecureFileHandler:
     require_columns : set[str] | None
         Columns that must be present in the ingested data.
         Defaults to ``REQUIRED_CSV_COLUMNS``.
+    scanner : FileScanner | None
+        Pre-parse scanner; defaults to the module-level scanner
+        (``NoOpScanner`` unless configured via ``set_scanner``).
     """
 
     def __init__(
@@ -339,10 +342,12 @@ class SecureFileHandler:
         allowed_base: str | Path | None = None,
         max_file_size: int = MAX_FILE_SIZE_BYTES,
         require_columns: set[str] | None = None,
+        scanner: FileScanner | None = None,
     ) -> None:
         if max_file_size < 1:
             raise ValueError("Maximum file size must be greater than 0 bytes.")
         self._allowed_base = allowed_base
+        self._scanner = scanner
         self._max_file_size = max_file_size
         self._require_columns = (
             require_columns if require_columns is not None else set(REQUIRED_CSV_COLUMNS)
@@ -368,6 +373,9 @@ class SecureFileHandler:
                 file_size,
                 file_hash[:12],
             )
+
+            # Pre-parse scan hook: rejects flagged files before any parsing.
+            check_file(resolved, self._scanner)
 
             reader = _READERS[ext]
             df = reader(resolved)
@@ -419,3 +427,101 @@ class SecureFileHandler:
                 file_path=str_path,
                 rejection_reason=f"Unexpected error: {exc}",
             )
+
+
+# ---------------------------------------------------------------------------
+# Pluggable pre-parse scanning hook
+# ---------------------------------------------------------------------------
+#
+# Every file is passed to the configured `FileScanner` *before* any bytes
+# reach a parser; a non-clean `ScanResult` raises `FileRejectedError`.
+#
+# Reference implementations:
+#   - `NoOpScanner` (default): passes every file through and logs a warning
+#     on first use so operators know scanning is NOT active unless configured.
+#   - `HashListScanner`: SHA-256 allowlist/denylist check backed by
+#     `data/allowlist.json` / `data/denylist.json` (JSON lists of hex digests).
+#
+# ClamAV can be plugged in by implementing `FileScanner.scan` (e.g. calling
+# `clamd.ClamdUnixSocket().scan(path)`) and passing it to `set_scanner`.
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    clean: bool
+    reason: str = ""
+
+
+class FileRejectedError(ValueError):
+    """Raised when a scanner flags a file; no parsing has occurred."""
+
+
+class FileScanner(Protocol):
+    def scan(self, path: Path) -> ScanResult: ...
+
+
+class NoOpScanner:
+    """Pass-through scanner used when no scanner is configured."""
+
+    _warned = False
+
+    def scan(self, path: Path) -> ScanResult:
+        if not NoOpScanner._warned:
+            logger.warning(
+                "File scanning is NOT active: NoOpScanner in use. "
+                "Configure a scanner via secure_file_handler.set_scanner()."
+            )
+            NoOpScanner._warned = True
+        return ScanResult(clean=True, reason="no-op")
+
+
+def _load_digests(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {str(d).lower() for d in json.loads(path.read_text() or "[]")}
+
+
+class HashListScanner:
+    """Reject files whose SHA-256 is denylisted (or, if strict, not allowlisted)."""
+
+    def __init__(
+        self,
+        allowlist_path: Path = _DATA_DIR / "allowlist.json",
+        denylist_path: Path = _DATA_DIR / "denylist.json",
+        strict: bool = False,
+    ):
+        self.allow = _load_digests(Path(allowlist_path))
+        self.deny = _load_digests(Path(denylist_path))
+        self.strict = strict
+
+    def scan(self, path: Path) -> ScanResult:
+        digest = compute_file_hash(path)
+        if digest in self.deny:
+            return ScanResult(False, f"sha256 {digest} is denylisted")
+        if self.strict and digest not in self.allow:
+            return ScanResult(False, f"sha256 {digest} is not allowlisted")
+        return ScanResult(True)
+
+
+_scanner: FileScanner = NoOpScanner()
+
+
+def set_scanner(scanner: FileScanner) -> None:
+    global _scanner
+    _scanner = scanner
+
+
+def get_scanner() -> FileScanner:
+    return _scanner
+
+
+def check_file(path: str | Path, scanner: FileScanner | None = None) -> Path:
+    """Scan `path`; raise `FileRejectedError` if flagged. Returns the Path."""
+    path = Path(path)
+    result = (scanner or _scanner).scan(path)
+    if not result.clean:
+        logger.error("Rejected file %s before parsing: %s", path, result.reason)
+        raise FileRejectedError(f"{path}: {result.reason}")
+    return path

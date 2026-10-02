@@ -130,12 +130,21 @@ Services that consume from the Kafka topic should:
 
 ## SchemaRegistry API
 
-```python
-from ingestion.avro_codec import SchemaRegistry, load_schema
+Producers register their schema before publishing, and the configured
+`SCHEMA_COMPATIBILITY_MODE` (`NONE`, `BACKWARD`, `FORWARD` or `FULL`, default
+`BACKWARD`) is enforced at registration time. Set `SCHEMA_REGISTRY_URL` to use a
+Confluent-compatible Schema Registry (`ConfluentSchemaRegistry`); otherwise the
+in-process `SchemaRegistry` below applies the same rules. See
+[`docs/schema_registry_runbook.md`](../docs/schema_registry_runbook.md) for the
+operational procedure.
 
-registry = SchemaRegistry()
-fp_v1 = registry.register(load_schema("data/trade_avro_schema_v1.json"))
-fp_v2 = registry.register(load_schema("data/trade_avro_schema.json"))
+```python
+from ingestion.avro_codec import SchemaRegistry, read_schema
+
+registry = SchemaRegistry("BACKWARD")
+fp_v1 = registry.register(read_schema("data/trade_avro_schema_v1.json"))
+# Raises SchemaCompatibilityError if v2 breaks BACKWARD compatibility with v1
+fp_v2 = registry.register(read_schema("data/trade_avro_schema.json"))
 
 # Check compatibility
 back_ok, errors = registry.check_backward_compatibility(fp_v1, fp_v2)
@@ -175,3 +184,15 @@ Schema files must only be loaded from the bundled `data/` directory at
 startup.  Runtime schema negotiation from untrusted external sources (e.g.
 operator-supplied URLs, user-submitted JSON) is not supported and must not be
 added without a security review.
+
+---
+
+## Account metadata consumer tolerance (Issue #903)
+
+`streaming/account_metadata_stream.py` tolerates additive upstream changes:
+`AccountMetadataUpdate` uses `extra="ignore"` and `validate_metadata_event`
+extracts only known fields (the full record stays in `raw`). Fields outside
+`KNOWN_EFFECT_FIELDS` never fail the event; they log a one-time WARNING and
+increment `ledgerlens_account_metadata_unknown_fields_total{field=...}` so
+operators can see producer-side schema drift. Removing or retyping a required
+field (`account`/`account_id`, `type`/`effect_type`) remains a breaking change.

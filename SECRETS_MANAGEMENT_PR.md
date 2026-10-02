@@ -480,3 +480,102 @@ If issues arise:
 ---
 
 **Ready for review and merge.** This PR provides a production-ready foundation for secrets management without breaking existing functionality.
+
+---
+
+## Automated Secret-Detection Scan (Issue #956)
+
+A lightweight regex + Shannon-entropy scanner (`scripts/scan_secrets.py`) runs
+as a **required CI check** on every pull request that touches `config/` or
+`.env.example`.  It covers:
+
+| Pattern | Examples caught |
+|---|---|
+| Stellar secret keys | `SXXXXXXXXXXXXXXX…` (56-char Base32 starting with S) |
+| AWS access keys | `AKIA…` |
+| Stripe live keys | `sk_live_…` |
+| Bearer tokens | `Authorization: Bearer <long-token>` |
+| PEM private key headers | `-----BEGIN PRIVATE KEY-----` |
+| Connection strings with passwords | `postgres://user:password@host/db` |
+| JWT tokens | `eyJ…` three-segment tokens |
+| Long hex / base64 blobs | 40+ char hex or base64 in an assignment |
+| High-entropy tokens (≥ 4.5 bits/char) | Novel credential formats |
+
+### Running the scanner locally
+
+```bash
+make scan-secrets                   # scan config/ and .env.example
+make scan-secrets SCAN_PATHS="config/ .env.example scripts/"
+python scripts/scan_secrets.py --help
+```
+
+### CI integration
+
+The scanner runs as a step named **"Secret-detection scan (Issue #956)"** in
+`.github/workflows/ci.yml`.  It exits 1 if any finding is reported, blocking
+the PR merge.
+
+---
+
+## Remediation if a secret is detected {#remediation-if-a-secret-is-detected}
+
+> **Important:** Pushing a secret is a security incident.  Act immediately —
+> do not rely on PR reviewers to catch it retroactively.
+
+### Step 1 — Rotate the credential immediately
+
+Before removing anything from git history, rotate the compromised credential
+with the issuing service (Stellar, AWS console, Stripe dashboard, etc.) so the
+leaked value can no longer be used.
+
+### Step 2 — Purge from git history
+
+Use `git filter-repo` (recommended over the deprecated `git filter-branch`):
+
+```bash
+# Install
+pip install git-filter-repo
+
+# Remove the file entirely from all commits
+git filter-repo --path path/to/secret-file --invert-paths
+
+# OR replace just the secret value everywhere in history
+git filter-repo \
+    --replace-text <(echo "SACTUAL_LEAKED_KEY==>REDACTED_STELLAR_KEY")
+
+# Force-push (coordinate with all team members to re-clone)
+git push --force-with-lease origin <branch>
+```
+
+### Step 3 — Notify team and re-sync
+
+Inform all contributors of the forced history rewrite so they re-clone or
+rebase on top of the cleaned history:
+
+```bash
+git fetch origin
+git reset --hard origin/<branch>
+```
+
+### Step 4 — Add to scanner allowlist (if false-positive)
+
+If the scanner flagged a genuine example/placeholder value (e.g. a
+documentation sample), confirm it is not a real credential and suppress it by
+adding a `# pragma: allowlist secret` comment on the flagged line:
+
+```yaml
+# .env.example
+LEDGERLENS_SUBMITTER_SECRET=SXXXXX_EXAMPLE_ONLY  # pragma: allowlist secret
+```
+
+The scanner treats lines containing `placeholder`, `example`, `your_`, or
+similar keywords as safe — verify the placeholder wording is obvious enough
+that the scanner's built-in heuristic already handles it before adding an
+explicit suppression comment.
+
+### Step 5 — Verify the scan passes
+
+```bash
+make scan-secrets
+# Expected output: "Secret-detection scan PASSED — no secret-shaped values found."
+```

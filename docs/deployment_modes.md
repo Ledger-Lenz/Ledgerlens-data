@@ -56,3 +56,35 @@ an unrelated runtime error downstream.
 ```bash
 pytest tests/test_deployment_modes.py -v
 ```
+
+## Graceful-shutdown guarantee (streaming workers)
+
+Kafka workers drain in-flight messages on SIGTERM before exiting: every consumed
+message is either fully processed with its offset committed, or not committed at
+all and redelivered. Keep `terminationGracePeriodSeconds` >
+`KAFKA_DRAIN_TIMEOUT_SECONDS` (default 30s) during rolling deploys. See
+`docs/stream_replay_runbook.md#graceful-shutdown--in-flight-draining-892`.
+## Liveness vs readiness probes (Issue #902)
+
+`streaming.health_check.start_health_server(port)` exposes:
+
+- `GET /livez` (alias `/health`) — liveness: worker heartbeats only. No external
+  dependencies, so a Kafka outage never causes a restart.
+- `GET /readyz` — readiness: every dependency registered via
+  `register_dependency()` (e.g. `kafka_broker_check`, `model_artifact_check`,
+  a feature-store ping) is checked live with a `READINESS_CHECK_TIMEOUT_SECONDS`
+  timeout (default 2s). Returns 503 while any dependency is down and flips back
+  to 200 automatically when it recovers — no restart required.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /livez, port: 8080 }
+  periodSeconds: 10
+  failureThreshold: 6        # ~1 min of stalled heartbeats before restart
+readinessProbe:
+  httpGet: { path: /readyz, port: 8080 }
+  periodSeconds: 5
+  timeoutSeconds: 3          # > READINESS_CHECK_TIMEOUT_SECONDS
+  failureThreshold: 2        # pull from traffic quickly
+  successThreshold: 1        # rejoin as soon as dependencies recover
+```

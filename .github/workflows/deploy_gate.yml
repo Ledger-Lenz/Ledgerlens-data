@@ -1,0 +1,90 @@
+name: Production Deploy Gate
+
+# Issue #955 — Pre-deploy gate that verifies all debug/unsafe flags are
+# disabled before any production deployment is permitted.
+# Must pass before deploying to the PUBLIC Stellar network.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target deployment environment"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - testnet
+  push:
+    branches:
+      - main
+    paths:
+      - "config/deployment_modes.py"
+      - "config/environments/production.yaml"
+      - ".env.example"
+
+jobs:
+  production-safety-check:
+    name: Production safety check
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run production safety check
+        run: python scripts/check_production_safety.py
+
+      - name: Run deployment modes tests
+        run: |
+          python -m pytest tests/test_deployment_modes.py -v \
+            --tb=short \
+            --timeout=60 \
+            -m "not integration and not slow" \
+            -k "safety"
+
+      - name: Verify production fixture has safe defaults
+        run: |
+          python - <<'EOF'
+          from config.deployment_modes import (
+              DeploymentMode,
+              DEPLOYMENT_MODE_FIXTURES,
+              ProductionSafetyChecker,
+          )
+
+          fixture = DEPLOYMENT_MODE_FIXTURES[DeploymentMode.PRODUCTION]
+          print(f"Production fixture: {fixture.description[:80]}...")
+          print(f"require_onchain: {fixture.require_onchain}")
+
+          # HORIZON_DEV_MODE must be False in the production fixture overrides
+          assert fixture.overrides.get("HORIZON_DEV_MODE") is False, (
+              "Production fixture must set HORIZON_DEV_MODE=False"
+          )
+          assert fixture.require_onchain is True, (
+              "Production fixture must require on-chain credentials"
+          )
+          print("Production fixture safety assertions: PASSED")
+          EOF
+
+      - name: Gate summary
+        if: always()
+        run: |
+          echo "## Production Deploy Gate Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ All safety checks passed — deployment may proceed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Safety check failed — deployment is **blocked**." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Review the failing step above, fix the unsafe configuration, and re-run." >> $GITHUB_STEP_SUMMARY
+          fi

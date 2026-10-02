@@ -1,19 +1,27 @@
 """Data quality scoring and ledger import readiness evaluation (Issue #464).
 
 Provides a reusable, contract-driven data quality scoring engine for evaluating
-incoming ledger records (trades, payments, orderbooks, account activity) before ingestion.
+incoming ledger records (trades, payments, orderbooks, account activity) before ingestion,
+plus stream-level anomaly detection on batch volume and field shape (Issue #913).
 """
 
 from __future__ import annotations
 
 import datetime
 import re
+from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from alerts.router import Alert, AlertRouter, RouteDestination
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class QualityDimension(StrEnum):
@@ -577,3 +585,249 @@ class LedgerQualityScorer:
             total_records=total_records,
             diagnostics=diagnostics,
         )
+
+
+# ---------------------------------------------------------------------------
+# Stream-level anomaly detection (Issue #913)
+#
+# Per-record rules above cannot see a systemic upstream fault that produces
+# individually valid records which are collectively wrong (a feed silently
+# dropping 90% of trades, a field suddenly arriving null for every record).
+# StreamQualityMonitor tracks rolling per-source baselines of batch volume and
+# key-field null rates / means and routes deviations through alerts.router.
+# ---------------------------------------------------------------------------
+
+STREAM_QUALITY_DETECTOR = "stream_quality_monitor"
+
+try:
+    from prometheus_client import Counter, Gauge
+
+    stream_metric_value = Gauge(
+        "ledgerlens_ingestion_stream_metric_value",
+        "Latest observed stream-level ingestion metric (batch volume, null rate, mean)",
+        ["source", "metric"],
+    )
+    stream_metric_zscore = Gauge(
+        "ledgerlens_ingestion_stream_metric_zscore",
+        "Deviation of the latest stream-level metric from its rolling baseline",
+        ["source", "metric"],
+    )
+    stream_anomalies_total = Counter(
+        "ledgerlens_ingestion_stream_anomalies_total",
+        "Stream-level ingestion anomalies detected, by suppression state",
+        ["source", "metric", "direction", "suppressed"],
+    )
+except Exception:  # pragma: no cover - prometheus optional in tests
+    stream_metric_value = None  # type: ignore[assignment]
+    stream_metric_zscore = None  # type: ignore[assignment]
+    stream_anomalies_total = None  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class SuppressionWindow:
+    """An acknowledged period during which anomalies for a source are expected.
+
+    ``source="*"`` covers every source; ``metrics=None`` covers every metric.
+    """
+
+    source: str
+    start: datetime.datetime
+    end: datetime.datetime
+    reason: str
+    metrics: frozenset[str] | None = None
+
+    def covers(self, source: str, metric: str, at: datetime.datetime) -> bool:
+        if self.source not in ("*", source):
+            return False
+        if self.metrics is not None and metric not in self.metrics:
+            return False
+        return self.start <= at < self.end
+
+
+@dataclass
+class StreamAnomaly:
+    """A stream-level metric that deviated from its rolling baseline."""
+
+    source: str
+    metric: str
+    observed: float
+    baseline_mean: float
+    baseline_std: float
+    z_score: float
+    detected_at: datetime.datetime
+    suppressed_by: SuppressionWindow | None = None
+
+    @property
+    def direction(self) -> str:
+        return "spike" if self.observed > self.baseline_mean else "drop"
+
+    def to_alert(self) -> Alert:
+        """Shape the anomaly as an ``alerts.router.Alert`` with triage context."""
+        return {
+            "detectors": [STREAM_QUALITY_DETECTOR],
+            "source": self.source,
+            "metric": self.metric,
+            "direction": self.direction,
+            "observed": self.observed,
+            "baseline": self.baseline_mean,
+            "magnitude": self.z_score,
+            "detected_at": self.detected_at.isoformat(),
+            "message": (
+                f"{self.source}: {self.metric} {self.direction} "
+                f"(observed={self.observed:.4g}, baseline={self.baseline_mean:.4g}, "
+                f"z={self.z_score:+.1f})"
+            ),
+        }
+
+
+class StreamQualityMonitor:
+    """Rolling statistical checks on ingestion volume and key-field shape.
+
+    Each call to :meth:`observe_batch` computes, per source, the batch
+    ``volume``, ``null_rate:<field>`` for every key field and ``mean:<field>``
+    for every distribution field, and compares each against a rolling window
+    of that source's previous batches. A metric whose z-score exceeds
+    ``z_threshold`` is an anomaly. The spread used for the z-score is floored
+    (``relative_std_floor`` of the baseline mean, ``null_rate_std_floor`` for
+    null rates) so a near-constant baseline does not turn ordinary jitter into
+    alerts.
+
+    Anomalous observations are kept out of the baseline so one bad batch does
+    not normalise the next; after an intended level change, call
+    :meth:`reset_baseline`. Anomalies inside an acknowledged
+    :class:`SuppressionWindow` are counted but not routed.
+    """
+
+    def __init__(
+        self,
+        router: AlertRouter | None = None,
+        dispatch: Callable[[RouteDestination, Alert], None] | None = None,
+        key_fields: list[str] | None = None,
+        distribution_fields: list[str] | None = None,
+        window: int = 24,
+        min_history: int = 6,
+        z_threshold: float = 4.0,
+        relative_std_floor: float = 0.05,
+        null_rate_std_floor: float = 0.01,
+    ) -> None:
+        self.router = router
+        self.dispatch = dispatch
+        self.key_fields = key_fields if key_fields is not None else ["amount"]
+        self.distribution_fields = distribution_fields or []
+        self.window = window
+        self.min_history = min_history
+        self.z_threshold = z_threshold
+        self.relative_std_floor = relative_std_floor
+        self.null_rate_std_floor = null_rate_std_floor
+        self._history: dict[tuple[str, str], deque[float]] = {}
+        self._suppressions: list[SuppressionWindow] = []
+
+    def acknowledge(
+        self,
+        source: str,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        reason: str,
+        metrics: list[str] | None = None,
+    ) -> SuppressionWindow:
+        """Register an expected change (e.g. planned maintenance) for *source*."""
+        if end <= start:
+            raise ValueError("suppression window end must be after start")
+        suppression = SuppressionWindow(
+            source, start, end, reason, frozenset(metrics) if metrics is not None else None
+        )
+        self._suppressions.append(suppression)
+        logger.info("Acknowledged stream-quality window for %s: %s", source, reason)
+        return suppression
+
+    def reset_baseline(self, source: str) -> None:
+        """Forget *source*'s rolling history, e.g. after an intended level shift."""
+        for key in [k for k in self._history if k[0] == source]:
+            del self._history[key]
+
+    def compute_metrics(self, df: pd.DataFrame) -> dict[str, float]:
+        """Stream-level metrics for one ingestion batch."""
+        metrics = {"volume": float(len(df))}
+        for col in self.key_fields:
+            if col in df.columns and len(df):
+                metrics[f"null_rate:{col}"] = float(df[col].isna().mean())
+        for col in self.distribution_fields:
+            if col in df.columns:
+                values = pd.to_numeric(df[col], errors="coerce").dropna()
+                if len(values):
+                    metrics[f"mean:{col}"] = float(values.mean())
+        return metrics
+
+    def observe_batch(
+        self,
+        source: str,
+        data: pd.DataFrame | list[dict[str, Any]],
+        at: datetime.datetime | None = None,
+    ) -> list[StreamAnomaly]:
+        """Score one batch from *source*, route unsuppressed anomalies, return all."""
+        df = pd.DataFrame(data) if isinstance(data, list) else data
+        at = at or datetime.datetime.now(tz=datetime.UTC)
+        self._suppressions = [s for s in self._suppressions if s.end > at]
+
+        anomalies = []
+        for metric, value in self.compute_metrics(df).items():
+            anomaly = self._check(source, metric, value, at)
+            if anomaly is not None:
+                anomalies.append(anomaly)
+                self._emit(anomaly)
+        return anomalies
+
+    def _check(
+        self, source: str, metric: str, value: float, at: datetime.datetime
+    ) -> StreamAnomaly | None:
+        history = self._history.setdefault((source, metric), deque(maxlen=self.window))
+        if stream_metric_value is not None:
+            stream_metric_value.labels(source=source, metric=metric).set(value)
+
+        if len(history) < self.min_history:
+            history.append(value)
+            return None
+
+        mean = float(np.mean(history))
+        floor = (
+            self.null_rate_std_floor
+            if metric.startswith("null_rate:")
+            else self.relative_std_floor * abs(mean)
+        )
+        std = max(float(np.std(history)), floor, 1e-9)
+        z_score = (value - mean) / std
+        if stream_metric_zscore is not None:
+            stream_metric_zscore.labels(source=source, metric=metric).set(z_score)
+
+        if abs(z_score) <= self.z_threshold:
+            history.append(value)
+            return None
+
+        suppressed_by = next((s for s in self._suppressions if s.covers(source, metric, at)), None)
+        return StreamAnomaly(source, metric, value, mean, std, z_score, at, suppressed_by)
+
+    def _emit(self, anomaly: StreamAnomaly) -> None:
+        suppressed = anomaly.suppressed_by is not None
+        if stream_anomalies_total is not None:
+            stream_anomalies_total.labels(
+                source=anomaly.source,
+                metric=anomaly.metric,
+                direction=anomaly.direction,
+                suppressed=str(suppressed).lower(),
+            ).inc()
+        if suppressed:
+            logger.info(
+                "Suppressed stream anomaly for %s/%s (%s)",
+                anomaly.source,
+                anomaly.metric,
+                anomaly.suppressed_by.reason,  # type: ignore[union-attr]
+            )
+            return
+
+        alert = anomaly.to_alert()
+        logger.warning("Stream-quality anomaly: %s", alert["message"])
+        if self.router is None:
+            return
+        for destination in self.router.route(alert):
+            if self.dispatch is not None:
+                self.dispatch(destination, alert)

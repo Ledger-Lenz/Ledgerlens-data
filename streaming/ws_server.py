@@ -22,14 +22,18 @@ from collections import deque
 from typing import Any, Literal
 
 import websockets
-from prometheus_client import Counter, Gauge
+from prometheus_client import Counter, Gauge, Histogram
 from pydantic import BaseModel, Field, ValidationError
 
 from config import config
 from config.contracts import validate_mode
 from streaming.pubsub_router import PubSubRouter
 from streaming.ws_abuse_detector import AbuseDetector
-from streaming.ws_auth import JWTAuthenticator
+from streaming.ws_auth import (
+    CLOSE_TOKEN_EXPIRED,
+    CLOSE_TOKEN_REFRESH_REJECTED,
+    JWTAuthenticator,
+)
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -230,6 +234,24 @@ ws_auth_failures_total = Counter(
     "ws_auth_failures_total",
     "Total authentication failures",
 )
+ws_client_queue_depth = Histogram(
+    "ws_client_queue_depth",
+    "Per-connection outbound queue depth observed at enqueue time",
+    buckets=(0, 1, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
+ws_slow_consumer_events_total = Counter(
+    "ws_slow_consumer_events_total",
+    "Slow-consumer policy triggers (queue full)",
+    labelnames=["policy", "action"],
+)
+ws_token_events_total = Counter(
+    "ws_token_events_total",
+    "In-band token refresh outcomes",
+    labelnames=["outcome"],
+)
+
+# Close code sent when a slow consumer is disconnected (issue #893).
+CLOSE_SLOW_CONSUMER = 4008
 
 # ─────────────────────────────────────────────────────────────────────────
 # Module-level State
@@ -358,6 +380,8 @@ async def _handler(websocket) -> None:
                 "queue": client_queue,
                 "rate_limiter": rate_limiter,
                 "permissions": permissions,
+                "token_exp": _get_auth().token_expiry(claims),
+                "drops": 0,
             }
 
         logger.info("WebSocket client connected (client_id=%s, total=%d)", client_id, len(_clients))
@@ -380,9 +404,12 @@ async def _handler(websocket) -> None:
         # is considered dead and the task exits, triggering cleanup via FIRST_COMPLETED.
         heartbeat_task = asyncio.create_task(_heartbeat(websocket, client_id))
 
+        # Task 4: Token expiry watchdog — closes with 4001 unless refreshed in-band.
+        expiry_task = asyncio.create_task(_token_expiry_watchdog(websocket, client_id))
+
         # Wait for either task to complete or for client to disconnect
         done, pending = await asyncio.wait(
-            [inbound_task, outbound_task, heartbeat_task],
+            [inbound_task, outbound_task, heartbeat_task, expiry_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
 
@@ -481,6 +508,9 @@ async def _process_inbound(websocket, client_id: str, permissions: set[str]) -> 
                     await _handle_unsubscribe(websocket, client_id, payload)
                 elif msg_type == "replay":
                     await _handle_replay(websocket, client_id, permissions, payload)
+                elif msg_type == "refresh_token":
+                    if not await _handle_refresh(websocket, client_id, permissions, payload):
+                        return
                 else:
                     error = ErrorMessage(
                         code="unknown_type", message=f"Unknown message type: {msg_type}"
@@ -502,6 +532,45 @@ async def _process_inbound(websocket, client_id: str, permissions: set[str]) -> 
         pass
     except Exception as exc:
         logger.error("Unexpected error in _process_inbound: %s", str(exc))
+
+
+async def _handle_refresh(websocket, client_id: str, permissions: set[str], payload: dict) -> bool:
+    """Handle an in-band token refresh. Returns False if the connection was closed."""
+    with _clients_lock:
+        state = _clients.get(client_id)
+        current_exp = state["token_exp"] if state else 0.0
+    claims = _get_auth().verify_refresh(str(payload.get("token", "")), client_id, current_exp)
+    if claims is None or state is None:
+        ws_token_events_total.labels(outcome="rejected").inc()
+        await websocket.close(code=CLOSE_TOKEN_REFRESH_REJECTED, reason="token_refresh_rejected")
+        return False
+    new_exp = _get_auth().token_expiry(claims)
+    permissions.clear()
+    permissions.update(_get_auth().extract_permissions(claims))
+    with _clients_lock:
+        state["token_exp"] = new_exp
+    ws_token_events_total.labels(outcome="refreshed").inc()
+    await websocket.send(json.dumps({"type": "token_refreshed", "exp": new_exp}))
+    return True
+
+
+async def _token_expiry_watchdog(websocket, client_id: str) -> None:
+    """Close the connection with 4001 once the session token expires unrefreshed."""
+    try:
+        while True:
+            with _clients_lock:
+                state = _clients.get(client_id)
+                if state is None:
+                    return
+                deadline = state["token_exp"] + config.WS_TOKEN_EXPIRY_GRACE_SECONDS
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                ws_token_events_total.labels(outcome="expired").inc()
+                await websocket.close(code=CLOSE_TOKEN_EXPIRED, reason="token_expired")
+                return
+            await asyncio.sleep(min(remaining, 60.0))
+    except asyncio.CancelledError:
+        pass
 
 
 async def _handle_subscribe(
@@ -808,9 +877,13 @@ async def publish_score_update(score_event: dict) -> None:
 
 
 def _enqueue_for_client(client_id: str, message: dict) -> None:
-    """Enqueue message for client, handling backpressure.
+    """Enqueue message for client, applying the slow-consumer policy.
 
-    If queue is full, drops oldest message and sends notification.
+    Policy (``WS_SLOW_CONSUMER_POLICY``, see docs/ws_streaming_policies.md):
+    - ``drop_oldest``: evict the oldest queued message and notify the client;
+      disconnect once drops exceed ``WS_SLOW_CONSUMER_MAX_DROPS`` (if > 0).
+    - ``disconnect``: close the connection with code 4008 immediately.
+    Producers are never blocked, so healthy clients are unaffected.
 
     Args:
         client_id: Client ID
@@ -819,11 +892,21 @@ def _enqueue_for_client(client_id: str, message: dict) -> None:
     with _clients_lock:
         if client_id not in _clients:
             return
-        queue = _clients[client_id]["queue"]
+        state = _clients[client_id]
+        queue = state["queue"]
 
+    ws_client_queue_depth.observe(queue.qsize())
+    policy = config.WS_SLOW_CONSUMER_POLICY
     try:
         queue.put_nowait(message)
     except asyncio.QueueFull:
+        state["drops"] = state.get("drops", 0) + 1
+        max_drops = config.WS_SLOW_CONSUMER_MAX_DROPS
+        if policy == "disconnect" or (max_drops > 0 and state["drops"] > max_drops):
+            ws_slow_consumer_events_total.labels(policy=policy, action="disconnect").inc()
+            _disconnect_slow_consumer(client_id, state["websocket"])
+            return
+        ws_slow_consumer_events_total.labels(policy=policy, action="drop_oldest").inc()
         # Queue is full; drop oldest message
         try:
             queue.get_nowait()
@@ -839,6 +922,23 @@ def _enqueue_for_client(client_id: str, message: dict) -> None:
             pass
 
         ws_messages_dropped_total.inc()
+
+
+def _disconnect_slow_consumer(client_id: str, websocket: Any) -> None:
+    """Schedule a close of a slow consumer's connection without blocking the producer."""
+    with _clients_lock:
+        _clients.pop(client_id, None)
+        ws_connected_clients.set(len(_clients))
+    logger.warning("Disconnecting slow consumer (client_id=%s)", client_id)
+    try:
+        asyncio.get_running_loop().create_task(
+            websocket.close(code=CLOSE_SLOW_CONSUMER, reason="slow_consumer")
+        )
+    except RuntimeError:
+        if _loop is not None:
+            asyncio.run_coroutine_threadsafe(
+                websocket.close(code=CLOSE_SLOW_CONSUMER, reason="slow_consumer"), _loop
+            )
 
 
 def push_alert_sync(payload: dict) -> None:

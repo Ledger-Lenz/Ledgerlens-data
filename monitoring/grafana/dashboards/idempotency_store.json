@@ -1,0 +1,94 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "LedgerLens — Idempotency Key Store",
+  "description": "Size, growth rate and TTL evictions of the pipeline idempotency-key store (pipeline/idempotency.py). With TTL eviction working, size plateaus at roughly one IDEMPOTENCY_TTL_HOURS window of keys; sustained growth means eviction is not running.",
+  "tags": ["ledgerlens", "pipeline", "idempotency"],
+  "timezone": "browser",
+  "time": {"from": "now-7d", "to": "now"},
+  "refresh": "1m",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Stored keys",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(ledgerlens_idempotency_store_entries)",
+          "legendFormat": "keys",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"}
+    },
+    {
+      "id": 2,
+      "title": "Growth rate (keys/hour)",
+      "description": "Should hover around zero once the store holds a full TTL window. A sustained positive rate means keys are not being evicted.",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "deriv(sum(ledgerlens_idempotency_store_entries)[6h:5m]) * 3600",
+          "legendFormat": "keys/hour",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"}
+    },
+    {
+      "id": 3,
+      "title": "Evicted keys (last 24h)",
+      "type": "stat",
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum(increase(ledgerlens_idempotency_store_evicted_total[24h]))",
+          "legendFormat": "evicted",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"}
+    },
+    {
+      "id": 4,
+      "title": "Store size by status",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (status) (ledgerlens_idempotency_store_entries)",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 5,
+      "title": "Growth rate and eviction rate (keys/hour)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "deriv(sum(ledgerlens_idempotency_store_entries)[1h:5m]) * 3600",
+          "legendFormat": "net growth",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(ledgerlens_idempotency_store_evicted_total[1h])) * 3600",
+          "legendFormat": "evictions",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    }
+  ]
+}

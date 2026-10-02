@@ -159,6 +159,99 @@ def _nx_to_pyg(
 
 
 # ---------------------------------------------------------------------------
+# Inductive inference for unseen wallets (Issue #857) — audit + plan
+# ---------------------------------------------------------------------------
+#
+# Audit of transductive-only assumptions (as of this commit):
+#
+#   A1. No embedding table: `_GraphSAGEModel` here and `WalletGraphSAGE` in
+#       gnn_embedder.py are SAGEConv stacks over the 5 node features, with no
+#       nn.Embedding keyed by node id. So the *model* is already inductive.
+#       The gaps are in how inference is driven (A2-A6).
+#   A2. `GNNEncoder.encode` raises KeyError for a wallet that is not in
+#       `graph`, and `feature_engineering.compute_graph_embedding_features`
+#       turns that (and any error) into an all-zeros vector. A zero vector
+#       is far outside the norm range of trained embeddings, so the
+#       downstream ensemble sees it as an outlier rather than "unknown".
+#   A3. Any new node changes `sorted(graph.nodes())`, which clears the whole
+#       `_embedding_cache` and re-runs a full-graph forward pass. That is
+#       O(|V| + |E|) per unseen wallet, which is the production common case.
+#   A4. `update_node` takes a 1-hop subgraph, but the model has 2 SAGEConv
+#       layers, so its receptive field is 2 hops. Node features (in/out
+#       degree) are also recomputed from the *local* subgraph, so
+#       neighbours' degrees are wrong. Incremental embeddings therefore
+#       differ from full-graph embeddings of the same node.
+#   A5. Node features are raw and unscaled (degree, age_days, trade_count,
+#       total_volume_xlm). A new high-volume wallet can produce an embedding
+#       whose norm is far above anything seen in training.
+#   A6. `TemporalGNNEncoder.encode` returns zeros for a wallet with no
+#       memory, and uses a zero self-feature vector even when the wallet's
+#       own features are known.
+#
+# Planned design:
+#
+# 1. Feature scaling (fixes A5): at training time, fit per-feature
+#    log1p + mean/std statistics and save them as `feature_scaler` in the
+#    `gnn_encoder` entry of metrics.json. They are covered by the same
+#    SHA-256 manifest as the state dict. `_nx_to_pyg` applies the scaler
+#    when it is loaded, and returns identity when absent (old artifacts),
+#    so existing artifacts keep working.
+#
+# 2. `GNNEncoder.encode_inductive(wallet, graph, wallet_metadata=None,
+#    *, num_neighbors=(25, 10)) -> np.ndarray` (fixes A2, A3, A4):
+#    - Builds node features from the FULL graph first (correct degrees),
+#      then takes the k-hop subgraph around `wallet` with k = number of
+#      SAGEConv layers (2), via torch_geometric.utils.k_hop_subgraph.
+#    - GraphSAGE-style neighbour sampling: cap fan-out per hop at
+#      `num_neighbors` (sampled with a fixed seed derived from the wallet id,
+#      so results are reproducible). This bounds latency on hub wallets.
+#    - Does not touch or invalidate the full-graph cache; the result is
+#      cached under the wallet key only.
+#    - `encode()` routes to `encode_inductive` when the wallet is not in the
+#      cached node set instead of re-encoding the full graph. `update_node`
+#      is reimplemented on top of `encode_inductive` so both paths agree.
+#
+# 3. Cold-start fallback for wallets with no edges yet (fixes A2 zeros):
+#    - `_ColdStartEncoder`: a 2-layer MLP (5 -> hidden -> embedding_dim)
+#      trained after the GraphSAGE model to regress the GraphSAGE embedding
+#      of each training node from its own scaled features alone (MSE, plus
+#      a cosine term). This puts cold-start vectors in the same space and
+#      norm range as trained embeddings.
+#    - Saved as `gnn_cold_start.pt` with its own SHA-256 manifest entry. If
+#      absent, fall back to running the SAGE model on a 1-node graph with a
+#      self-loop, which still uses the wallet's own features rather than
+#      zeros.
+#    - `compute_graph_embedding_features` calls
+#      `encoder.encode_inductive(...)` for wallets not in the graph instead
+#      of returning zeros. Zeros remain only for the "torch not installed"
+#      path.
+#    - `TemporalGNNEncoder.encode` uses the cold-start embedding when the
+#      memory is empty (fixes A6).
+#
+# 4. Acceptance tests (tests/test_gnn_inductive.py):
+#    - Train on a synthetic graph, hold out 20% of wallets (removed with
+#      their edges), add them back at inference. The held-out embeddings'
+#      L2 norms fall within [p1, p99] of the trained embeddings' norms, and
+#      each held-out embedding's nearest-trained-neighbour cosine distance is
+#      <= the p95 of the same measure among trained nodes.
+#    - Cold-start (zero-edge) wallet: non-zero embedding, norm within the
+#      same [p1, p99] band.
+#    - Regression: for every node present at training time, `encode()`
+#      output is unchanged (np.allclose, atol=1e-6) compared with the
+#      current full-graph path, i.e. transductive nodes are unaffected.
+#    - `encode_inductive` equals the full-graph embedding when
+#      num_neighbors=None (no sampling), which proves the k-hop fix for A4.
+#
+# 5. Latency benchmark (benchmarks/gnn_cold_start.py): time
+#    encode_inductive and the cold-start path over 1,000 unseen wallets on
+#    graphs of 1k / 10k / 100k nodes with `time.perf_counter`, and report
+#    p50/p95/p99 in a JSON file under reports/. Proposed budget, to be
+#    confirmed against the first benchmark run: cold-start p95 < 5 ms,
+#    inductive 2-hop p95 < 50 ms at 10k nodes (the same 50 ms target
+#    `update_node`'s docstring already claims).
+
+
+# ---------------------------------------------------------------------------
 # Public encoder class
 # ---------------------------------------------------------------------------
 

@@ -52,6 +52,28 @@ current detection thresholds.
 | Feature Schema Version | {{ report.model_metadata.get("feature_schema_version", "N/A") }} |
 
 ---
+{% if report.asset_metadata %}
+
+## Asset Metadata Provenance
+
+{% if report.asset_metadata_degraded -%}
+⚠️  Asset metadata for this report is **not fresh primary-source data**
+(trust tier `{{ report.asset_metadata.trust_tier }}`{% if report.asset_metadata.is_stale %}, stale{% endif %}).
+Supply-dependent figures should be treated with corresponding caution.
+
+{% endif -%}
+| Field | Value |
+|---|---|
+| Asset | {{ report.asset_metadata.asset_code }}:{{ report.asset_metadata.asset_issuer }} |
+| Circulating Supply | {{ report.asset_metadata.circulating_supply if report.asset_metadata.circulating_supply is not none else "N/A" }} |
+| Trust Tier | `{{ report.asset_metadata.trust_tier }}` |
+| Source | {{ report.asset_metadata.source or "N/A" }} |
+| Fetched At (UTC) | {{ report.asset_metadata.fetched_at or "N/A" }} |
+| Age | {{ "%.0f s" | format(report.asset_metadata.age_seconds) if report.asset_metadata.age_seconds is not none else "N/A" }} |
+| Stale | {{ "yes" if report.asset_metadata.is_stale else "no" }} |
+
+---
+{% endif %}
 
 ## SHAP Feature Attribution
 

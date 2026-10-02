@@ -976,3 +976,31 @@ recorded outcome as a hard error — the "silently dropped alert" failure mode.
 root, and rehydrates `self._entries` from durable storage on every
 construction. A routine process restart no longer makes `verify_chain()`
 indistinguishable from real tampering.
+
+## FeatureBuffer memory bound and eviction (Issue #901)
+
+`streaming.FeatureBuffer` holds at most `FEATURE_BUFFER_MAX_WALLETS × max_trades`
+trade records (default `100000 × 1000`; `FEATURE_BUFFER_MAX_WALLETS=0` disables the wallet cap).
+
+**Eviction policy:** each wallet's deque drops its oldest trade once full. When a
+new wallet arrives and the wallet cap is reached, the **least-recently-used**
+wallet (by last `update`/`get_feature_row`) is evicted along with its dedup
+index and Benford sketches.
+
+**Metrics** (published by `FeatureBuffer.stats()`, called by `buffer_stats` logger):
+
+| Metric | Meaning |
+|---|---|
+| `ledgerlens_feature_buffer_evictions_total` | LRU wallet evictions (use `rate()` for eviction rate) |
+| `ledgerlens_feature_buffer_wallets` | Wallets currently buffered |
+| `ledgerlens_feature_buffer_trades` | Trades currently buffered |
+| `ledgerlens_feature_buffer_occupancy_ratio` | wallets / max_wallets |
+
+**Tradeoffs:**
+- *Tightening* the bound lowers memory and OOM risk, but evicted wallets lose
+  history and Benford state — their next score is computed from a cold start and
+  the dedup index no longer protects against redelivery of their old trades.
+- *Loosening* the bound keeps more wallets warm (better feature quality) at the
+  cost of memory proportional to `max_wallets × max_trades`.
+- Sustained non-zero eviction rate with occupancy ≈ 1.0 means the working set
+  exceeds the cap; raise it (with memory headroom) or shard by wallet.

@@ -70,6 +70,7 @@ class FeatureCache:
         ttl_seconds: int | None = None,
         maxsize: int | None = None,
         tenant_id: str | None = None,
+        schema_version: int | str | None = None,
     ) -> None:
         self._ttl = ttl_seconds if ttl_seconds is not None else config.FEATURE_CACHE_TTL_SECONDS
         self._maxsize = maxsize if maxsize is not None else config.FEATURE_CACHE_MAXSIZE
@@ -77,8 +78,21 @@ class FeatureCache:
             schema_version if schema_version is not None else FEATURE_CONTRACT_VERSION
         )
         self._lock = threading.Lock()
-        self._cache: OrderedDict[str, tuple[pd.Series, float]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[pd.Series, float, int | str]] = OrderedDict()
         self.tenant_id = tenant_id
+
+    @property
+    def schema_version(self) -> int | str:
+        """The active feature contract version this cache enforces."""
+        return self._schema_version
+
+    @schema_version.setter
+    def schema_version(self, value: int | str) -> None:
+        """Update the active schema version, clearing any stale cached rows."""
+        with self._lock:
+            self._schema_version = value
+            # Purge all entries: their schema version may no longer match.
+            self._cache.clear()
 
     def _key(self, wallet: str) -> str:
         """Namespace the cache key by tenant.
@@ -115,9 +129,10 @@ class FeatureCache:
     def put(self, wallet: str, features: pd.Series, schema_version: int | str | None = None) -> None:
         """Cache *features* for *wallet*, evicting the LRU entry if at capacity."""
         key = self._key(wallet)
+        sv = schema_version if schema_version is not None else self._schema_version
         with self._lock:
             self._cache.pop(key, None)
-            self._cache[key] = (features, time.monotonic())
+            self._cache[key] = (features, time.monotonic(), sv)
             while len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
@@ -321,3 +336,264 @@ class RecentDataBuffer:
                 self._chunks[0] = oldest.iloc[excess:].reset_index(drop=True)
                 self._n_rows -= excess
                 break
+
+
+# ---------------------------------------------------------------------------
+# CacheWarmer — cold-start warm-up strategy (Issue #969)
+# ---------------------------------------------------------------------------
+
+
+class CacheWarmer:
+    """Pre-populate a :class:`FeatureCache` with the most-active wallets before
+    an instance is marked ready to receive production traffic.
+
+    Cold-start problem
+    ------------------
+    After every deployment the feature cache is empty.  The first wave of
+    requests re-builds every feature matrix from scratch, causing a latency
+    spike that typically lasts until the TTL window is filled (~1–2 minutes at
+    production trade volumes).  ``CacheWarmer`` eliminates this spike by
+    computing and caching features for the *hot set* — the wallets most likely
+    to be scored in the next scoring cycle — **before** the readiness probe
+    marks the instance live.
+
+    Hot-set definition
+    ------------------
+    The hot set is derived from recent ``RiskScore`` records persisted in the
+    database.  Wallets with the highest trade activity or score frequency in
+    the last ``lookback_hours`` hours are the most likely to be re-scored
+    immediately after deployment.  The default hot-set size is
+    ``config.CACHE_WARM_HOT_SET_SIZE`` (100 wallets).
+
+    Usage
+    -----
+    ::
+
+        cache = FeatureCache()
+        warmer = CacheWarmer(cache, feature_builder=my_feature_fn)
+        warmer.warm(hot_set=[(wallet_id, features_series), ...])
+
+        # Or use the convenience method that queries the risk-score store:
+        warmer.warm_from_store(risk_store, trades_df, ...)
+
+    Deployment integration
+    ----------------------
+    Call :meth:`warm` (or :meth:`warm_from_store`) in the instance startup
+    sequence **before** signalling readiness to the load-balancer or
+    container orchestrator.  In Kubernetes this means calling it before the
+    readiness probe HTTP endpoint starts returning 200.  The
+    :attr:`is_warm` flag turns ``True`` when warm-up completes and can be
+    checked by your readiness probe handler.
+
+    Metrics
+    -------
+    ``CacheWarmer`` exposes a Prometheus gauge (``cache_warm_entries_total``)
+    that tracks how many entries were inserted during the last warm-up run.
+    A Prometheus counter (``cache_warm_duration_seconds``) records elapsed
+    time.  These are optional: if ``prometheus_client`` is not installed the
+    attributes are ``None`` and no metrics are emitted.
+
+    Args:
+        cache: The :class:`FeatureCache` instance to warm.
+        hot_set_size: Maximum number of wallets to pre-warm. Defaults to
+            ``config.CACHE_WARM_HOT_SET_SIZE`` (100).
+        timeout_seconds: Maximum wall-clock time allowed for the warm-up phase.
+            If the warm-up takes longer than this, it is stopped early and
+            :attr:`is_warm` is still set to ``True`` (partial warm-up is better
+            than delaying deployment). Defaults to
+            ``config.CACHE_WARM_TIMEOUT_SECONDS`` (30).
+    """
+
+    def __init__(
+        self,
+        cache: FeatureCache,
+        hot_set_size: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._cache = cache
+        try:
+            from config import config as _cfg
+
+            self._hot_set_size = int(
+                hot_set_size
+                if hot_set_size is not None
+                else getattr(_cfg, "CACHE_WARM_HOT_SET_SIZE", 100)
+            )
+            self._timeout = float(
+                timeout_seconds
+                if timeout_seconds is not None
+                else getattr(_cfg, "CACHE_WARM_TIMEOUT_SECONDS", 30.0)
+            )
+        except Exception:  # pragma: no cover
+            self._hot_set_size = hot_set_size if hot_set_size is not None else 100
+            self._timeout = timeout_seconds if timeout_seconds is not None else 30.0
+
+        self._is_warm: bool = False
+        self._entries_warmed: int = 0
+        self._last_warm_duration_seconds: float | None = None
+
+        # Optional Prometheus metrics
+        try:
+            from prometheus_client import Counter, Gauge
+
+            self._warm_entries_gauge: object | None = Gauge(
+                "cache_warm_entries_total",
+                "Number of entries inserted during the last cache warm-up run",
+            )
+            self._warm_duration_counter: object | None = Counter(
+                "cache_warm_duration_seconds_total",
+                "Total seconds spent in cache warm-up runs",
+            )
+        except Exception:  # pragma: no cover
+            self._warm_entries_gauge = None
+            self._warm_duration_counter = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def is_warm(self) -> bool:
+        """``True`` once :meth:`warm` has completed (even if partial)."""
+        return self._is_warm
+
+    @property
+    def entries_warmed(self) -> int:
+        """Number of entries inserted during the last warm-up run."""
+        return self._entries_warmed
+
+    @property
+    def last_warm_duration_seconds(self) -> float | None:
+        """Elapsed seconds for the most recent warm-up run, or ``None`` if
+        no warm-up has been performed yet."""
+        return self._last_warm_duration_seconds
+
+    def warm(
+        self,
+        hot_set: list[tuple[str, "pd.Series"]],
+    ) -> int:
+        """Pre-populate the cache from a pre-computed hot set.
+
+        Args:
+            hot_set: List of ``(wallet_id, feature_series)`` tuples to insert.
+                The list is processed in order; up to :attr:`hot_set_size`
+                entries are inserted. Processing stops early if
+                :attr:`timeout_seconds` elapses.
+
+        Returns:
+            Number of cache entries actually inserted.
+        """
+        start = time.monotonic()
+        inserted = 0
+        limit = min(self._hot_set_size, len(hot_set))
+
+        for wallet_id, features in hot_set[:limit]:
+            elapsed = time.monotonic() - start
+            if elapsed >= self._timeout:
+                break
+            try:
+                self._cache.put(wallet_id, features)
+                inserted += 1
+            except Exception:  # pragma: no cover
+                # Never let a warm-up error block startup
+                pass
+
+        elapsed_total = time.monotonic() - start
+        self._entries_warmed = inserted
+        self._last_warm_duration_seconds = elapsed_total
+        self._is_warm = True
+
+        # Update Prometheus metrics
+        if self._warm_entries_gauge is not None:
+            self._warm_entries_gauge.set(inserted)  # type: ignore[union-attr]
+        if self._warm_duration_counter is not None:
+            self._warm_duration_counter.inc(elapsed_total)  # type: ignore[union-attr]
+
+        return inserted
+
+    def warm_from_store(
+        self,
+        risk_store: object,
+        build_features_fn,
+        trades_df: "pd.DataFrame",
+        lookback_hours: int = 24,
+        **feature_kwargs,
+    ) -> int:
+        """Query the risk-score store for the hot set and warm the cache.
+
+        Identifies the most-active wallets from *risk_store* (those scored
+        most recently within *lookback_hours* hours), builds their feature
+        matrices using *build_features_fn*, and inserts them into the cache.
+
+        Args:
+            risk_store: A repository object with a ``get_recent_wallets``
+                method (or equivalent) that returns
+                ``list[str]`` — wallet IDs ordered by recency.
+            build_features_fn: Callable ``(wallet_id, wallet_trades_df, **kwargs)
+                -> pd.Series`` that computes the feature vector for a wallet.
+            trades_df: Full trade DataFrame used to build per-wallet features.
+                Only rows matching each hot-set wallet are passed to
+                *build_features_fn*.
+            lookback_hours: How far back to look when selecting the hot set.
+                Default 24 hours.
+            **feature_kwargs: Extra keyword arguments forwarded to
+                *build_features_fn* (e.g. ``funding_graph``, ``all_pairs_df``).
+
+        Returns:
+            Number of cache entries inserted.
+        """
+        try:
+            wallets: list[str] = list(
+                risk_store.get_recent_wallets(  # type: ignore[union-attr]
+                    limit=self._hot_set_size,
+                    lookback_hours=lookback_hours,
+                )
+            )
+        except Exception:  # pragma: no cover
+            # Store unavailable at startup — proceed without warming
+            self._is_warm = True
+            return 0
+
+        start = time.monotonic()
+        hot_set: list[tuple[str, "pd.Series"]] = []
+
+        for wallet_id in wallets:
+            elapsed = time.monotonic() - start
+            if elapsed >= self._timeout:
+                break
+            try:
+                wallet_trades = (
+                    trades_df[trades_df["wallet_id"] == wallet_id]
+                    if not trades_df.empty
+                    else trades_df
+                )
+                features = build_features_fn(wallet_id, wallet_trades, **feature_kwargs)
+                hot_set.append((wallet_id, pd.Series(features) if isinstance(features, dict) else features))
+            except Exception:  # pragma: no cover
+                # Feature build errors must not block warm-up
+                continue
+
+        return self.warm(hot_set)
+
+    def describe(self) -> dict:
+        """Return a summary of the last warm-up run for operator diagnostics.
+
+        Useful for logging at startup and for the readiness-probe endpoint::
+
+            if not warmer.is_warm:
+                return {"ready": False}
+            info = warmer.describe()
+            logger.info("Cache warmed: %s", info)
+
+        Returns:
+            Dictionary with ``is_warm``, ``entries_warmed``,
+            ``last_warm_duration_seconds``, and ``hot_set_size``.
+        """
+        return {
+            "is_warm": self._is_warm,
+            "entries_warmed": self._entries_warmed,
+            "last_warm_duration_seconds": self._last_warm_duration_seconds,
+            "hot_set_size": self._hot_set_size,
+            "timeout_seconds": self._timeout,
+            "cache_size": len(self._cache),
+        }

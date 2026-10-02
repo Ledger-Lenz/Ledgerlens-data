@@ -1,0 +1,21 @@
+name: Importer conformance
+
+on:
+  pull_request:
+    paths:
+      - "ingestion/**importer*.py"
+      - "ingestion/historical_loader.py"
+      - "scripts/check_importer_conformance.py"
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Check importer conformance
+        run: PYTHONPATH=. python scripts/check_importer_conformance.py

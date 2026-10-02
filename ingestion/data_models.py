@@ -308,6 +308,9 @@ class BotFingerprint(BaseModel):
     """Bot detection fingerprint extracted from Horizon event patterns."""
 
     account_id: str
+    fingerprint_version: str = Field(
+        default="v1", description="Fingerprint feature schema version for compatibility tracking"
+    )
     trust_line_creation_latency_seconds: float | None = Field(
         default=None, description="Time in seconds from account creation to first trust line"
     )

@@ -288,3 +288,144 @@ class LabelQualityEstimator:
                     "status": "quarantined",
                 }
                 f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Issue #887: inter-annotator agreement tracking
+# ---------------------------------------------------------------------------
+
+
+def assign_overlapping_items(
+    item_ids: list[str],
+    annotators: list[str],
+    overlap_fraction: float | None = None,
+    n_per_overlap: int = 2,
+    seed: int = 42,
+) -> dict[str, list[str]]:
+    """Assign queue items to annotators, sending *overlap_fraction* of items to 2+ annotators.
+
+    Returns ``item_id -> [annotator, ...]``. Non-overlap items go round-robin to one annotator.
+    """
+    if overlap_fraction is None:
+        overlap_fraction = config.AL_OVERLAP_FRACTION
+    if not 0.0 <= overlap_fraction <= 1.0:
+        raise ValueError(f"overlap_fraction must be in [0, 1], got {overlap_fraction}")
+    if not annotators:
+        raise ValueError("at least one annotator is required")
+    rng = np.random.default_rng(seed)
+    k = min(max(2, n_per_overlap), len(annotators))
+    n_overlap = int(round(len(item_ids) * overlap_fraction)) if len(annotators) > 1 else 0
+    overlap = set(rng.choice(len(item_ids), size=n_overlap, replace=False).tolist()) if n_overlap else set()
+    assignments: dict[str, list[str]] = {}
+    for i, item in enumerate(item_ids):
+        if i in overlap:
+            assignments[item] = [str(a) for a in rng.choice(annotators, size=k, replace=False)]
+        else:
+            assignments[item] = [annotators[i % len(annotators)]]
+    return assignments
+
+
+def cohens_kappa(labels_a: list, labels_b: list) -> float:
+    """Cohen's kappa between two annotators over the same items."""
+    if len(labels_a) != len(labels_b):
+        raise ValueError("label lists must be equal length")
+    n = len(labels_a)
+    if n == 0:
+        return float("nan")
+    a, b = np.asarray(labels_a), np.asarray(labels_b)
+    p_o = float(np.mean(a == b))
+    cats = np.union1d(a, b)
+    p_e = float(sum(np.mean(a == c) * np.mean(b == c) for c in cats))
+    if p_e == 1.0:
+        return 1.0 if p_o == 1.0 else 0.0
+    return (p_o - p_e) / (1.0 - p_e)
+
+
+def fleiss_kappa(ratings: dict[str, dict[str, Any]]) -> float:
+    """Fleiss' kappa over ``item_id -> {annotator: label}`` (items with 2+ ratings only)."""
+    items = [list(r.values()) for r in ratings.values() if len(r) >= 2]
+    if not items:
+        return float("nan")
+    cats = sorted({lab for labs in items for lab in labs}, key=str)
+    counts = np.array([[labs.count(c) for c in cats] for labs in items], dtype=float)
+    n_i = counts.sum(axis=1)
+    p_i = ((counts * (counts - 1)).sum(axis=1)) / (n_i * (n_i - 1))
+    p_bar = float(p_i.mean())
+    p_j = counts.sum(axis=0) / n_i.sum()
+    p_e = float((p_j**2).sum())
+    if p_e == 1.0:
+        return 1.0
+    return (p_bar - p_e) / (1.0 - p_e)
+
+
+class AgreementTracker:
+    """Track per-annotator agreement on overlapping items and route disagreements.
+
+    ``ratings`` is ``item_id -> {annotator_id: label}``. An annotator's score is the
+    mean Cohen's kappa against every peer who shared at least ``min_shared`` items.
+    Annotators below ``min_kappa`` are flagged; their votes are down-weighted to
+    ``flagged_weight`` in :meth:`resolve`. Items with no weighted majority of at
+    least ``consensus`` go to adjudication, so no label is ever picked silently.
+    """
+
+    def __init__(
+        self,
+        min_kappa: float | None = None,
+        min_shared: int = 5,
+        consensus: float = 0.75,
+        flagged_weight: float = 0.0,
+    ):
+        self.min_kappa = config.AL_MIN_ANNOTATOR_KAPPA if min_kappa is None else min_kappa
+        self.min_shared = min_shared
+        self.consensus = consensus
+        self.flagged_weight = flagged_weight
+        self.ratings: dict[str, dict[str, Any]] = {}
+
+    def record(self, item_id: str, annotator_id: str, label: Any) -> None:
+        self.ratings.setdefault(item_id, {})[annotator_id] = label
+
+    def annotator_kappas(self) -> dict[str, float]:
+        annotators = sorted({a for r in self.ratings.values() for a in r})
+        scores: dict[str, list[float]] = {a: [] for a in annotators}
+        for i, a in enumerate(annotators):
+            for b in annotators[i + 1 :]:
+                shared = [r for r in self.ratings.values() if a in r and b in r]
+                if len(shared) < self.min_shared:
+                    continue
+                k = cohens_kappa([r[a] for r in shared], [r[b] for r in shared])
+                scores[a].append(k)
+                scores[b].append(k)
+        return {a: float(np.mean(v)) for a, v in scores.items() if v}
+
+    def flagged_annotators(self) -> list[str]:
+        return sorted(a for a, k in self.annotator_kappas().items() if k < self.min_kappa)
+
+    def resolve(self) -> tuple[dict[str, Any], list[str]]:
+        """Return ``(resolved_labels, items_needing_adjudication)``."""
+        flagged = set(self.flagged_annotators())
+        resolved: dict[str, Any] = {}
+        adjudicate: list[str] = []
+        for item, votes in self.ratings.items():
+            tally: dict[Any, float] = {}
+            for ann, lab in votes.items():
+                tally[lab] = tally.get(lab, 0.0) + (self.flagged_weight if ann in flagged else 1.0)
+            total = sum(tally.values())
+            if total == 0:
+                adjudicate.append(item)
+                continue
+            label, weight = max(tally.items(), key=lambda kv: kv[1])
+            if len(votes) == 1 or weight / total >= self.consensus:
+                resolved[item] = label
+            else:
+                adjudicate.append(item)
+        if flagged:
+            logger.warning("Low-agreement annotators flagged: %s", sorted(flagged))
+        return resolved, adjudicate
+
+    def report(self) -> dict[str, Any]:
+        return {
+            "fleiss_kappa": fleiss_kappa(self.ratings),
+            "annotator_kappas": self.annotator_kappas(),
+            "flagged_annotators": self.flagged_annotators(),
+            "min_kappa": self.min_kappa,
+        }

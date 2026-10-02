@@ -272,3 +272,181 @@ def apply_deployment_mode(
                 delattr(config_cls, name)
             else:
                 setattr(config_cls, name, value)
+
+
+# ---------------------------------------------------------------------------
+# Issue #955 — Production safety checker
+# ---------------------------------------------------------------------------
+
+#: Complete enumeration of debug/unsafe feature flags that MUST be disabled
+#: in production.  Add new flags here when introducing them to ``Config``.
+#:
+#: Each entry is a ``(config_attr_name, unsafe_value, description)`` tuple:
+#: - ``config_attr_name``: the attribute name on the ``Config`` class / object.
+#: - ``unsafe_value``: the value that is considered unsafe in production.
+#: - ``description``: human-readable explanation for the safety report.
+PRODUCTION_UNSAFE_FLAGS: list[tuple[str, Any, str]] = [
+    (
+        "HORIZON_DEV_MODE",
+        True,
+        "HORIZON_DEV_MODE=True bypasses TLS verification and enables verbose "
+        "Horizon request logging — must be disabled in production.",
+    ),
+    (
+        "DEBUG_MODE",
+        True,
+        "DEBUG_MODE=True enables stack traces in API error responses and "
+        "disables rate limiting — must be disabled in production.",
+    ),
+    (
+        "VERBOSE_ERRORS",
+        True,
+        "VERBOSE_ERRORS=True exposes internal exception details to API callers "
+        "— must be disabled in production.",
+    ),
+    (
+        "DISABLE_AUTH",
+        True,
+        "DISABLE_AUTH=True removes API authentication — must be disabled in production.",
+    ),
+    (
+        "PERMISSIVE_CORS",
+        True,
+        "PERMISSIVE_CORS=True allows all CORS origins — must be disabled in production.",
+    ),
+    (
+        "ALLOW_UNAUTHENTICATED_SCORING",
+        True,
+        "ALLOW_UNAUTHENTICATED_SCORING=True lets anyone call the scoring endpoint "
+        "without an API key — must be disabled in production.",
+    ),
+    (
+        "SKIP_MODEL_INTEGRITY_CHECK",
+        True,
+        "SKIP_MODEL_INTEGRITY_CHECK=True disables Ed25519 + SHA-256 model artifact "
+        "verification — must be disabled in production.",
+    ),
+    (
+        "LEDGERLENS_OFFLINE",
+        "1",
+        "LEDGERLENS_OFFLINE=1 routes contract calls to the in-memory stub — "
+        "no on-chain writes occur in production with this flag set.",
+    ),
+    (
+        "LEDGERLENS_OFFLINE",
+        "true",
+        "LEDGERLENS_OFFLINE=true routes contract calls to the in-memory stub — "
+        "no on-chain writes occur in production with this flag set.",
+    ),
+]
+
+
+class ProductionSafetyViolation:
+    """A single unsafe flag violation detected by :class:`ProductionSafetyChecker`."""
+
+    def __init__(self, attr: str, current_value: Any, description: str) -> None:
+        self.attr = attr
+        self.current_value = current_value
+        self.description = description
+
+    def __str__(self) -> str:
+        return (
+            f"  UNSAFE: {self.attr}={self.current_value!r}\n"
+            f"          {self.description}"
+        )
+
+
+class ProductionSafetyError(RuntimeError):
+    """Raised by :class:`ProductionSafetyChecker` when unsafe flags are enabled.
+
+    Carries the full list of :class:`ProductionSafetyViolation` objects so
+    tooling can report them structured as well as human-readable.
+    """
+
+    def __init__(self, violations: list[ProductionSafetyViolation]) -> None:
+        self.violations = violations
+        lines = [f"Production safety check failed ({len(violations)} violation(s)):"]
+        for v in violations:
+            lines.append(str(v))
+        lines.append(
+            "\nReview the flags above and ensure they are disabled before deploying to production."
+        )
+        super().__init__("\n".join(lines))
+
+
+class ProductionSafetyChecker:
+    """Verify that all debug/unsafe feature flags are disabled in production.
+
+    This checker is designed to run as a **pre-deploy gate** — it should be
+    called before any production deployment and must pass before the deploy
+    is allowed to proceed.
+
+    Usage::
+
+        from config.deployment_modes import ProductionSafetyChecker, DeploymentMode
+
+        checker = ProductionSafetyChecker()
+        checker.verify_production_safe()          # raises ProductionSafetyError if unsafe
+        violations = checker.check(config_obj)    # returns list, never raises
+
+    The unsafe flags checked are defined in :data:`PRODUCTION_UNSAFE_FLAGS`.
+    To add a new flag, append to that list — the checker picks it up automatically.
+
+    Parameters
+    ----------
+    unsafe_flags:
+        Override the default :data:`PRODUCTION_UNSAFE_FLAGS`.  Mainly useful
+        in tests.
+    """
+
+    def __init__(
+        self,
+        unsafe_flags: list[tuple[str, Any, str]] | None = None,
+    ) -> None:
+        self._unsafe_flags = unsafe_flags if unsafe_flags is not None else PRODUCTION_UNSAFE_FLAGS
+
+    def check(self, config_obj: Any = None) -> list[ProductionSafetyViolation]:
+        """Return violations without raising.
+
+        Parameters
+        ----------
+        config_obj:
+            Object to inspect.  Defaults to ``config.Config`` (class-level
+            attributes).  Can be any object with the expected attributes.
+
+        Returns
+        -------
+        list[ProductionSafetyViolation]
+            Empty list when all flags are safe.
+        """
+        if config_obj is None:
+            config_obj = import_module("config").Config
+
+        violations: list[ProductionSafetyViolation] = []
+        for attr, unsafe_val, description in self._unsafe_flags:
+            current = getattr(config_obj, attr, None)
+            # Normalise string values for case-insensitive comparison
+            if isinstance(unsafe_val, str) and isinstance(current, str):
+                if current.strip().lower() == unsafe_val.strip().lower():
+                    violations.append(ProductionSafetyViolation(attr, current, description))
+            elif current == unsafe_val:
+                violations.append(ProductionSafetyViolation(attr, current, description))
+        return violations
+
+    def verify_production_safe(self, config_obj: Any = None) -> None:
+        """Assert that no unsafe flags are enabled.
+
+        Parameters
+        ----------
+        config_obj:
+            Object to inspect.  Defaults to ``config.Config``.
+
+        Raises
+        ------
+        ProductionSafetyError
+            If any unsafe flag is enabled.  The error message lists every
+            violation with the flag name, current value, and explanation.
+        """
+        violations = self.check(config_obj)
+        if violations:
+            raise ProductionSafetyError(violations)

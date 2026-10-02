@@ -63,6 +63,8 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `KAFKA_LAG_ALERT_THRESHOLD` | `KAFKA_LAG_ALERT_THRESHOLD` | `int` | No | `'500'` | — |
 | `KAFKA_METRICS_PORT` | `KAFKA_METRICS_PORT` | `int` | No | `'9100'` | — |
 | `TRADE_AVRO_SCHEMA_PATH` | `TRADE_AVRO_SCHEMA_PATH` | `str` | No | `'data/trade_avro_schema.json'` | — |
+| `SCHEMA_REGISTRY_URL` | `SCHEMA_REGISTRY_URL` | `str | None` | Yes | — | Confluent-compatible Schema Registry base URL (ingestion/avro_codec.py). When unset, schemas are registered in an in-process registry instead. |
+| `SCHEMA_COMPATIBILITY_MODE` | `SCHEMA_COMPATIBILITY_MODE` | `str` | No | `'BACKWARD'` | NONE, BACKWARD, FORWARD or FULL; enforced when a producer registers its schema. |
 | `WORKER_HEALTH_STALE_THRESHOLD_SECONDS` | `WORKER_HEALTH_STALE_THRESHOLD_SECONDS` | `float` | No | `'120'` | Worker health monitoring (streaming/health.py::WorkerHealthMonitor). A worker is marked UNHEALTHY when it has not heartbeat within this many seconds — should comfortably exceed the poll-loop interval plus the slowest expected per-message processing time. |
 | `E2E_LATENCY_BUDGET_MS` | `E2E_LATENCY_BUDGET_MS` | `int` | No | `'2000'` | End-to-end latency budget (Issue #124) |
 | `LATENCY_ANOMALY_RATE_THRESHOLD` | `LATENCY_ANOMALY_RATE_THRESHOLD` | `float` | No | `'0.90'` | — |
@@ -82,10 +84,16 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `WS_REPLAY_BUFFER_SIZE` | `WS_REPLAY_BUFFER_SIZE` | `int` | No | `'1000'` | — |
 | `WS_RATE_LIMIT_MSGS_PER_SECOND` | `WS_RATE_LIMIT_MSGS_PER_SECOND` | `int` | No | `'100'` | — |
 | `WS_HEARTBEAT_INTERVAL_SECONDS` | `WS_HEARTBEAT_INTERVAL_SECONDS` | `float` | No | `'30'` | Seconds between WebSocket ping frames sent to each client. If the client does not respond with a pong within this interval, the connection is closed and the subscriber entry is cleaned up. |
+| `WS_SLOW_CONSUMER_POLICY` | `WS_SLOW_CONSUMER_POLICY` | `str` | No | `'drop_oldest'` | Slow-consumer policy when a client's outbound queue is full (issue #893): "drop_oldest" (default) or "disconnect". Under drop_oldest, a client that drops more than WS_SLOW_CONSUMER_MAX_DROPS messages is disconnected (0 = never). |
+| `WS_SLOW_CONSUMER_MAX_DROPS` | `WS_SLOW_CONSUMER_MAX_DROPS` | `int` | No | `'0'` | — |
+| `WS_TOKEN_EXPIRY_GRACE_SECONDS` | `WS_TOKEN_EXPIRY_GRACE_SECONDS` | `float` | No | `'0'` | In-band token refresh (issue #894): seconds of grace after token expiry before the connection is force-closed with code 4001. |
 | `WS_ABUSE_MAX_REQUESTS_PER_MINUTE` | `WS_ABUSE_MAX_REQUESTS_PER_MINUTE` | `int` | No | `'300'` | WebSocket abuse detection (issue #223) |
 | `WS_ABUSE_MAX_DISTINCT_WALLETS` | `WS_ABUSE_MAX_DISTINCT_WALLETS` | `int` | No | `'50'` | — |
 | `WS_ABUSE_WALLET_WINDOW_SECONDS` | `WS_ABUSE_WALLET_WINDOW_SECONDS` | `int` | No | `'60'` | — |
 | `WS_ABUSE_BLOCK_DURATION_SECONDS` | `WS_ABUSE_BLOCK_DURATION_SECONDS` | `int` | No | `'300'` | — |
+| `WS_ABUSE_MAX_REPUTATION_MULTIPLIER` | `WS_ABUSE_MAX_REPUTATION_MULTIPLIER` | `float` | No | `'3.0'` | Reputation-based adaptive rate limit (issue #895) |
+| `WS_ABUSE_NEW_CLIENT_MULTIPLIER` | `WS_ABUSE_NEW_CLIENT_MULTIPLIER` | `float` | No | `'1.0'` | — |
+| `WS_ABUSE_REPUTATION_HALF_LIFE_SECONDS` | `WS_ABUSE_REPUTATION_HALF_LIFE_SECONDS` | `float` | No | `'3600'` | — |
 | `DP_TARGET_EPSILON` | `DP_TARGET_EPSILON` | `float` | No | `'8.0'` | Differentially private neural training (DP-SGD via Opacus) |
 | `DP_TARGET_DELTA` | `DP_TARGET_DELTA` | `float` | No | `'1e-5'` | — |
 | `DP_MAX_GRAD_NORM` | `DP_MAX_GRAD_NORM` | `float` | No | `'1.0'` | — |
@@ -217,6 +225,7 @@ Auto-generated from `config.py` by `scripts/generate_env_contract_docs.py` (Issu
 | `RISK_PROP_CONVERGENCE_THRESHOLD` | `RISK_PROP_CONVERGENCE_THRESHOLD` | `float` | No | `'0.01'` | Weighted personalised PageRank convergence (detection/risk_propagation.py) |
 | `TRADE_DEDUP_TTL_SECONDS` | `TRADE_DEDUP_TTL_SECONDS` | `int` | No | `str(24 * 3600)` | Trade ingestion dedup cache (ingestion/trade_deduplicator.py) |
 | `TRADE_DEDUP_CACHE_KEY_PREFIX` | `TRADE_DEDUP_CACHE_KEY_PREFIX` | `str` | No | `'ledgerlens:trades:'` | — |
+| `IDEMPOTENCY_TTL_HOURS` | `IDEMPOTENCY_TTL_HOURS` | `int` | No | `'48'` | Pipeline stage idempotency-key TTL (pipeline/idempotency.py); see docs/idempotency.md |
 | `PARALLEL_EXECUTOR_BACKEND` | `PARALLEL_EXECUTOR_BACKEND` | `str` | No | `'process'` | Parallel processing controls — Issue #528 (ingestion/parallel_executor.py) Executor backend: "process" uses ProcessPoolExecutor (bypasses the GIL, best for CPU-heavy Benford / feature engineering work); "thread" uses ThreadPoolExecutor (lower overhead for I/O-bound tasks). |
 | `PARALLEL_EXECUTOR_MAX_WORKERS` | `PARALLEL_EXECUTOR_MAX_WORKERS` | `int` | No | `str(max(1, (os.cpu_count() or 2) - 1))` | Maximum number of worker processes/threads.  Defaults to CPU count − 1 (≥ 1). |
 | `PARALLEL_EXECUTOR_MAX_PENDING` | `PARALLEL_EXECUTOR_MAX_PENDING` | `int` | No | `'64'` | Maximum number of futures that may be in-flight simultaneously (back-pressure). 0 disables the limit. |

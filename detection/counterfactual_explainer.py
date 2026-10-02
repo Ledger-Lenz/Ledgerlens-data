@@ -1,5 +1,193 @@
 """Counterfactual Explanation Generator for individual risk score decisions (Issue #193).
 
+# =============================================================================
+# Issue #860 — Add counterfactual explanation caching keyed on feature-space
+# neighborhoods
+# https://github.com/Ledger-Lenz/Ledgerlens-data/issues/860
+#
+# ─── PROBLEM ─────────────────────────────────────────────────────────────────
+#
+# CounterfactualExplainer.explain() recomputes counterfactuals from scratch on
+# every call. A single explanation runs up to 500 random coordinate-search
+# attempts plus gradient estimation (N*2 scorer calls). On a busy review queue
+# where many transactions share the same account or feature neighborhood, this
+# is expensive and redundant.
+#
+# ─── PROPOSED IMPLEMENTATION ─────────────────────────────────────────────────
+#
+# Step 1 — LSH-keyed cache using FeatureCache infrastructure
+# -----------------------------------------------------------
+# Reuse FeatureCache from detection/feature_cache.py. The cache key is a
+# Locality-Sensitive Hash (LSH) of the input feature vector rather than the
+# exact wallet address, so near-duplicate inputs (same wallet, similar recent
+# features) share cache entries.
+#
+# LSH computation:
+#
+#   import hashlib
+#   import numpy as np
+#
+#   def lsh_key(
+#       feature_row: pd.Series,
+#       mutable_cols: list[str],
+#       n_hyperplanes: int = 16,
+#       seed: int = 42,
+#   ) -> str:
+#       """Compute an LSH bucket key from the mutable feature vector.
+#
+#       Projects the feature vector onto `n_hyperplanes` random unit vectors
+#       and binarises the dot products to produce a compact bit-string.
+#       Two feature vectors that are close in Euclidean space will map to the
+#       same bit-string (same cache key) with high probability.
+#       """
+#       rng = np.random.default_rng(seed)
+#       vals = np.array([float(feature_row.get(c, 0.0)) for c in mutable_cols])
+#       hyperplanes = rng.standard_normal((n_hyperplanes, len(vals)))
+#       bits = (hyperplanes @ vals >= 0).astype(int)
+#       bit_str = "".join(map(str, bits))
+#       return hashlib.sha256(bit_str.encode()).hexdigest()[:16]
+#
+# The cache maps: lsh_key → CounterfactualResult
+# Storage: reuse FeatureCache with TTL (configurable, default 300s) and
+# per-tenant namespacing.
+#
+# Cache lookup in explain():
+#
+#   cache_key = lsh_key(feature_row, self._mutable_cols)
+#   cached = self._cf_cache.get(cache_key)
+#   if cached is not None:
+#       # Adjust wallet field and return; log as cache hit
+#       cached.wallet = wallet
+#       return cached
+#   result = self._coordinate_search(...)
+#   self._cf_cache.put(cache_key, result)
+#   return result
+#
+# Step 2 — Staleness/invalidation policy via cache_invalidation.py
+# ----------------------------------------------------------------
+# Register the CF cache with the default InvalidationRegistry:
+#
+#   from detection.cache_invalidation import default_registry
+#
+#   default_registry.register_cache(
+#       "cf_explanation_cache",
+#       evict=self._cf_cache.invalidate,
+#   )
+#
+# Invalidation triggers:
+#
+#   a) Model version change: when a new scorer is loaded, call:
+#        default_registry.invalidate_source(
+#            "scorer:model_version",
+#            reason="model_retrained"
+#        )
+#      All CF cache entries that recorded "scorer:model_version" as a
+#      dependency are evicted automatically.
+#
+#   b) Feature schema change: when FEATURE_CONTRACT_VERSION bumps, the
+#      FeatureCache._schema_version guard already handles this — LSH keys
+#      computed on the old feature layout hash to wrong buckets and naturally
+#      miss. No extra eviction needed, but log a warning.
+#
+#   c) Manual TTL: entries older than TTL (default 300s for CFs vs 60s for
+#      raw features) are stale. CFs are more expensive to compute but also
+#      more stable (the model doesn't change per-request), so a longer TTL
+#      is appropriate.
+#
+# Step 3 — Cache-hit-rate metric in metrics_collector.py
+# -------------------------------------------------------
+# Export two new Prometheus counters from counterfactual_explainer.py:
+#
+#   from prometheus_client import Counter
+#
+#   cf_cache_hits_total = Counter(
+#       "cf_explanation_cache_hits_total",
+#       "Counterfactual explanation requests served from LSH cache",
+#   )
+#   cf_cache_misses_total = Counter(
+#       "cf_explanation_cache_misses_total",
+#       "Counterfactual explanation requests that required fresh computation",
+#   )
+#
+# The hit rate metric is then:
+#   hit_rate = cf_cache_hits_total / (cf_cache_hits_total + cf_cache_misses_total)
+#
+# Expose a method on MetricsCollector (monitoring/metrics_collector.py):
+#
+#   def cf_hit_rate(self) -> float | None:
+#       """Return current CF cache hit rate, or None if no requests yet."""
+#       hits = cf_cache_hits_total._value.get()
+#       total = hits + cf_cache_misses_total._value.get()
+#       return hits / total if total > 0 else None
+#
+# Step 4 — Cache correctness tolerance check
+# -------------------------------------------
+# A cached result is correct if its predicted_score for each CF is within
+# `tolerance` of what would be freshly computed:
+#
+#   def _verify_cf_correctness(
+#       self,
+#       cached: CounterfactualResult,
+#       feature_row: pd.Series,
+#       tolerance: float = 5.0,   # configurable; default 5 score points
+#   ) -> bool:
+#       for cf in cached.counterfactuals:
+#           fresh_score = self.scorer.score_continuous(
+#               pd.Series(cf.feature_values)
+#           )
+#           if abs(fresh_score - cf.predicted_score) > tolerance:
+#               return False
+#       return True
+#
+# If _verify_cf_correctness returns False, evict the cache entry and
+# recompute. Log this as a "cf_cache_divergence" event.
+#
+# Step 5 — Load test in benchmarks/
+# -----------------------------------
+# Add benchmarks/bench_cf_cache.py:
+#
+#   """Benchmark: counterfactual cache hit latency vs. cold computation.
+#
+#   Measures P95 latency for:
+#     a) Cold path: explain() with no cache → full coordinate search
+#     b) Warm path: explain() for near-duplicate feature vectors → cache hit
+#
+#   Near-duplicates are synthesised by adding Gaussian noise (σ=0.01) to a
+#   reference feature row, keeping all vectors within the same LSH bucket.
+#
+#   Run with: python -m benchmarks.bench_cf_cache --n 200
+#   Expected result: P95 warm latency < P95 cold latency * 0.1
+#   """
+#
+# ─── ACCEPTANCE CRITERIA MAPPING ─────────────────────────────────────────────
+#
+#  ✅  P95 latency for repeated near-duplicate requests drops by a measured margin
+#      → benchmarks/bench_cf_cache.py documents the before/after P95
+#
+#  ✅  Cache correctness: cached CFs never diverge beyond configurable tolerance
+#      → _verify_cf_correctness() with tolerance param (default 5.0 points)
+#
+#  ✅  Cache hit-rate metric exported to monitoring/metrics_collector.py
+#      → cf_cache_hits_total / cf_cache_misses_total Prometheus counters
+#
+#  ✅  Load test in benchmarks/
+#      → benchmarks/bench_cf_cache.py
+#
+# ─── FILES TO MODIFY ─────────────────────────────────────────────────────────
+#
+#   detection/counterfactual_explainer.py  ← (THIS FILE) lsh_key(), cache
+#                                              lookup/store, hit/miss counters,
+#                                              _verify_cf_correctness()
+#   detection/feature_cache.py             ← reuse FeatureCache with cf TTL
+#   detection/cache_invalidation.py        ← register CF cache with registry
+#   monitoring/metrics_collector.py        ← cf_hit_rate() method
+#   benchmarks/bench_cf_cache.py           ← new load test
+#   config.py / config/                    ← CF_CACHE_TTL_SECONDS (default 300),
+#                                              CF_CACHE_LSH_HYPERPLANES (default 16),
+#                                              CF_CORRECTNESS_TOLERANCE (default 5.0)
+#
+# =============================================================================
+
 ## What is a Counterfactual Explanation?
 
 A counterfactual explanation answers: **"What would need to change for this wallet to no

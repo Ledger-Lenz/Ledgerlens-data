@@ -10,6 +10,16 @@ This complements `scripts/adversarial_training_loop.py` (referenced in the
 issue) by providing the reusable, testable building blocks: dataset
 augmentation, adversarial-test-set construction, and the before/after
 AUC-ROC comparison.
+
+Issue #872 adds `CurriculumScheduler`: a perturbation-strength curriculum
+(weak-to-strong epsilon ramp-up) consumed by
+`detection.adversarial.robustness.run_adversarial_training` — the actual
+per-epoch adversarial training loop invoked from
+`detection.model_training.main` when `ADV_TRAINING_ENABLED=true` (the file
+this issue names, `scripts/adversarial_training_loop.py`, is a separate
+GAN-style *dataset-regeneration* loop between attacker profiles, not a
+per-example perturbation-budget loop, so a perturbation curriculum has no
+natural hook there; see that module's docstring).
 """
 
 import pandas as pd
@@ -27,6 +37,57 @@ from detection.model_training import (
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_CURRICULUM_STRATEGIES = ("linear", "step")
+
+
+class CurriculumScheduler:
+    """Weak-to-strong perturbation-budget (epsilon) schedule over epochs.
+
+    Two strategies:
+      - ``"linear"``: continuous linear interpolation from `start` to `end`
+        across `[0, epochs - 1]`.
+      - ``"step"``: a 4-stage staircase (start, then three evenly-spaced
+        jumps up to `end`) — a coarser ramp for when a continuous change
+        per epoch is not meaningful (e.g. very few epochs).
+
+    With `epochs <= 1` there is no room to ramp, so `epsilon_for_epoch`
+    always returns `end`.
+    """
+
+    def __init__(self, start: float, end: float, epochs: int, strategy: str = "linear"):
+        if strategy not in _CURRICULUM_STRATEGIES:
+            raise ValueError(f"strategy must be one of {_CURRICULUM_STRATEGIES}, got {strategy!r}")
+        if epochs < 1:
+            raise ValueError(f"epochs must be >= 1, got {epochs}")
+        if start <= 0 or end <= 0:
+            raise ValueError(f"start/end epsilon must be positive, got start={start}, end={end}")
+        self.start = float(start)
+        self.end = float(end)
+        self.epochs = int(epochs)
+        self.strategy = strategy
+
+    def epsilon_for_epoch(self, epoch: int) -> float:
+        """Perturbation budget for `epoch` (0-indexed, `< self.epochs`)."""
+        if not (0 <= epoch < self.epochs):
+            raise ValueError(f"epoch must be in [0, {self.epochs}), got {epoch}")
+        if self.epochs == 1:
+            return self.end
+
+        progress = epoch / (self.epochs - 1)  # 0.0 .. 1.0
+        if self.strategy == "linear":
+            return self.start + progress * (self.end - self.start)
+
+        # "step": 4 evenly-spaced stages (ceil so the last epoch always
+        # lands exactly on `end`, matching the linear strategy's endpoint).
+        n_stages = 4
+        stage = min(int(progress * n_stages), n_stages - 1)
+        stage_progress = stage / (n_stages - 1)
+        return self.start + stage_progress * (self.end - self.start)
+
+    def schedule(self) -> list[float]:
+        """The full per-epoch epsilon list, `len() == self.epochs`."""
+        return [self.epsilon_for_epoch(e) for e in range(self.epochs)]
 
 
 def generate_adversarial_examples(

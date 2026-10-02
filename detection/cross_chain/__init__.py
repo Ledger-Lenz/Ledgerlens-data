@@ -16,7 +16,12 @@ from detection.cross_chain.identity_graph import (
     CrossChainNode,
     IdentityGraph,
 )
-from detection.cross_chain.resolver import get_link_evidence, resolve, resolve_risk_scores
+from detection.cross_chain.resolver import (
+    get_link_evidence,
+    resolve,
+    resolve_risk_scores,
+    resolve_weighted_risk_scores,
+)
 
 __all__ = [
     "BridgeDetector",
@@ -33,4 +38,5 @@ __all__ = [
     "resolve",
     "resolve_risk_scores",
     "get_link_evidence",
+    "resolve_weighted_risk_scores",
 ]

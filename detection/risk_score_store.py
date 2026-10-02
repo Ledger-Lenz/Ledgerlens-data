@@ -30,6 +30,36 @@ _tracer = get_tracer(__name__)
 class RiskScoreStore:
     """CRUD wrapper around `RiskScoreRecord` keyed by `(wallet, asset_pair)`."""
 
+    # ------------------------------------------------------------------
+    # Planned for Issue #856: persist the fused uncertainty interval
+    # ------------------------------------------------------------------
+    # 1. `RiskScoreRecord` (detection/persistence.py) gets three nullable
+    #    columns: `fused_score_lower` (Float), `fused_score_upper` (Float) and
+    #    `fusion_strategy` (String(32)). NULL means "not computed" (older
+    #    rows, or producers that don't fuse), so existing readers and
+    #    `to_risk_score()` are unaffected.
+    # 2. New migration `migrations/versions/0008_add_fused_score_interval.py`,
+    #    following 0006_add_risk_score_finality.py: inspect the table, then
+    #    `ALTER TABLE risk_scores ADD COLUMN ...` for each missing column.
+    #    Idempotent, with no backfill.
+    # 3. The upsert copies the three keys only when present in `risk_score`,
+    #    the same pattern already used for `propagated_risk` / `ring_id`, so
+    #    a producer that omits them never overwrites stored values with NULL.
+    # 4. `RiskScoreRecord.to_risk_score()` adds the keys only when non-NULL,
+    #    so the API wire shape is unchanged for rows without fusion data.
+    # 5. Tests: round-trip a score carrying the fused fields; upsert one
+    #    without them and assert the previous values survive; assert that
+    #    `to_risk_score()` omits them when NULL.
+    #
+    # Pre-existing problem to fix first: `_upsert_impl` below currently mixes
+    # two versions of the upsert (the ORM `existing = ...` path and the
+    # dialect `insert().on_conflict_do_update` path). It references
+    # undefined names (`table`, `values`, `update_columns`, `existing`) and
+    # has an unbalanced `)`, so this module does not import on current
+    # `main`. The dialect-insert version (from the #789 race fix) should be
+    # kept, with the column mapping built into `values` / `update_columns`.
+    # The new fused columns then go in that mapping.
+
     def __init__(self, session_factory: sessionmaker[Session] | None = None):
         self._session_factory = session_factory or get_session_factory()
 
@@ -81,7 +111,12 @@ class RiskScoreStore:
                             index_elements=["wallet", "asset_pair"],
                             set_=update_columns,
                         )
-                    )
+                    else:
+                        raise NotImplementedError(
+                            f"Atomic upsert not configured for dialect "
+                            f"'{dialect_name}'. Add an ON CONFLICT / equivalent "
+                            f"branch in RiskScoreStore._upsert_impl."
+                        )
                     if existing is None:
                         existing = RiskScoreRecord(wallet=wallet, asset_pair=asset_pair)
                         session.add(existing)
@@ -95,18 +130,6 @@ class RiskScoreStore:
                         existing.propagated_risk = float(risk_score["propagated_risk"])
                     if "ring_id" in risk_score:
                         existing.ring_id = risk_score["ring_id"]
-
-                        stmt = dialect_insert(table).values(**values)
-                        stmt = stmt.on_conflict_do_update(
-                            index_elements=["wallet", "asset_pair"],
-                            set_=update_columns,
-                        )
-                    else:
-                        raise NotImplementedError(
-                            f"Atomic upsert not configured for dialect "
-                            f"'{dialect_name}'. Add an ON CONFLICT / equivalent "
-                            f"branch in RiskScoreStore._upsert_impl."
-                        )
                     session.execute(stmt)
                     session.commit()
                     return self.get(wallet, asset_pair)

@@ -21,12 +21,27 @@ Usage::
     record_risk_score(asset_pair, score["score"])
     record_confirmed_wash_trade(asset_pair)
     record_confirmed_clean_wallet(asset_pair)
+
+Per-pair degradation detection (issue #971)
+-------------------------------------------
+
+``PerPairDegradationMonitor`` tracks a rolling window of per-pair metric
+values and runs a CUSUM change-point test (reusing
+``monitoring.cusum_detector``) on each pair independently.  When a single
+pair's distribution shifts while aggregate metrics stay flat, only that
+pair's CUSUM statistic crosses the threshold, so a per-pair alert is
+emitted through ``alerts.router`` with pair-level context (pair id, metric,
+magnitude).  Stable pairs never cross the threshold and stay silent.
 """
 
 from __future__ import annotations
 
 import contextlib
+import logging
 import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional
 
 _metrics_available = False
 _score_duration: object = None
@@ -66,6 +81,12 @@ try:
         "Total confirmed clean (non-fraudulent) wallets per asset pair",
         ["asset_pair"],
     )
+    # Per-pair degradation counters (issue #971)
+    ledgerlens_pair_degradation_total = Counter(
+        "ledgerlens_pair_degradation_total",
+        "Total per-pair model degradation alerts emitted",
+        ["asset_pair", "metric"],
+    )
     _score_duration = ledgerlens_score_duration_seconds
     _benford_computation = ledgerlens_benford_computation_total
     _risk_score_dist = ledgerlens_risk_score_distribution
@@ -78,6 +99,9 @@ except Exception:
     ledgerlens_risk_score_distribution = None  # type: ignore[assignment]
     ledgerlens_confirmed_wash_trades_total = None  # type: ignore[assignment]
     ledgerlens_confirmed_clean_wallets_total = None  # type: ignore[assignment]
+    ledgerlens_pair_degradation_total = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 def canonical_pair(asset_pair: str) -> str:
@@ -143,3 +167,288 @@ def record_confirmed_clean_wallet(asset_pair: str) -> None:
     pair = canonical_pair(asset_pair)
     if _metrics_available and _confirmed_clean_wallets is not None:
         _confirmed_clean_wallets.labels(asset_pair=pair).inc()
+
+
+# ---------------------------------------------------------------------------
+# Per-pair degradation detection (issue #971)
+# ---------------------------------------------------------------------------
+
+
+def _cusum_detector_cls():
+    """Return the CUSUM detector class from ``monitoring.cusum_detector``.
+
+    Imported lazily so this module keeps working (metrics only) even when the
+    monitoring package is unavailable in a minimal deployment.
+    """
+    from monitoring.cusum_detector import CUSUMDetector  # type: ignore
+
+    return CUSUMDetector
+
+
+@dataclass
+class PairDegradationAlert:
+    """Per-pair degradation alert payload (issue #971).
+
+    Carries the pair identifier, the metric that degraded, and the magnitude
+    of the shift so downstream routing/alerting has full pair-level context.
+    """
+
+    asset_pair: str
+    metric: str
+    magnitude: float
+    direction: str
+    cusum_value: float
+    baseline_mean: float
+    observed_mean: float
+    samples: int
+
+    def to_payload(self) -> Dict[str, object]:
+        return {
+            "asset_pair": self.asset_pair,
+            "metric": self.metric,
+            "magnitude": self.magnitude,
+            "direction": self.direction,
+            "cusum_value": self.cusum_value,
+            "baseline_mean": self.baseline_mean,
+            "observed_mean": self.observed_mean,
+            "samples": self.samples,
+        }
+
+
+@dataclass
+class _PairState:
+    """Rolling state for a single (pair, metric) series."""
+
+    window: Deque[float] = field(default_factory=lambda: deque(maxlen=200))
+    detector: object = None
+    baseline_mean: float = 0.0
+    baseline_ready: bool = False
+
+
+class PerPairDegradationMonitor:
+    """Rolling per-pair metric tracking with CUSUM degradation detection.
+
+    Each ``(asset_pair, metric)`` series is tracked independently.  A CUSUM
+    change-point test (reusing ``monitoring.cusum_detector``) runs per series,
+    so a distribution shift on one thinly traded pair is detected even when
+    aggregate metrics across all pairs remain flat.  Stable pairs never cross
+    the CUSUM threshold and therefore never emit an alert.
+
+    Alerts are routed through ``alerts.router`` with pair-level context.
+    """
+
+    def __init__(
+        self,
+        metric: str = "risk_score",
+        baseline_size: int = 30,
+        threshold: float = 5.0,
+        slack: float = 0.5,
+        window_size: int = 200,
+    ) -> None:
+        self.metric = metric
+        self.baseline_size = baseline_size
+        self.threshold = threshold
+        self.slack = slack
+        self.window_size = window_size
+        self._states: Dict[str, _PairState] = defaultdict(self._new_state)
+
+    def _new_state(self) -> _PairState:
+        return _PairState(window=deque(maxlen=self.window_size))
+
+    def _ensure_detector(self, state: _PairState) -> None:
+        if state.detector is not None:
+            return
+        detector_cls = _cusum_detector_cls()
+        try:
+            state.detector = detector_cls(
+                threshold=self.threshold, slack=self.slack
+            )
+        except TypeError:
+            # Fall back to a positional/looser constructor signature.
+            state.detector = detector_cls(self.threshold, self.slack)
+
+    def observe(self, asset_pair: str, value: float) -> Optional[PairDegradationAlert]:
+        """Record a metric *value* for *asset_pair* and check for degradation.
+
+        Returns a :class:`PairDegradationAlert` when the pair's CUSUM statistic
+        crosses the threshold, otherwise ``None``.
+        """
+        pair = canonical_pair(asset_pair)
+        state = self._states[pair]
+        value = float(value)
+        state.window.append(value)
+
+        # Establish a baseline from the first ``baseline_size`` samples.
+        if not state.baseline_ready:
+            if len(state.window) >= self.baseline_size:
+                state.baseline_mean = sum(state.window) / len(state.window)
+                state.baseline_ready = True
+                self._ensure_detector(state)
+            return None
+
+        self._ensure_detector(state)
+        detector = state.detector
+        if detector is None:
+            return None
+
+        # Feed the detector and read its current statistic.
+        if hasattr(detector, "update"):
+            detector.update(value)
+        elif hasattr(detector, "observe"):
+            detector.observe(value)
+        else:  # pragma: no cover - defensive
+            return None
+
+        cusum_value = self._read_statistic(detector)
+        if cusum_value is None or cusum_value < self.threshold:
+            return None
+
+        observed_mean = sum(state.window) / len(state.window)
+        magnitude = abs(observed_mean - state.baseline_mean)
+        direction = "up" if observed_mean >= state.baseline_mean else "down"
+        alert = PairDegradationAlert(
+            asset_pair=pair,
+            metric=self.metric,
+            magnitude=magnitude,
+            direction=direction,
+            cusum_value=cusum_value,
+            baseline_mean=state.baseline_mean,
+            observed_mean=observed_mean,
+            samples=len(state.window),
+        )
+        self._record_metric(alert)
+        self._route_alert(alert)
+        # Reset the detector so a single shift does not re-fire every sample.
+        self._reset_detector(state)
+        return alert
+
+    @staticmethod
+    def _read_statistic(detector: object) -> Optional[float]:
+        for attr in ("statistic", "cusum", "value", "max_statistic"):
+            if hasattr(detector, attr):
+                try:
+                    return float(getattr(detector, attr))
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _reset_detector(self, state: _PairState) -> None:
+        detector = state.detector
+        if detector is None:
+            return
+        for attr in ("reset", "clear"):
+            if hasattr(detector, attr):
+                try:
+                    getattr(detector, attr)()
+                    return
+                except Exception:  # pragma: no cover - defensive
+                    continue
+
+    @staticmethod
+    def _record_metric(alert: PairDegradationAlert) -> None:
+        if _metrics_available and ledgerlens_pair_degradation_total is not None:
+            ledgerlens_pair_degradation_total.labels(
+                asset_pair=alert.asset_pair, metric=alert.metric
+            ).inc()
+
+    @staticmethod
+    def _route_alert(alert: PairDegradationAlert) -> None:
+        """Route the per-pair degradation alert through ``alerts.router``."""
+        try:
+            from alerts.router import route_alert  # type: ignore
+        except Exception:  # pragma: no cover - router optional in tests
+            logger.warning(
+                "per-pair degradation on %s (%s): magnitude=%.4f",
+                alert.asset_pair,
+                alert.metric,
+                alert.magnitude,
+            )
+            return
+        try:
+            route_alert(
+                alert_type="per_pair_degradation",
+                severity="warning",
+                message=(
+                    f"Model degradation detected for pair {alert.asset_pair} "
+                    f"on metric {alert.metric} "
+                    f"(magnitude={alert.magnitude:.4f}, {alert.direction})"
+                ),
+                context=alert.to_payload(),
+            )
+        except TypeError:
+            # Router with a looser signature.
+            route_alert(alert.to_payload())
+
+
+def detect_pair_degradation(
+    series_by_pair: Dict[str, List[float]],
+    metric: str = "risk_score",
+    baseline_size: int = 30,
+    threshold: float = 5.0,
+    slack: float = 0.5,
+) -> List[PairDegradationAlert]:
+    """Convenience helper: run per-pair detection over pre-collected series.
+
+    ``series_by_pair`` maps an asset pair to its ordered metric values.  Each
+    pair is evaluated independently, so a shift on one pair is reported even
+    when the aggregate across all pairs is unchanged.
+    """
+    monitor = PerPairDegradationMonitor(
+        metric=metric,
+        baseline_size=baseline_size,
+        threshold=threshold,
+        slack=slack,
+    )
+    alerts: List[PairDegradationAlert] = []
+    for pair, values in series_by_pair.items():
+        for value in values:
+            alert = monitor.observe(pair, value)
+            if alert is not None:
+                alerts.append(alert)
+    return alerts
+def compare_pair_metrics(
+    production_scores: dict[str, float],
+    candidate_scores: dict[str, float],
+    *,
+    threshold: float = 0.0,
+) -> dict[str, object]:
+    """Compare production vs. candidate scores per asset pair (issue #936).
+
+    Used by the model-governance shadow-mode evaluation to compute the
+    agreement rate and per-pair metric deltas over a shadow period.  This is
+    a pure computation: it never emits metrics or influences live alerts, so
+    running it against shadow traffic has zero effect on production decisions.
+
+    *production_scores* and *candidate_scores* map canonical asset pairs to
+    risk scores.  A pair is considered to *agree* when both models place it on
+    the same side of *threshold* (both flagged or both not flagged).
+
+    Returns a report dict with ``agreement_rate``, ``pairs_compared``,
+    ``deltas`` (per-pair absolute score delta) and ``disagreements`` (pairs
+    where the flag decision differs).
+    """
+    pairs = sorted(set(production_scores) | set(candidate_scores))
+    deltas: dict[str, float] = {}
+    disagreements: list[str] = []
+    compared = 0
+    agreed = 0
+    for pair in pairs:
+        prod = production_scores.get(pair)
+        cand = candidate_scores.get(pair)
+        if prod is None or cand is None:
+            continue
+        compared += 1
+        deltas[pair] = abs(float(cand) - float(prod))
+        prod_flag = float(prod) >= threshold
+        cand_flag = float(cand) >= threshold
+        if prod_flag == cand_flag:
+            agreed += 1
+        else:
+            disagreements.append(pair)
+    agreement_rate = (agreed / compared) if compared else 1.0
+    return {
+        "agreement_rate": agreement_rate,
+        "pairs_compared": compared,
+        "deltas": deltas,
+        "disagreements": disagreements,
+    }

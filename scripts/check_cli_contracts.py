@@ -132,6 +132,15 @@ def main() -> int:
         actual = _extract_actual_arguments(script_path)
         all_diagnostics.extend(check_contract(contract, actual))
 
+    # ------------------------------------------------------------------
+    # Issue #959 — also check structured-output (--json) contracts for
+    # CLI subcommands defined in cli/main.py
+    # ------------------------------------------------------------------
+    from cli_contracts import CLI_SUBCOMMAND_CONTRACTS, CliSubcommandContract  # noqa: E402
+
+    cli_diagnostics = _check_subcommand_contracts(CLI_SUBCOMMAND_CONTRACTS)
+    all_diagnostics.extend(cli_diagnostics)
+
     if all_diagnostics:
         print(f"CLI contract check FAILED: {len(all_diagnostics)} issue(s)\n")
         for d in all_diagnostics:
@@ -139,7 +148,87 @@ def main() -> int:
         return 1
 
     print(f"CLI contract check passed for {len(scripts)} script(s): {', '.join(scripts)}")
+    n_sub = len(CLI_SUBCOMMAND_CONTRACTS)
+    print(f"  + {n_sub} CLI subcommand contract(s) verified (Issue #959).")
     return 0
+
+
+def _check_subcommand_contracts(
+    subcommand_contracts: dict,
+) -> list[str]:
+    """Validate that every CLI subcommand contract still matches cli/main.py.
+
+    Checks:
+    - The module file (e.g. cli/main.py) exists.
+    - Every declared ``--json`` flag is actually present in the parser.
+    - The ``schema_version`` constant exported by the module matches the
+      contract's ``json_schema_version``.
+    - Every ``json_schema_fields`` entry appears (by name) in the module
+      docstring or the subparser's description, so the schema documentation
+      stays in sync with the contract.
+    """
+    diagnostics: list[str] = []
+
+    for key, sub_contract in subcommand_contracts.items():
+        # Resolve module path to a file
+        module_rel = sub_contract.module.replace(".", "/") + ".py"
+        module_path = REPO_ROOT / module_rel
+        if not module_path.is_file():
+            diagnostics.append(
+                f"[{key}] module '{sub_contract.module}' not found at "
+                f"{module_rel} — update CLI_SUBCOMMAND_CONTRACTS or restore the file."
+            )
+            continue
+
+        actual = _extract_actual_arguments(module_path)
+
+        # Check each declared argument is present in the source
+        for declared in sub_contract.arguments:
+            match = next((a for a in actual if a.matches(declared.name)), None)
+            if match is None:
+                diagnostics.append(
+                    f"[{key}] contract declares '{declared.name}' but no matching "
+                    f"add_argument() call was found in {module_rel} — "
+                    f"update CLI_SUBCOMMAND_CONTRACTS or restore the flag."
+                )
+
+        # Check that --json is present for every subcommand contract
+        json_flag_present = any(a.matches("--json") for a in actual)
+        if not json_flag_present:
+            diagnostics.append(
+                f"[{key}] contract requires '--json' flag but it was not found "
+                f"in {module_rel} — Issue #959 requires --json on all diagnostic subcommands."
+            )
+
+        # Check that the schema_version constant exists in the module
+        source = module_path.read_text(encoding="utf-8")
+        version = sub_contract.json_schema_version
+        # Look for SCHEMA_VERSION = "X.Y" or schema_version: "X.Y" in docstrings
+        import re
+        version_found = (
+            re.search(rf'SCHEMA_VERSION\s*=\s*["\']' + re.escape(version) + r'["\']', source)
+            or re.search(rf'schema_version.*["\']' + re.escape(version) + r'["\']', source)
+            or version in source
+        )
+        if not version_found:
+            diagnostics.append(
+                f"[{key}] contract declares json_schema_version='{version}' "
+                f"but that version string was not found in {module_rel}."
+            )
+
+        # Check that documented JSON schema fields appear somewhere in the
+        # module (docstring or subparser help text)
+        for field in sub_contract.json_schema_fields:
+            # Use the field base name (before the first dot) for the check
+            field_base = field.split(".")[0]
+            if field_base not in source:
+                diagnostics.append(
+                    f"[{key}] JSON schema field '{field}' (base: '{field_base}') "
+                    f"is declared in the contract but not mentioned in {module_rel}. "
+                    f"Update the docstring/help text or the contract."
+                )
+
+    return diagnostics
 
 
 if __name__ == "__main__":

@@ -8,7 +8,10 @@ back to ``config.RISK_SCORE_FLAG_THRESHOLD`` otherwise.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
+import os
 from typing import Any
 
 import numpy as np
@@ -34,6 +37,13 @@ logger = logging.getLogger(__name__)
 
 MIN_THRESHOLD: float = 40.0
 MAX_THRESHOLD: float = 95.0
+# Circuit-breaker safe range defaults (Issue #898). Outside this band the RL
+# policy is considered runaway and the controller reverts to the safe static
+# threshold until an operator calls ``reset_circuit_breaker``.
+DEFAULT_MAX_ALERTS_PER_HOUR: float = float(os.getenv("RL_MAX_ALERTS_PER_HOUR", "100"))
+DEFAULT_MIN_ALERTS_PER_HOUR: float = float(os.getenv("RL_MIN_ALERTS_PER_HOUR", "0"))
+DEFAULT_MIN_TP_RATE: float = float(os.getenv("RL_MIN_TP_RATE", "0.05"))
+DEFAULT_OVERRIDE_PATH: str = os.getenv("RL_THRESHOLD_OVERRIDE_PATH", "data/threshold_override.json")
 # Discrete action deltas: index 0-4 → {-5, -2, 0, +2, +5}
 _ACTIONS: list[int] = [-5, -2, 0, 2, 5]
 _DEFAULT_WEIGHTS: dict[str, float] = {"w1": 2.0, "w2": 5.0, "w3": 1.0, "w4": 0.1}
@@ -246,19 +256,118 @@ class ThresholdController:
         model: Any = None,
         alert_budget: int = 20,
         reward_weights: dict[str, float] | None = None,
+        min_threshold: float = MIN_THRESHOLD,
+        max_threshold: float = MAX_THRESHOLD,
+        safe_threshold: float | None = None,
+        max_alerts_per_hour: float = DEFAULT_MAX_ALERTS_PER_HOUR,
+        min_alerts_per_hour: float = DEFAULT_MIN_ALERTS_PER_HOUR,
+        min_tp_rate: float = DEFAULT_MIN_TP_RATE,
+        override_path: str | None = None,
     ) -> None:
+        if min_threshold > max_threshold:
+            raise ValueError("min_threshold must be <= max_threshold")
         self._model = model
         self._alert_budget = alert_budget
         self._weights: dict[str, float] = {**_DEFAULT_WEIGHTS, **(reward_weights or {})}
         self._thresholds: dict[str, float] = {}
+        # Hard bounds — no policy output can move a threshold outside these.
+        self.min_threshold = float(min_threshold)
+        self.max_threshold = float(max_threshold)
+        self.safe_threshold = self._clamp(
+            float(config.RISK_SCORE_FLAG_THRESHOLD) if safe_threshold is None else safe_threshold
+        )
+        self.max_alerts_per_hour = max_alerts_per_hour
+        self.min_alerts_per_hour = min_alerts_per_hour
+        self.min_tp_rate = min_tp_rate
+        self.circuit_open: bool = False
+        self.circuit_reason: str | None = None
+        # Operator overrides: asset -> pinned threshold ("*" pins every asset).
+        self._overrides: dict[str, float] = {}
+        self._override_path = override_path
+        self._override_mtime: float | None = None
+
+    # ------------------------------------------------------------------
+    # Safety: bounds, circuit breaker, operator override (Issue #898)
+    # ------------------------------------------------------------------
+
+    def _clamp(self, value: float) -> float:
+        if not math.isfinite(value):
+            return self.safe_threshold if hasattr(self, "safe_threshold") else self.min_threshold
+        return float(min(max(value, self.min_threshold), self.max_threshold))
+
+    def pin_threshold(self, value: float, asset: str = "*") -> None:
+        """Manually pin *asset*'s threshold; takes precedence over the RL policy."""
+        self._overrides[asset] = self._clamp(float(value))
+        logger.warning("Threshold override pinned: %s=%.1f", asset, self._overrides[asset])
+
+    def release_override(self, asset: str = "*") -> None:
+        """Release a manual pin, handing control back to the RL policy."""
+        self._overrides.pop(asset, None)
+        logger.warning("Threshold override released: %s", asset)
+
+    def _override_for(self, asset: str) -> float | None:
+        self._sync_override_file()
+        return self._overrides.get(asset, self._overrides.get("*"))
+
+    def _sync_override_file(self) -> None:
+        """Pick up pins written by ``scripts/threshold_override.py``."""
+        path = self._override_path
+        if not path:
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            if self._override_mtime is not None:
+                self._overrides.clear()
+                self._override_mtime = None
+            return
+        if mtime == self._override_mtime:
+            return
+        self._override_mtime = mtime
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            self._overrides = {k: self._clamp(float(v)) for k, v in data.items()}
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Ignoring unreadable threshold override file %s: %s", path, exc)
+
+    def _check_circuit(self, obs_dict: dict[str, Any]) -> None:
+        alerts = float(obs_dict.get("alerts_fired_last_hour", 0.0))
+        tp_rate = obs_dict.get("analyst_tp_rate_last_24h")
+        reason = None
+        if alerts > self.max_alerts_per_hour:
+            reason = f"alert volume {alerts:.0f}/h above {self.max_alerts_per_hour:.0f}/h"
+        elif alerts < self.min_alerts_per_hour:
+            reason = f"alert volume {alerts:.0f}/h below {self.min_alerts_per_hour:.0f}/h"
+        elif tp_rate is not None and float(tp_rate) < self.min_tp_rate:
+            reason = f"TP rate {float(tp_rate):.2f} below {self.min_tp_rate:.2f}"
+        if reason and not self.circuit_open:
+            self.circuit_open = True
+            self.circuit_reason = reason
+            logger.error("RL threshold circuit breaker tripped: %s", reason)
+
+    def reset_circuit_breaker(self) -> None:
+        """Close the breaker and resume RL control (operator action)."""
+        self.circuit_open = False
+        self.circuit_reason = None
+        self._thresholds.clear()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def get_threshold(self, asset: str) -> float:
-        """Return the cached threshold for *asset*, or the static config default."""
-        return self._thresholds.get(asset, float(config.RISK_SCORE_FLAG_THRESHOLD))
+        """Return the effective threshold for *asset*.
+
+        Precedence: operator override > circuit-breaker safe value > RL
+        cached value > static config default; always within hard bounds.
+        """
+        pinned = self._override_for(asset)
+        if pinned is not None:
+            return pinned
+        if self.circuit_open:
+            return self.safe_threshold
+        return self._clamp(self._thresholds.get(asset, float(config.RISK_SCORE_FLAG_THRESHOLD)))
 
     def update(self, asset: str, obs_dict: dict[str, Any]) -> float:
         """Run the policy to select a new threshold for *asset* and cache it.
@@ -271,14 +380,22 @@ class ThresholdController:
         Returns the updated threshold.  If no model is loaded the existing
         cached value (or config default) is returned unchanged.
         """
-        if self._model is None:
+        if self._override_for(asset) is not None:
+            return self.get_threshold(asset)
+        self._check_circuit(obs_dict)
+        if self._model is None or self.circuit_open:
             return self.get_threshold(asset)
 
         current = self.get_threshold(asset)
         obs = self._encode_obs(current, obs_dict)
         action, _ = self._model.predict(obs, deterministic=True)
-        delta = float(_ACTIONS[int(action)])
-        new_threshold = float(np.clip(current + delta, MIN_THRESHOLD, MAX_THRESHOLD))
+        try:
+            idx = int(np.asarray(action).reshape(-1)[0])
+        except (TypeError, ValueError, OverflowError):
+            idx = _ACTIONS.index(0)
+        # Adversarial/out-of-range actions are clamped to the extreme valid delta.
+        delta = float(_ACTIONS[min(max(idx, 0), len(_ACTIONS) - 1)])
+        new_threshold = self._clamp(current + delta)
         self._thresholds[asset] = new_threshold
         logger.debug("RL threshold %s: %.1f → %.1f (Δ%+.0f)", asset, current, new_threshold, delta)
         return new_threshold
